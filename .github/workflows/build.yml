@@ -89,6 +89,14 @@ jobs:
           python3 tests/check_bitstream.py h264 h264.frames
           python3 tests/check_bitstream.py hevc h265.frames
 
+      - name: Measure static refinement after motion on the Mac encoder
+        if: runner.os == 'macOS'
+        run: |
+          ./build/Release/codec_probe topoff-h264.frames h264 topoff
+          ./build/Release/codec_probe topoff-h265.frames h265 topoff
+          python3 tests/check_bitstream.py h264 topoff-h264.frames topoff
+          python3 tests/check_bitstream.py hevc topoff-h265.frames topoff
+
       - name: Run tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
 

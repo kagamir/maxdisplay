@@ -7,6 +7,7 @@
 #include "win/decoder.hpp"
 #endif
 
+#include <algorithm>
 #include <type_traits>
 #include <memory>
 #include <string>
@@ -32,26 +33,41 @@ Color color_at(unsigned x, unsigned y, unsigned index) {
 }
 
 #ifdef __APPLE__
-bool probe(const char* path, Codec codec, bool strict) {
+constexpr unsigned moving_frames = 12, still_frames = 30;
+
+// Scroll dense, high-contrast glyphs at a constrained bitrate, then hold the
+// last page still. The interop quadrants are too easy to compress for this test.
+uint8_t text_luma(unsigned x, unsigned y, unsigned index) {
+    y += 13 * std::min(index, moving_frames - 1);
+    const unsigned col = x % 7, row = y % 10;
+    if (col >= 5 || row >= 8) return 218;
+    uint32_t glyph = (x / 7 + 101 * (y / 10)) * 2654435761u;
+    glyph ^= glyph >> 16;
+    return (glyph >> ((5 * row + col) % 32)) & 1 ? 36 : 218;
+}
+
+bool probe(const char* path, Codec codec, bool strict, bool topoff = false) {
     std::ofstream stream(path, std::ios::binary);
     stream.exceptions(std::ios::badbit | std::ios::failbit);
     unsigned packets = 0;
-    Encoder encoder(width, height, fps, 2'000'000, [&](std::vector<uint8_t> au, bool keyframe) {
-        if ((packets == 0 || packets == recovery_frame) && !keyframe)
+    const unsigned count = topoff ? moving_frames + still_frames : frame_count;
+    std::vector<uint8_t> reference(topoff ? width * height : 0);
+    Encoder encoder(width, height, fps, topoff ? 250'000 : 2'000'000, [&](std::vector<uint8_t> au, bool keyframe) {
+        if ((packets == 0 || (!topoff && packets == recovery_frame)) && !keyframe)
             throw std::runtime_error("Missing requested random access frame at " + std::to_string(packets));
         // The receiver loss test skips index 3 and then delivers this dependent picture.
-        if (packets == recovery_frame - 1 && keyframe)
+        if (!topoff && packets == recovery_frame - 1 && keyframe)
             throw std::runtime_error("Expected a predicted picture immediately before recovery");
         const auto n = static_cast<uint32_t>(au.size());
         const uint8_t length[] = {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
         stream.write(reinterpret_cast<const char*>(length), sizeof(length));
         stream.write(reinterpret_cast<const char*>(au.data()), n);
         ++packets;
-    }, codec, strict);
+    }, codec, strict, !topoff);
     const bool hardware = encoder.hardware_accelerated();
     if (strict && !hardware) throw std::runtime_error("Required hardware encoder was not selected");
     std::cout << "Encoder: " << (hardware ? "hardware" : "software") << '\n';
-    for (unsigned i = 0; i < frame_count; ++i) {
+    for (unsigned i = 0; i < count; ++i) {
         CVPixelBufferRef pixel = nullptr;
         if (CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nullptr, &pixel) != kCVReturnSuccess)
             throw std::runtime_error("Could not allocate test pixels");
@@ -66,6 +82,13 @@ bool probe(const char* path, Codec codec, bool strict) {
         const auto luma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
         const auto chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
         for (unsigned y = 0; y < height; ++y) {
+            if (topoff) {
+                auto* line = luma + y * luma_stride;
+                for (unsigned x = 0; x < width; ++x) line[x] = text_luma(x, y, i);
+                if (y % 2 == 0) std::fill_n(chroma + y / 2 * chroma_stride, width, 128);
+                if (i == moving_frames - 1) std::copy_n(line, width, reference.data() + y * width);
+                continue;
+            }
             for (unsigned x = 0; x < width; ++x) {
                 const auto color = color_at(x, y, i);
                 const double luminance = 0.2126 * color[2] + 0.7152 * color[1] + 0.0722 * color[0];
@@ -78,13 +101,24 @@ bool probe(const char* path, Codec codec, bool strict) {
             }
         }
         CVPixelBufferUnlockBaseAddress(pixel, 0);
-        if (i == 2) encoder.set_bitrate(950'000);
-        if (i == recovery_frame) encoder.set_bitrate(1'500'000);
-        encoder.encode(pixel, CMTimeMake(i, fps), i == recovery_frame);
+        if (!topoff && i == 2) encoder.set_bitrate(950'000);
+        if (!topoff && i == recovery_frame) encoder.set_bitrate(1'500'000);
+        encoder.encode(pixel, CMTimeMake(i, fps), !topoff && i == recovery_frame);
     }
+    const bool final_hardware = encoder.hardware_accelerated();
     encoder.finish();
-    if (packets != frame_count) throw std::runtime_error("Encoder did not return all pattern frames");
+    if (packets != count) throw std::runtime_error("Encoder did not return all pattern frames");
     stream.close();
+    if (topoff) {
+        // Save the exact last moving luma plane and the backend that finished
+        // the run (a hardware session can fall back during submission).
+        std::ofstream pgm(std::string(path) + ".pgm", std::ios::binary);
+        pgm.exceptions(std::ios::badbit | std::ios::failbit);
+        pgm << "P5\n# encoder=" << (final_hardware ? "hardware" : "software")
+            << "\n" << width << ' ' << height << "\n255\n";
+        pgm.write(reinterpret_cast<const char*>(reference.data()), reference.size());
+        pgm.close();
+    }
     return hardware;
 }
 #else
@@ -136,11 +170,25 @@ bool probe(const char* path, Codec codec, bool strict, unsigned start = 0) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 3) return 2;
-    const std::string name = argc == 3 ? argv[2] : "h264";
+#ifdef __APPLE__
+    const bool topoff = argc == 4 && std::string(argv[3]) == "topoff";
+    if (!topoff && argc > 3) return 2;
+#else
+    if (argc > 3) return 2;
+#endif
+    if (argc < 2) return 2;
+    const std::string name = argc >= 3 ? argv[2] : "h264";
     if (name != "av1" && name != "h264" && name != "h265") return 2;
     const Codec codec = name == "h265" ? Codec::h265 : name == "av1" ? Codec::av1 : Codec::h264;
     try {
+#ifdef __APPLE__
+        if (topoff) {
+            probe(argv[1], codec, false, true);
+            std::cout << "Encoded " << moving_frames << " moving frames and " << still_frames
+                      << " repeats of the final frame\n";
+            return 0;
+        }
+#endif
         const bool hardware = probe(argv[1], codec, false);
 #ifdef __APPLE__
         if (hardware) probe(argv[1], codec, true);

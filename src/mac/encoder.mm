@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -27,6 +29,23 @@ bool is_sync_sample(CMSampleBufferRef sample) {
         return true;
     auto first = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(attachments, 0));
     return CFDictionaryGetValue(first, kCMSampleAttachmentKey_NotSync) != kCFBooleanTrue;
+}
+
+std::optional<double> luma_psnr(CMSampleBufferRef sample) {
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140400
+    if (@available(macOS 14.4, *)) {
+        NSArray* attachments = (__bridge NSArray*)CMSampleBufferGetSampleAttachmentsArray(sample, false);
+        NSDictionary* frame = attachments.firstObject;
+        NSDictionary* metrics = frame[(__bridge NSString*)kVTSampleAttachmentKey_QualityMetrics];
+        NSNumber* value = metrics[(__bridge NSString*)kVTSampleAttachmentQualityMetricsKey_LumaMeanSquaredError];
+        if ([value isKindOfClass:NSNumber.class]) {
+            const double mse = value.doubleValue;
+            if (mse == 0) return std::numeric_limits<double>::infinity();
+            if (mse > 0 && std::isfinite(mse)) return 10 * std::log10(255.0 * 255.0 / mse);
+        }
+    }
+#endif
+    return std::nullopt;
 }
 
 void start_nal(std::vector<uint8_t>& frame) {
@@ -104,26 +123,28 @@ struct Encoder::Impl {
     std::unique_ptr<Av1Encoder> av1;
     uint32_t width, height, fps, bitrate;
     Codec codec;
-    bool require_hardware;
+    bool require_hardware, periodic_keyframes;
     std::atomic<bool> hardware{false};
     bool need_sync = true;
     int64_t last_av1_pts = -1;
     CMTime last_vt_pts = kCMTimeInvalid;
     CMTime duration;
+    std::optional<double> psnr;
 
     // Only one sample is submitted at a time. Publish output to the transport
     // after CompleteFrames succeeds so a failed frame can be retried exactly once.
     struct Frame {
         std::vector<uint8_t> bytes;
         bool keyframe = false;
+        std::optional<double> psnr;
     };
     std::mutex result_mutex;
     Frame result;
     std::exception_ptr callback_error;
 
-    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps, uint32_t bps, Codec codec, bool strict)
+    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps, uint32_t bps, Codec codec, bool strict, bool periodic)
         : output(std::move(cb)), width(w), height(h), fps(fps), bitrate(bps), codec(codec),
-          require_hardware(strict), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
+          require_hardware(strict), periodic_keyframes(periodic), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
 
     void close() noexcept {
         if (session) {
@@ -151,7 +172,7 @@ struct Encoder::Impl {
             const bool keyframe = is_sync_sample(sample);
             auto bytes = annex_b(sample, keyframe);
             std::lock_guard<std::mutex> lock(self.result_mutex);
-            self.result = {std::move(bytes), keyframe};
+            self.result = {std::move(bytes), keyframe, luma_psnr(sample)};
         } catch (...) {
             std::lock_guard<std::mutex> lock(self.result_mutex);
             self.callback_error = std::current_exception();
@@ -171,7 +192,7 @@ void Encoder::Impl::open(bool use_hardware) {
         (__bridge NSString*)kVTCompressionPropertyKey_YCbCrMatrix: (__bridge NSString*)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
         (__bridge NSString*)kVTCompressionPropertyKey_AverageBitRate: @(bitrate),
         (__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate: @(fps),
-        (__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval: @(fps * 2)
+        (__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval: @(periodic_keyframes ? fps * 2 : INT32_MAX)
     };
     NSDictionary* spec = use_hardware ?
         @{(__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES} :
@@ -183,6 +204,14 @@ void Encoder::Impl::open(bool use_hardware) {
                  hevc ? "Create VideoToolbox HEVC encoder" : "Create VideoToolbox H.264 encoder");
     check_status(VTSessionSetProperties(session, (__bridge CFDictionaryRef)properties),
                  "Configure VideoToolbox encoder");
+    if (!periodic_keyframes)
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@0);
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140400
+    if (@available(macOS 14.4, *)) {
+        // Quality metrics are optional even on systems that export this key.
+        VTSessionSetProperty(session, kVTCompressionPropertyKey_CalculateMeanSquaredError, kCFBooleanTrue);
+    }
+#endif
     // Older encoders may omit this optional property. Closed GOPs make recovery independent.
     VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
     check_status(VTCompressionSessionPrepareToEncodeFrames(session), "Prepare VideoToolbox encoder");
@@ -237,18 +266,18 @@ Encoder::Impl::Frame Encoder::Impl::submit(CVPixelBufferRef pixels, CMTime pts, 
 }
 
 Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate,
-                 std::function<void(std::vector<uint8_t>)> output, Codec codec, bool require_hardware)
+                 std::function<void(std::vector<uint8_t>)> output, Codec codec, bool require_hardware, bool periodic_keyframes)
     : Encoder(width, height, fps, bitrate, [cb = std::move(output)](std::vector<uint8_t> data, bool) {
           cb(std::move(data));
-      }, codec, require_hardware) {}
+      }, codec, require_hardware, periodic_keyframes) {}
 
 Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output,
-                 Codec codec, bool require_hardware)
-    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps, bitrate, codec, require_hardware)) {
+                 Codec codec, bool require_hardware, bool periodic_keyframes)
+    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps, bitrate, codec, require_hardware, periodic_keyframes)) {
     if (codec == Codec::av1) {
         if (require_hardware) throw std::invalid_argument("AV1 encoding uses software libaom");
         std::cerr << "Warning: AV1 hardware encoding is unavailable in this build. Using software libaom.\n";
-        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate);
+        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate, periodic_keyframes);
         return;
     }
     if (codec != Codec::h264 && codec != Codec::h265)
@@ -262,7 +291,7 @@ Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate
 
 Encoder::~Encoder() = default;
 
-void Encoder::encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe) {
+bool Encoder::encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe, uint32_t current_fps) {
     if (!pixels || !CMTIME_IS_NUMERIC(pts))
         throw std::runtime_error("Screen capture returned an invalid frame or timestamp");
     if (impl_->av1) {
@@ -277,12 +306,11 @@ void Encoder::encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe) {
         } unlock{pixels};
         const auto timestamp = CMTimeConvertScale(pts, impl_->duration.timescale, kCMTimeRoundingMethod_Default);
         impl_->last_av1_pts = std::max<int64_t>(impl_->last_av1_pts + 1, timestamp.value);
-        impl_->av1->encode_nv12(static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 0)),
-                                CVPixelBufferGetBytesPerRowOfPlane(pixels, 0),
-                                static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 1)),
-                                CVPixelBufferGetBytesPerRowOfPlane(pixels, 1), impl_->last_av1_pts, impl_->output,
-                                force_keyframe);
-        return;
+        return impl_->av1->encode_nv12(static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 0)),
+                                       CVPixelBufferGetBytesPerRowOfPlane(pixels, 0),
+                                       static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 1)),
+                                       CVPixelBufferGetBytesPerRowOfPlane(pixels, 1), impl_->last_av1_pts, impl_->output,
+                                       force_keyframe, current_fps);
     }
     if (!impl_->session) throw std::logic_error("The compression session is closed");
     if (CMTIME_IS_VALID(impl_->last_vt_pts) && CMTimeCompare(pts, impl_->last_vt_pts) <= 0)
@@ -296,7 +324,17 @@ void Encoder::encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe) {
         impl_->fall_back(error);
         frame = impl_->submit(pixels, pts, true);
     }
-    if (!frame.bytes.empty()) impl_->output(std::move(frame.bytes), frame.keyframe);
+    impl_->psnr = frame.psnr;
+    if (frame.bytes.empty()) return false;
+    impl_->output(std::move(frame.bytes), frame.keyframe);
+    return true;
+}
+
+std::optional<double> Encoder::last_psnr() const { return impl_->psnr; }
+
+std::optional<int> Encoder::last_quantizer() const {
+    if (impl_->av1) return impl_->av1->last_quantizer();
+    return std::nullopt;
 }
 
 bool Encoder::hardware_accelerated() const { return impl_->hardware; }
