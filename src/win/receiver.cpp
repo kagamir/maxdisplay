@@ -87,7 +87,7 @@ struct Receiver {
     std::exception_ptr listener_error; // Read after joining the worker.
     std::atomic<bool> stopping{false};
     std::mutex mutex;
-    std::shared_ptr<net::Socket> active;
+    std::shared_ptr<net::Socket> active_tcp;
     std::shared_ptr<const VideoFrame> frame;
     std::uint32_t frame_sequence = 0; // Published under the same lock as the decoded pixels.
     std::uint64_t session_id = 0;
@@ -249,7 +249,7 @@ struct Receiver {
         std::lock_guard lock(mutex);
         stopping = true;
         // Wake a TCP read. UDP checks the stop flag on every bounded service poll.
-        if (active) active->shutdown();
+        if (active_tcp) active_tcp->shutdown();
     }
 
     void show_status(const wchar_t* message) {
@@ -475,7 +475,7 @@ struct Receiver {
             if (serving_udp) udp_listener->disconnect();
             else {
                 std::lock_guard lock(mutex);
-                active.reset();
+                active_tcp.reset();
             }
             serving_udp = false;
             if (!stopping) show_status(message);
@@ -499,7 +499,7 @@ struct Receiver {
                 {
                     std::lock_guard lock(mutex);
                     if (stopping) break;
-                    active = client;
+                    active_tcp = client;
                 }
                 video = std::async(std::launch::async, [this, client] { return receive_tcp(*client); });
             }

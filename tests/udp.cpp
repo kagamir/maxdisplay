@@ -224,11 +224,8 @@ void shared_port_without_udp_video() {
     // The new ENet connection goes through the same loopback receive queue,
     // after the cursor burst. Leave the cursor queue unread until then.
     for (unsigned seq = 2; seq <= 100; ++seq) send(cursor::packet::wrap(packet(token, seq)));
-    auto client = std::async(std::launch::async, [&] {
-        return std::make_unique<udp::Sender>("127.0.0.1", listener.local_port());
-    });
+    udp::Sender client("127.0.0.1", listener.local_port());
     require(listener.accept(4000), "Cursor burst prevented a subsequent ENet connection");
-    auto connected = client.get();
     std::size_t queued = 0;
     cursor::Bytes last;
     while (listener.receive_cursor(inner, from, 0)) {

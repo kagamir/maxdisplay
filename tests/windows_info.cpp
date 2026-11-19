@@ -49,6 +49,9 @@ void check_addresses() {
     auto binding = win_info::socket_binding(socket.native_handle());
     if (win_info::listening_addresses(binding) != std::vector<std::wstring>{L"127.0.0.1"})
         throw std::runtime_error("Receiver advertised an address outside its binding");
+    auto localhost = net::listen_tcp("localhost", 0);
+    if (win_info::socket_binding(localhost.native_handle()).family != AF_INET)
+        throw std::runtime_error("The localhost binding cannot serve UDP video");
     auto wildcard = net::listen_tcp("0.0.0.0", 0);
     auto all = win_info::listening_addresses(win_info::socket_binding(wildcard.native_handle()));
     if (all.empty()) throw std::runtime_error("No IPv4 address returned from the Windows adapter list");
