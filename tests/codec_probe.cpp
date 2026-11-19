@@ -32,7 +32,7 @@ Color color_at(unsigned x, unsigned y, unsigned index) {
 }
 
 #ifdef __APPLE__
-void probe(const char* path) {
+void probe(const char* path, Codec codec) {
     std::ofstream stream(path, std::ios::binary);
     stream.exceptions(std::ios::badbit | std::ios::failbit);
     unsigned packets = 0;
@@ -42,7 +42,7 @@ void probe(const char* path) {
         stream.write(reinterpret_cast<const char*>(length), sizeof(length));
         stream.write(reinterpret_cast<const char*>(au.data()), n);
         ++packets;
-    });
+    }, codec);
     for (unsigned i = 0; i < frame_count; ++i) {
         CVPixelBufferRef pixel = nullptr;
         if (CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nullptr, &pixel) != kCVReturnSuccess)
@@ -77,16 +77,19 @@ void probe(const char* path) {
     stream.close();
 }
 #else
-void probe(const char* path) {
+void probe(const char* path, Codec codec) {
     std::ifstream stream(path, std::ios::binary);
     stream.exceptions(std::ios::badbit | std::ios::failbit);
-    Decoder decoder(width, height, fps);
+    Decoder decoder(width, height, fps, codec);
     unsigned decoded = 0;
     auto check = [&](VideoFrame&& frame) {
         if (frame.width != width || frame.height != height || frame.bgra.size() != width * height * 4)
             throw std::runtime_error("Unexpected decoded geometry");
-        for (unsigned y : {height / 4, height / 2 - 8, height / 2 + 8, height * 3 / 4}) {
-            for (unsigned x : {width / 4, width / 2 - 8, width / 2 + 8, width * 3 / 4}) {
+        // Realtime AV1 chroma blocks can span the quadrant boundary. Check
+        // solid colors inside each patch instead of the transition band.
+        const unsigned margin = codec == Codec::av1 ? 24 : 8;
+        for (unsigned y : {height / 4, height / 2 - margin, height / 2 + margin, height * 3 / 4}) {
+            for (unsigned x : {width / 4, width / 2 - margin, width / 2 + margin, width * 3 / 4}) {
                 const auto expected = color_at(x, y, decoded);
                 for (unsigned c = 0; c < 3; ++c) {
                     const auto actual = frame.bgra[(y * width + x) * 4 + c];
@@ -117,10 +120,12 @@ void probe(const char* path) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc < 2 || argc > 3) return 2;
+    const std::string name = argc == 3 ? argv[2] : "h264";
+    if (name != "av1" && name != "h264") return 2;
     try {
-        probe(argv[1]);
-        std::cout << "Checked " << frame_count << " H.264 pattern frames\n";
+        probe(argv[1], name == "av1" ? Codec::av1 : Codec::h264);
+        std::cout << "Checked " << frame_count << " " << name << " pattern frames\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

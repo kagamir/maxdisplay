@@ -1,4 +1,5 @@
 #include "decoder.hpp"
+#include "av1.hpp"
 #include "wire.hpp"
 
 #include <windows.h>
@@ -65,10 +66,6 @@ ComPtr<IMFSample> make_sample(DWORD size, DWORD alignment) {
     return sample;
 }
 
-struct YuvMatrix {
-    int y_offset, y_scale, r_v, g_u, g_v, b_u;
-};
-
 YuvMatrix color_matrix(IMFMediaType* type) {
     const auto matrix = MFGetAttributeUINT32(type, MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
     const bool full = MFGetAttributeUINT32(type, MF_MT_VIDEO_NOMINAL_RANGE,
@@ -78,11 +75,7 @@ YuvMatrix color_matrix(IMFMediaType* type) {
                     : YuvMatrix{16, 298, 409, -100, -208, 516};
     }
     return full ? YuvMatrix{0, 256, 403, -48, -120, 475}
-                : YuvMatrix{16, 298, 459, -55, -136, 541};
-}
-
-uint8_t channel(int value) {
-    return static_cast<uint8_t>(std::clamp((value + 128) >> 8, 0, 255));
+                : bt709_video_range;
 }
 
 } // namespace
@@ -189,27 +182,10 @@ struct Decoder::Impl {
             throw std::runtime_error("Short NV12 output buffer or invalid stride");
         }
 
-        const auto matrix = color_matrix(nv12.Get());
-        VideoFrame frame{width, height, std::vector<uint8_t>(static_cast<size_t>(width) * height * 4)};
-        const BYTE* uv_plane = lock.bytes + static_cast<size_t>(stride) * coded_height;
-        for (UINT32 y = 0; y < height; ++y) {
-            const BYTE* luma = lock.bytes + static_cast<size_t>(top + y) * stride + left;
-            const BYTE* uv = uv_plane + static_cast<size_t>((top + y) / 2) * stride + left;
-            BYTE* pixel = frame.bgra.data() + static_cast<size_t>(y) * width * 4;
-            for (UINT32 x = 0; x < width; x += 2) {
-                const int u = uv[x] - 128, v = uv[x + 1] - 128;
-                const int blue = matrix.b_u * u, green = matrix.g_u * u + matrix.g_v * v;
-                const int red = matrix.r_v * v;
-                for (UINT32 i = 0; i < 2; ++i, pixel += 4) {
-                    const int luminance = matrix.y_scale * (luma[x + i] - matrix.y_offset);
-                    pixel[0] = channel(luminance + blue);
-                    pixel[1] = channel(luminance + green);
-                    pixel[2] = channel(luminance + red);
-                    pixel[3] = 255;
-                }
-            }
-        }
-        return frame;
+        const BYTE* luma = lock.bytes + static_cast<size_t>(top) * stride + left;
+        const BYTE* chroma = lock.bytes + static_cast<size_t>(coded_height + top / 2) * stride + left;
+        return convert_yuv420(width, height, color_matrix(nv12.Get()), luma, stride,
+                              chroma, stride, chroma + 1, stride, 2);
     }
 
     void read_output(const Output& output) {
@@ -240,12 +216,19 @@ struct Decoder::Impl {
     }
 };
 
-Decoder::Decoder(uint32_t width, uint32_t height, uint32_t fps)
-    : impl_(std::make_unique<Impl>(width, height, fps)) {}
+Decoder::Decoder(uint32_t width, uint32_t height, uint32_t fps, Codec codec) {
+    if (codec == Codec::av1)
+        av1_ = std::make_unique<Av1Decoder>(width, height);
+    else if (codec == Codec::h264)
+        impl_ = std::make_unique<Impl>(width, height, fps);
+    else
+        throw std::invalid_argument("Unsupported video codec");
+}
 
 Decoder::~Decoder() = default;
 
 void Decoder::decode(const std::vector<uint8_t>& access_unit, const Output& output) {
+    if (av1_) return av1_->decode(access_unit, output);
     if (access_unit.empty() || access_unit.size() > wire::max_frame_bytes) {
         throw std::runtime_error("Invalid H.264 access unit length");
     }
@@ -276,6 +259,7 @@ void Decoder::decode(const std::vector<uint8_t>& access_unit, const Output& outp
 }
 
 void Decoder::finish(const Output& output) {
+    if (av1_) return av1_->finish(output);
     check(impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0), "End stream");
     check(impl_->transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "Drain H.264 decoder");
     impl_->read_output(output);

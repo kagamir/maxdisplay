@@ -1,7 +1,8 @@
-// Feed the Mac codec fixture through the real TCP receiver and sample the window's
+// Feed the Mac codec fixture through the real TCP or UDP receiver and sample the window's
 // client rendering. WM_PRINTCLIENT works even when another window obscures the viewer.
 #include "app.hpp"
 #include "net.hpp"
+#include "udp.hpp"
 #include "wire.hpp"
 
 #include <windows.h>
@@ -15,6 +16,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -118,19 +120,41 @@ bool sees_pattern(HWND window, bool final) {
     return false;
 }
 
-net::Socket start_stream(const Frames& frames, std::uint16_t port, HWND window) {
-    auto socket = net::connect_tcp("127.0.0.1", port);
-    wire::send_header(socket, width, height, fps);
-    for (int i = 0; i < 3; ++i) wire::send_frame(socket, frames[i]);
+class TestSender {
+public:
+    TestSender(const ReceiverOptions& options, Codec codec) {
+        if (options.transport == Transport::udp) {
+            udp_.emplace(options.bind, options.port);
+            udp_->send(wire::encode_header({width, height, fps, codec}));
+        } else {
+            tcp_ = net::connect_tcp(options.bind, options.port);
+            wire::send_header(tcp_, width, height, fps, codec);
+        }
+    }
+
+    void send(const std::vector<uint8_t>& frame) {
+        if (udp_) udp_->send(frame);
+        else wire::send_frame(tcp_, frame);
+    }
+private:
+    net::Socket tcp_;
+    std::optional<udp::Sender> udp_;
+};
+
+void send_initial_frames(TestSender& sender, const Frames& frames, HWND window) {
+    for (int i = 0; i < 3; ++i) sender.send(frames[i]);
     if (!wait_until([&] { return sees_pattern(window, false); }, 8s))
         throw std::runtime_error("The live window did not paint the initial green and gray pattern");
-    return socket;
 }
 
-void check(const Frames& frames) {
+void check(const Frames& frames, Codec codec, Transport transport) {
     ReceiverOptions options;
     options.bind = "127.0.0.1";
-    options.port = net::listen_tcp(options.bind, 0).local_port();
+    options.transport = transport;
+    if (transport == Transport::udp)
+        options.port = udp::Listener(options.bind, 0).local_port();
+    else
+        options.port = net::listen_tcp(options.bind, 0).local_port();
     options.windowed = true;
     std::promise<DWORD> started;
     auto ui_id = started.get_future();
@@ -140,7 +164,7 @@ void check(const Frames& frames) {
     });
     const DWORD thread = ui_id.get();
     HWND window = nullptr;
-    net::Socket client; // Remains connected while Escape interrupts the blocked receiver.
+    std::optional<TestSender> client; // Remain connected during Escape shutdown.
     std::exception_ptr failure;
     try {
         wait_until([&] {
@@ -148,14 +172,16 @@ void check(const Frames& frames) {
             return window || ui.wait_for(0s) == std::future_status::ready;
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
-        client = start_stream(frames, options.port, window);
-        for (unsigned i = 3; i < frames.size(); ++i) wire::send_frame(client, frames[i]);
+        client.emplace(options, codec);
+        send_initial_frames(*client, frames, window);
+        for (unsigned i = 3; i < frames.size(); ++i) client->send(frames[i]);
         if (!wait_until([&] { return sees_pattern(window, true); }, 8s))
             throw std::runtime_error("The live window never painted the final gray level");
-        client = net::Socket{};
-        if (!wait_until([&] { return read_colors(window)[0] == RGB(0, 0, 0); }, 4s))
+        client.reset();
+        if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
             throw std::runtime_error("Disconnected window did not clear its last frame");
-        client = start_stream(frames, options.port, window);
+        client.emplace(options, codec);
+        send_initial_frames(*client, frames, window);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -171,7 +197,10 @@ void check(const Frames& frames) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc < 2 || argc > 4) return 2;
+    const std::string codec = argc > 2 ? argv[2] : "h264";
+    const std::string transport = argc > 3 ? argv[3] : "tcp";
+    if ((codec != "av1" && codec != "h264") || (transport != "tcp" && transport != "udp")) return 2;
     try {
         const auto frames = read_frames(argv[1]);
         // Probe desktop access with a system window class. Lack of monitor visibility
@@ -188,8 +217,9 @@ int main(int argc, char** argv) {
             throw std::system_error(error, std::system_category(), "Create GUI capability probe");
         }
         DestroyWindow(probe);
-        check(frames);
-        std::cout << "Verified live window pixels, receiver reconnect and Escape shutdown\n";
+        check(frames, codec == "av1" ? Codec::av1 : Codec::h264,
+              transport == "udp" ? Transport::udp : Transport::tcp);
+        std::cout << codec << "/" << transport << ": verified live window pixels, receiver reconnect and Escape shutdown\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

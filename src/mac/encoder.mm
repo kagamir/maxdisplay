@@ -1,4 +1,5 @@
 #include "encoder.hpp"
+#include "av1.hpp"
 
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -95,12 +96,15 @@ std::vector<uint8_t> annex_b(CMSampleBufferRef sample) {
 struct Encoder::Impl {
     VTCompressionSessionRef session = nullptr;
     Output output;
+    std::unique_ptr<Av1Encoder> av1;
+    uint32_t width, height;
+    int64_t last_pts = -1;
     std::mutex error_mutex;
     std::exception_ptr error;
     CMTime duration;
 
-    Impl(Output cb, uint32_t fps)
-        : output(std::move(cb)), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
+    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps)
+        : output(std::move(cb)), width(w), height(h), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
 
     OSStatus close() noexcept {
         if (!session)
@@ -132,8 +136,13 @@ struct Encoder::Impl {
     }
 };
 
-Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output)
-    : impl_(std::make_unique<Impl>(std::move(output), fps)) {
+Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output, Codec codec)
+    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps)) {
+    if (codec == Codec::av1) {
+        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate);
+        return;
+    }
+    if (codec != Codec::h264) throw std::invalid_argument("Unsupported video codec");
     NSDictionary* spec = @{(__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES};
     check_status(VTCompressionSessionCreate(kCFAllocatorDefault, width, height, kCMVideoCodecType_H264,
                                             (__bridge CFDictionaryRef)spec, nullptr, nullptr,
@@ -159,10 +168,27 @@ Encoder::~Encoder() = default;
 
 void Encoder::encode(CVPixelBufferRef pixels, CMTime pts) {
     check_error();
-    if (!impl_->session)
-        throw std::logic_error("The H.264 compression session is closed");
     if (!pixels || !CMTIME_IS_NUMERIC(pts))
         throw std::runtime_error("Screen capture returned an invalid frame or timestamp");
+    if (impl_->av1) {
+        if (CVPixelBufferGetPixelFormatType(pixels) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+            CVPixelBufferGetPlaneCount(pixels) != 2 || CVPixelBufferGetWidth(pixels) != impl_->width ||
+            CVPixelBufferGetHeight(pixels) != impl_->height)
+            throw std::runtime_error("AV1 capture requires video-range NV12 at the configured size");
+        check_status(CVPixelBufferLockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly), "Lock AV1 capture buffer");
+        struct Unlock {
+            CVPixelBufferRef pixels;
+            ~Unlock() { CVPixelBufferUnlockBaseAddress(pixels, kCVPixelBufferLock_ReadOnly); }
+        } unlock{pixels};
+        const auto timestamp = CMTimeConvertScale(pts, impl_->duration.timescale, kCMTimeRoundingMethod_Default);
+        impl_->last_pts = std::max<int64_t>(impl_->last_pts + 1, timestamp.value);
+        impl_->av1->encode_nv12(static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 0)),
+                                CVPixelBufferGetBytesPerRowOfPlane(pixels, 0),
+                                static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixels, 1)),
+                                CVPixelBufferGetBytesPerRowOfPlane(pixels, 1), impl_->last_pts, impl_->output);
+        return;
+    }
+    if (!impl_->session) throw std::logic_error("The compression session is closed");
     check_status(VTCompressionSessionEncodeFrame(impl_->session, pixels, pts, impl_->duration,
                                                  nullptr, nullptr, nullptr),
                  "Submit H.264 frame");
@@ -178,6 +204,11 @@ void Encoder::check_error() const {
 }
 
 void Encoder::finish() {
+    if (impl_->av1) {
+        impl_->av1->finish(impl_->output);
+        impl_->av1.reset();
+        return;
+    }
     OSStatus status = impl_->close();
     check_error();
     check_status(status, "Finish H.264 encoder");

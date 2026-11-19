@@ -71,6 +71,22 @@ void check_layout() {
             bytes == Bytes{0, 0, 0, 4, 0, 0, 1, 0xff}, "Invalid wire frame");
 }
 
+void codec_headers() {
+    require(wire::encode_header({1920, 1080, 60}) == hello, "Legacy H.264 header changed");
+    Connection connection;
+    wire::send_header(connection.writer, 3840, 2160, 60, Codec::av1);
+    wire::send_frame(connection.writer, {0x12, 0x00});
+    const auto header = wire::receive_header(connection.reader);
+    require(header.codec == Codec::av1 && header.width == 3840 && header.fps == 60, "AV1 header mismatch");
+    Bytes frame;
+    require(wire::receive_frame(connection.reader, frame) && frame == Bytes{0x12, 0x00}, "Lost frame boundary");
+    auto bad = wire::encode_header(header);
+    bad.back() = 255;
+    expect_failure([&] { wire::decode_header(bad); }, "Accepted unknown codec identifier");
+    bad.resize(20);
+    expect_failure([&] { wire::decode_header(bad); }, "Accepted truncated extended header");
+}
+
 void large_frame() {
     Connection connection;
     Bytes payload(6 * 1024 * 1024);
@@ -130,6 +146,7 @@ int main() {
     try {
         round_trip();
         check_layout();
+        codec_headers();
         large_frame();
         auto header = hello;
         header[0] = 0;

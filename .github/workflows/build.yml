@@ -15,7 +15,7 @@ jobs:
     if: github.event.deleted != true
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +37,18 @@ jobs:
       - name: Configure macOS
         if: runner.os == 'macOS'
         run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DBUILD_TESTING=ON
+
+      - name: Locate or install NASM for the x64 AV1 codec
+        if: runner.os == 'Windows'
+        run: |
+          if (Get-Command nasm -ErrorAction SilentlyContinue) { exit 0 }
+          $dir = Join-Path $env:ProgramFiles 'NASM'
+          if (-not (Test-Path "$dir/nasm.exe")) {
+            choco install nasm --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if (Test-Path "$dir/nasm.exe") { $dir >> $env:GITHUB_PATH }
+          elseif (-not (Get-Command nasm -ErrorAction SilentlyContinue)) { throw "NASM executable not found" }
 
       - name: Configure Windows
         if: runner.os == 'Windows'
@@ -88,16 +100,20 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: Encode Mac test pattern
+      - name: Encode H.264 and AV1 test patterns on Mac
         if: runner.os == 'macOS'
-        run: ./build/Release/codec_probe test-pattern.frames
+        run: |
+          ./build/Release/codec_probe h264.frames h264
+          ./build/Release/codec_probe av1.frames av1
 
       - name: Store encoded test fixture
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v7
         with:
           name: mac-encoded-fixture
-          path: test-pattern.frames
+          path: |
+            h264.frames
+            av1.frames
           retention-days: 1
           if-no-files-found: error
 
@@ -116,16 +132,24 @@ jobs:
           name: windows-video-tests
           path: tools
       - *media-foundation
-      - name: Check decoded frames
-        run: .\tools\codec_probe.exe fixture\test-pattern.frames
-      - name: Check live Windows presentation
+      - name: Check H.264 and AV1 decoded pixels and frame order
         run: |
-          .\tools\windows_present_tests.exe fixture\test-pattern.frames
-          if ($LASTEXITCODE -eq 77) {
-            Write-Warning "Window readback skipped in this desktop session."
-            exit 0
+          foreach ($codec in 'h264', 'av1') {
+            .\tools\codec_probe.exe "fixture/$codec.frames" $codec
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          exit $LASTEXITCODE
+      - name: Check live Windows presentation over TCP and UDP
+        run: |
+          foreach ($codec in 'h264', 'av1') {
+            foreach ($transport in 'tcp', 'udp') {
+              .\tools\windows_present_tests.exe "fixture/$codec.frames" $codec $transport
+              if ($LASTEXITCODE -eq 77) {
+                Write-Warning "Window readback skipped in this desktop session."
+                exit 0
+              }
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
 
   release:
     name: Publish binaries to GitHub Releases

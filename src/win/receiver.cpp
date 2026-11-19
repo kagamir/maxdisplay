@@ -1,6 +1,8 @@
 #include "app.hpp"
 #include "decoder.hpp"
+#include "display_info.hpp"
 #include "net.hpp"
+#include "udp.hpp"
 #include "wire.hpp"
 
 #ifndef NOMINMAX
@@ -19,15 +21,21 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
 
 constexpr wchar_t window_class[] = L"MaxDisplayReceiver";
 constexpr UINT listener_failed = WM_APP + 1;
+constexpr UINT_PTR address_timer = 1;
+using Listener = std::variant<net::Socket, udp::Listener>;
 
 struct Receiver {
     HWND window = nullptr;
+    win_info::Binding binding{};
+    std::uint16_t port = 0;
+    std::wstring address_text;
     bool fullscreen = false;
     WINDOWPLACEMENT windowed_placement{};
     std::exception_ptr listener_error; // Read after joining the worker.
@@ -37,10 +45,25 @@ struct Receiver {
     std::shared_ptr<const VideoFrame> frame;
     const wchar_t* status = L"Waiting for the Mac to connect";
 
+    // Only the UI thread reads and updates the network details shown while idle.
+    void refresh_addresses() {
+        auto addresses = win_info::listening_addresses(binding);
+        std::wstring text;
+        for (const auto& ip : addresses) {
+            if (!text.empty()) text += L"     ";
+            text += ip;
+        }
+        if (text.empty()) text = L"No active address";
+        if (text != address_text) {
+            address_text = std::move(text);
+            if (window) InvalidateRect(window, nullptr, FALSE);
+        }
+    }
+
     void stop() {
         std::lock_guard lock(mutex);
         stopping = true;
-        // Wake a worker blocked halfway through a stream header or H.264 frame.
+        // Wake a TCP read. UDP checks the stop flag on every bounded service poll.
         if (active) active->shutdown();
     }
 
@@ -63,39 +86,69 @@ struct Receiver {
         InvalidateRect(window, nullptr, FALSE);
     }
 
-    void receive(net::Socket& listener) {
+    template<class ReadHeader, class ReadFrame>
+    void receive_stream(ReadHeader read_header, ReadFrame read_frame) {
+        show_status(L"Mac connected. Waiting for video");
+        const wchar_t* next_status = L"Stream ended. Waiting for the Mac to reconnect";
         try {
-            while (!stopping) {
-                if (!net::wait_readable(listener, 150)) continue;
-                auto accepted = net::accept_tcp(listener);
-                if (!accepted) continue;
-                auto client = std::make_shared<net::Socket>(std::move(accepted));
-                {
-                    std::lock_guard lock(mutex);
-                    if (stopping) break;
-                    active = client;
-                }
-                show_status(L"Mac connected. Waiting for video");
-                const wchar_t* next_status = L"Stream ended. Waiting for the Mac to reconnect";
-                try {
-                    const auto header = wire::receive_header(*client);
-                    Decoder decoder(header.width, header.height, header.fps);
-                    auto display = [this](VideoFrame&& decoded) { present(std::move(decoded)); };
-                    std::vector<std::uint8_t> bytes;
-                    while (!stopping && wire::receive_frame(*client, bytes)) {
-                        decoder.decode(bytes, display);
-                    }
-                    if (!stopping) decoder.finish(display);
-                } catch (const std::exception& e) {
-                    if (!stopping) std::cerr << "Stream error: " << e.what() << '\n';
-                    next_status = L"Stream error. See the console for details. Waiting for a connection";
-                }
-                {
-                    std::lock_guard lock(mutex);
-                    active.reset();
-                }
-                if (!stopping) show_status(next_status);
+            const auto header = read_header();
+            Decoder decoder(header.width, header.height, header.fps, header.codec);
+            auto display = [this](VideoFrame&& decoded) { present(std::move(decoded)); };
+            std::vector<std::uint8_t> bytes;
+            while (!stopping && read_frame(bytes)) {
+                decoder.decode(bytes, display);
             }
+            if (!stopping) decoder.finish(display);
+        } catch (const std::exception& e) {
+            if (!stopping) std::cerr << "Stream error: " << e.what() << '\n';
+            next_status = L"Stream error. See the console for details. Waiting for a connection";
+        }
+        if (!stopping) show_status(next_status);
+    }
+
+    void listen(net::Socket& listener) {
+        while (!stopping) {
+            if (!net::wait_readable(listener, 150)) continue;
+            auto accepted = net::accept_tcp(listener);
+            if (!accepted) continue;
+            auto client = std::make_shared<net::Socket>(std::move(accepted));
+            {
+                std::lock_guard lock(mutex);
+                if (stopping) break;
+                active = client;
+            }
+            receive_stream([&] { return wire::receive_header(*client); },
+                           [&](auto& bytes) { return wire::receive_frame(*client, bytes); });
+            std::lock_guard lock(mutex);
+            active.reset();
+        }
+    }
+
+    void listen(udp::Listener& listener) {
+        auto read = [&](std::vector<std::uint8_t>& bytes) {
+            while (!stopping) {
+                switch (listener.receive(bytes, 100)) {
+                case udp::ReadResult::message: return true;
+                case udp::ReadResult::disconnected: return false;
+                case udp::ReadResult::timeout: break;
+                }
+            }
+            return false;
+        };
+        while (!stopping) {
+            if (!listener.accept(100)) continue;
+            receive_stream([&] {
+                std::vector<std::uint8_t> bytes;
+                if (!read(bytes)) throw std::runtime_error("UDP stream ended before its header");
+                return wire::decode_header(bytes);
+            }, read);
+            listener.disconnect();
+        }
+    }
+
+    void receive(Listener& listener) {
+        try {
+            std::visit([this](auto& server) { listen(server); }, listener);
         } catch (...) {
             listener_error = std::current_exception();
             PostMessageW(window, listener_failed, 0, 0);
@@ -147,8 +200,25 @@ void paint_client(Receiver& receiver, HDC dc) {
         FillRect(dc, &area, black);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(224, 224, 224));
-        SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-        DrawTextW(dc, status, -1, &area, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        const SIZE pixels = win_info::monitor_pixels(receiver.window);
+        std::wstring details = status;
+        if (pixels.cx > 0 && pixels.cy > 0)
+            details += L"\nDisplay: " + std::to_wstring(pixels.cx) + L" × " + std::to_wstring(pixels.cy) + L" px";
+        details += L"\n\nLocal IP addresses (port " + std::to_wstring(receiver.port) + L")\n" + receiver.address_text;
+        const auto dpi = GetDpiForWindow(receiver.window);
+        HFONT font = CreateFontW(-MulDiv(13, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ previous = SelectObject(dc, font ? static_cast<HGDIOBJ>(font) : GetStockObject(DEFAULT_GUI_FONT));
+        const int inset = (std::min)(MulDiv(16, dpi, 96), width / 4);
+        RECT bounds{inset, 0, width - inset, height};
+        RECT measured = bounds;
+        constexpr UINT flags = DT_CENTER | DT_WORDBREAK | DT_NOPREFIX;
+        DrawTextW(dc, details.c_str(), -1, &measured, flags | DT_CALCRECT);
+        bounds.top = (std::max)(0L, (height - measured.bottom) / 2);
+        DrawTextW(dc, details.c_str(), -1, &bounds, flags);
+        SelectObject(dc, previous);
+        if (font) DeleteObject(font);
     } else if (width > 0 && height > 0) {
         const int src_width = static_cast<int>(frame->width);
         const int src_height = static_cast<int>(frame->height);
@@ -206,8 +276,19 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
+    case WM_MOVE:
         InvalidateRect(window, nullptr, FALSE);
         return 0;
+    case WM_TIMER:
+        if (wp == address_timer) {
+            {
+                std::lock_guard lock(receiver->mutex);
+                if (receiver->frame) return 0;
+            }
+            receiver->refresh_addresses();
+            return 0;
+        }
+        break;
     case WM_SETCURSOR:
         if (receiver->fullscreen && LOWORD(lp) == HTCLIENT) {
             SetCursor(nullptr);
@@ -225,6 +306,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DISPLAYCHANGE:
         if (receiver->fullscreen) fit_monitor(window);
+        InvalidateRect(window, nullptr, FALSE);
         return 0;
     case WM_KEYDOWN:
         if (wp == VK_F11 && !(lp & (1L << 30))) {
@@ -245,7 +327,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int run_receiver(const ReceiverOptions& options) {
-    net::Socket listener = net::listen_tcp(options.bind, options.port);
+    win_info::KeepAwake keep_awake;
+    Listener listener = options.transport == Transport::udp
+        ? Listener(std::in_place_type<udp::Listener>, options.bind, options.port)
+        : Listener(net::listen_tcp(options.bind, options.port));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{};
@@ -258,13 +343,18 @@ int run_receiver(const ReceiverOptions& options) {
         throw std::system_error(GetLastError(), std::system_category(), "RegisterClassExW");
 
     Receiver receiver;
+    receiver.binding = win_info::resolve_binding(options.bind, options.transport == Transport::udp);
+    receiver.port = options.port;
+    receiver.refresh_addresses();
     HWND window = CreateWindowExW(0, window_class, L"MaxDisplay", WS_OVERLAPPEDWINDOW,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1000, 620,
                                   nullptr, nullptr, instance, &receiver);
     if (!window) throw std::system_error(GetLastError(), std::system_category(), "CreateWindowExW");
+    SetTimer(window, address_timer, 5000, nullptr);
     ShowWindow(window, SW_SHOWNORMAL);
     if (!options.windowed) toggle_fullscreen(receiver);
-    std::cout << "Listening on " << options.bind << ':' << options.port
+    std::cout << "Listening on " << (options.transport == Transport::udp ? "UDP " : "TCP ")
+              << options.bind << ':' << options.port
               << ". F11 toggles full screen. Esc exits.\n" << std::flush;
 
     try {

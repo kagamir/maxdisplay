@@ -52,7 +52,7 @@ Class private_class(NSString *name, std::initializer_list<SEL> required) {
     return cls;
 }
 
-MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps) {
+MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi) {
     Class descriptor_class = private_class(@"CGVirtualDisplayDescriptor",
         {@selector(setQueue:), @selector(setName:), @selector(setMaxPixelsWide:),
          @selector(setMaxPixelsHigh:), @selector(setSizeInMillimeters:), @selector(setVendorID:),
@@ -73,18 +73,23 @@ MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps) {
     if ([descriptor respondsToSelector:@selector(setSerialNumber:)]) descriptor.serialNumber = 1;
     descriptor.maxPixelsWide = width;
     descriptor.maxPixelsHigh = height;
-    descriptor.sizeInMillimeters = CGSizeMake(width * 25.4 / 110, height * 25.4 / 110);
+    const double pixels_per_inch = hi_dpi ? 220 : 110;
+    descriptor.sizeInMillimeters = CGSizeMake(width * 25.4 / pixels_per_inch, height * 25.4 / pixels_per_inch);
     descriptor.redPrimary = CGPointMake(0.640, 0.330);
     descriptor.greenPrimary = CGPointMake(0.300, 0.600);
     descriptor.bluePrimary = CGPointMake(0.150, 0.060);
     descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
 
-    MDDisplayMode *mode = [(MDDisplayMode *)[mode_class alloc] initWithWidth:width
-                                                                   height:height
-                                                              refreshRate:fps];
+    // For HiDPI the descriptor advertises the backing pixels, while the mode
+    // advertises points. CoreGraphics renders each point at 2× on both axes.
+    const auto mode_width = hi_dpi ? width / 2 : width;
+    const auto mode_height = hi_dpi ? height / 2 : height;
+    MDDisplayMode *mode = [(MDDisplayMode *)[mode_class alloc] initWithWidth:mode_width
+                                                                      height:mode_height
+                                                                 refreshRate:fps];
     if (!mode) throw std::runtime_error("macOS rejected the virtual display mode");
     MDDisplaySettings *settings = [settings_class new];
-    settings.hiDPI = 0;
+    settings.hiDPI = hi_dpi ? 1 : 0;
     settings.modes = @[mode];
     MDDisplay *display = [(MDDisplay *)[display_class alloc] initWithDescriptor:descriptor];
     if (!display || ![display applySettings:settings] || display.displayID == kCGNullDirectDisplay)
@@ -107,8 +112,8 @@ void extend_display(CGDirectDisplayID display_id) {
 
 } // namespace
 
-VirtualDisplay::VirtualDisplay(uint32_t width, uint32_t height, uint32_t fps)
-    : display_(make_display(width, height, fps)) {
+VirtualDisplay::VirtualDisplay(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi)
+    : display_(make_display(width, height, fps, hi_dpi)) {
     using namespace std::chrono_literals;
     auto deadline = std::chrono::steady_clock::now() + 8s;
     bool requested_extension = false;

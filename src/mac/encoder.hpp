@@ -1,5 +1,7 @@
 #pragma once
 
+#include "media.hpp"
+
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 
@@ -12,7 +14,8 @@ class Encoder {
 public:
     using Output = std::function<void(std::vector<uint8_t>)>;
 
-    Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output);
+    Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output,
+            Codec codec = Codec::h264);
     ~Encoder();
 
     // Call from the serial capture queue. Output can run on a VideoToolbox thread.

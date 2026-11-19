@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "encoder.hpp"
 #include "net.hpp"
+#include "udp.hpp"
 #include "wire.hpp"
 #include "virtual_display.hpp"
 
@@ -90,14 +91,31 @@ SCDisplay *find_display(CGDirectDisplayID display_id) {
     throw std::runtime_error("MaxDisplay did not appear as an active extended display. Check System Settings > Displays.");
 }
 
-// A serial writer keeps TCP I/O off the capture and VideoToolbox callback
-// queues. Never discard an encoded P-frame while continuing the same stream.
+// TCP writes can block. UDP has its own bounded queue and service thread.
+// Both paths preserve inter-frame dependencies.
 class Connection : public std::enable_shared_from_this<Connection> {
 public:
-    explicit Connection(net::Socket socket) : socket_(std::move(socket)) {}
+    explicit Connection(const SenderOptions& options) {
+        if (options.transport == Transport::udp)
+            udp_ = std::make_unique<udp::Sender>(options.host, options.port);
+        else
+            tcp_ = net::connect_tcp(options.host, options.port);
+    }
+
+    void send_header(const SenderOptions& options) {
+        if (udp_) {
+            udp_->send(wire::encode_header({options.width, options.height, options.fps, options.codec}));
+        } else {
+            wire::send_header(tcp_, options.width, options.height, options.fps, options.codec);
+        }
+    }
 
     void send(std::vector<uint8_t> frame) {
         if (closing_.load()) return;
+        if (udp_) {
+            udp_->send(frame);
+            return;
+        }
         if (pending_.fetch_add(1) >= 12) {
             --pending_;
             throw std::runtime_error("Receiver is too slow. Try a lower bitrate or frame rate.");
@@ -106,7 +124,7 @@ public:
         auto payload = std::make_shared<std::vector<uint8_t>>(std::move(frame));
         dispatch_async(writes_, ^{
             if (!self->closing_) {
-                try { wire::send_frame(self->socket_, *payload); }
+                try { wire::send_frame(self->tcp_, *payload); }
                 catch (...) { self->fail(std::current_exception()); }
             }
             --self->pending_;
@@ -124,16 +142,19 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             if (error_) std::rethrow_exception(error_);
         }
-        if (socket_.peer_closed()) throw std::runtime_error("Windows receiver disconnected");
+        if (udp_ ? udp_->peer_closed() : tcp_.peer_closed())
+            throw std::runtime_error("Windows receiver disconnected");
     }
 
     void close() {
         closing_ = true;
-        socket_.shutdown();
+        if (udp_) udp_->shutdown();
+        else tcp_.shutdown();
         dispatch_sync(writes_, ^{});
     }
 private:
-    net::Socket socket_;
+    net::Socket tcp_;
+    std::unique_ptr<udp::Sender> udp_;
     dispatch_queue_t writes_ = dispatch_queue_create("maxdisplay.network", DISPATCH_QUEUE_SERIAL);
     std::atomic<unsigned> pending_{0};
     std::atomic<bool> closing_{false};
@@ -190,8 +211,8 @@ int stream_desktop(const SenderOptions& options) {
         throw std::runtime_error("Allow Screen Recording for MaxDisplay or your terminal in System Settings "
                                  "> Privacy & Security, then quit, reopen and retry.");
 
-    auto socket = net::connect_tcp(options.host, options.port);
-    VirtualDisplay display(options.width, options.height, options.fps);
+    auto connection = std::make_shared<Connection>(options);
+    VirtualDisplay display(options.width, options.height, options.fps, options.scale == 2.0);
     CGDirectDisplayID display_id = display.id();
     SCDisplay *source = find_display(display_id);
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:source excludingWindows:@[]];
@@ -206,10 +227,9 @@ int stream_desktop(const SenderOptions& options) {
     config.showsCursor = YES;
     config.capturesAudio = NO;
 
-    wire::send_header(socket, options.width, options.height, options.fps);
-    auto connection = std::make_shared<Connection>(std::move(socket));
+    connection->send_header(options);
     auto encoder = std::make_shared<Encoder>(options.width, options.height, options.fps, options.bitrate,
-        [connection](std::vector<uint8_t> frame) { connection->send(std::move(frame)); });
+        [connection](std::vector<uint8_t> frame) { connection->send(std::move(frame)); }, options.codec);
     MDStreamSink *sink = [MDStreamSink new];
     sink->encoder = encoder;
     sink->connection = connection;
@@ -223,7 +243,10 @@ int stream_desktop(const SenderOptions& options) {
     try {
         change_capture(stream, true);
         std::cout << "Streaming MaxDisplay " << options.width << 'x' << options.height << " to "
-                  << options.host << ':' << options.port << ". Press Ctrl+C to stop." << std::endl;
+                  << options.host << ':' << options.port << " using "
+                  << (options.codec == Codec::av1 ? "AV1" : "H.264") << " over "
+                  << (options.transport == Transport::udp ? "UDP" : "TCP")
+                  << ". Press Ctrl+C to stop." << std::endl;
         while (!interrupted) {
             connection->check();
             encoder->check_error();

@@ -25,19 +25,21 @@ bool contains(const std::vector<CGDirectDisplayID>& displays, CGDirectDisplayID 
     return std::find(displays.begin(), displays.end(), id) != displays.end();
 }
 
-void check_lifecycle() {
+void check_lifecycle(bool hi_dpi) {
     using namespace std::chrono_literals;
     const auto original = online_displays();
     CGDirectDisplayID id = kCGNullDirectDisplay;
     @autoreleasepool {
-        VirtualDisplay display(1280, 720, 60);
+        VirtualDisplay display(1280, 720, 60, hi_dpi);
         id = display.id();
         if (contains(original, id) || !contains(online_displays(), id) ||
             !CGDisplayIsActive(id) || CGDisplayIsInMirrorSet(id))
             throw std::runtime_error("MaxDisplay is not a newly registered independent display");
         CGDisplayModeRef mode = CGDisplayCopyDisplayMode(id);
         if (!mode) throw std::runtime_error("Cannot read the virtual display mode");
-        bool matches = CGDisplayModeGetPixelWidth(mode) == 1280 && CGDisplayModeGetPixelHeight(mode) == 720;
+        const bool matches = CGDisplayModeGetPixelWidth(mode) == 1280 && CGDisplayModeGetPixelHeight(mode) == 720 &&
+                             CGDisplayModeGetWidth(mode) == (hi_dpi ? 640u : 1280u) &&
+                             CGDisplayModeGetHeight(mode) == (hi_dpi ? 360u : 720u);
         CGDisplayModeRelease(mode);
         if (!matches) throw std::runtime_error("Virtual display did not use the requested 1280x720 pixel mode");
     }
@@ -61,7 +63,10 @@ int main() {
             return 77;
         }
         CFRelease(session);
-        try { check_lifecycle(); }
+        try {
+            check_lifecycle(false);
+            check_lifecycle(true);
+        }
         catch (const std::exception& error) {
             std::cerr << error.what() << '\n';
             return 1;
