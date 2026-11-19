@@ -1,0 +1,365 @@
+#include "app.hpp"
+#include "encoder.hpp"
+#include "net.hpp"
+#include "wire.hpp"
+
+#import <CoreGraphics/CoreGraphics.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+#import <Foundation/Foundation.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <exception>
+#include <initializer_list>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+// CoreGraphics does not publish headers for virtual displays. These local
+// types describe the message ABI; private classes are resolved only at runtime.
+@interface MDDisplayDescriptor : NSObject
+@property(nonatomic, strong) dispatch_queue_t queue;
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic) unsigned int maxPixelsWide;
+@property(nonatomic) unsigned int maxPixelsHigh;
+@property(nonatomic) unsigned int vendorID;
+@property(nonatomic) unsigned int productID;
+@property(nonatomic) unsigned int serialNum;
+@property(nonatomic) unsigned int serialNumber;
+@property(nonatomic) CGSize sizeInMillimeters;
+@property(nonatomic) CGPoint redPrimary;
+@property(nonatomic) CGPoint greenPrimary;
+@property(nonatomic) CGPoint bluePrimary;
+@property(nonatomic) CGPoint whitePoint;
+@end
+
+@interface MDDisplayMode : NSObject
+- (instancetype)initWithWidth:(unsigned int)width height:(unsigned int)height refreshRate:(double)rate;
+@end
+
+@interface MDDisplaySettings : NSObject
+@property(nonatomic) unsigned int hiDPI;
+@property(nonatomic, copy) NSArray *modes;
+@end
+
+@interface MDDisplay : NSObject
+- (instancetype)initWithDescriptor:(MDDisplayDescriptor *)descriptor;
+- (BOOL)applySettings:(MDDisplaySettings *)settings;
+@property(nonatomic, readonly) CGDirectDisplayID displayID;
+@end
+
+namespace {
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+volatile std::sig_atomic_t interrupted = 0;
+void signal_stop(int) { interrupted = 1; }
+
+class StopSignals {
+public:
+    StopSignals() {
+        interrupted = 0;
+        previous_int_ = std::signal(SIGINT, signal_stop);
+        previous_term_ = std::signal(SIGTERM, signal_stop);
+    }
+    ~StopSignals() {
+        std::signal(SIGINT, previous_int_);
+        std::signal(SIGTERM, previous_term_);
+    }
+private:
+    using Handler = void (*)(int);
+    Handler previous_int_, previous_term_;
+};
+
+void pump(double seconds) {
+    @autoreleasepool {
+        if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false) == kCFRunLoopRunFinished)
+            std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+    }
+}
+
+void wait_for(dispatch_semaphore_t done, Clock::time_point deadline, const char *operation,
+              bool cancelable = true) {
+    while (dispatch_semaphore_wait(done, DISPATCH_TIME_NOW) != 0) {
+        if (cancelable && interrupted) throw std::runtime_error("Interrupted");
+        if (Clock::now() >= deadline) throw std::runtime_error(std::string(operation) + " timed out");
+        pump(0.025);
+    }
+}
+
+std::runtime_error capture_error(const char *operation, NSError *error) {
+    return std::runtime_error(std::string(operation) + ": " +
+                              (error.localizedDescription.UTF8String ?: "unknown ScreenCaptureKit error"));
+}
+
+Class private_class(NSString *name, std::initializer_list<SEL> required) {
+    Class cls = NSClassFromString(name);
+    for (SEL selector : required) {
+        if (![cls instancesRespondToSelector:selector])
+            throw std::runtime_error(std::string("Unsupported macOS virtual display API: ") +
+                                     name.UTF8String + " " + NSStringFromSelector(selector).UTF8String);
+    }
+    return cls;
+}
+
+MDDisplay *make_display(const SenderOptions& options) {
+    Class descriptor_class = private_class(@"CGVirtualDisplayDescriptor",
+        {@selector(setQueue:), @selector(setName:), @selector(setMaxPixelsWide:),
+         @selector(setMaxPixelsHigh:), @selector(setSizeInMillimeters:), @selector(setVendorID:),
+         @selector(setProductID:), @selector(setSerialNum:), @selector(setWhitePoint:),
+         @selector(setRedPrimary:), @selector(setGreenPrimary:), @selector(setBluePrimary:)});
+    Class mode_class = private_class(@"CGVirtualDisplayMode", {@selector(initWithWidth:height:refreshRate:)});
+    Class settings_class = private_class(@"CGVirtualDisplaySettings", {@selector(setModes:), @selector(setHiDPI:)});
+    Class display_class = private_class(@"CGVirtualDisplay",
+        {@selector(initWithDescriptor:), @selector(applySettings:), @selector(displayID)});
+
+    MDDisplayDescriptor *descriptor = [descriptor_class new];
+    descriptor.name = @"MaxDisplay";
+    descriptor.queue = dispatch_get_main_queue();
+    descriptor.vendorID = 0xF0F0;
+    descriptor.productID = 1;
+    // A stable identity lets macOS remember the user's display arrangement.
+    descriptor.serialNum = 1;
+    if ([descriptor respondsToSelector:@selector(setSerialNumber:)]) descriptor.serialNumber = 1;
+    descriptor.maxPixelsWide = options.width;
+    descriptor.maxPixelsHigh = options.height;
+    descriptor.sizeInMillimeters = CGSizeMake(options.width * 25.4 / 110, options.height * 25.4 / 110);
+    descriptor.redPrimary = CGPointMake(0.640, 0.330);
+    descriptor.greenPrimary = CGPointMake(0.300, 0.600);
+    descriptor.bluePrimary = CGPointMake(0.150, 0.060);
+    descriptor.whitePoint = CGPointMake(0.3127, 0.3290);
+
+    MDDisplayMode *mode = [(MDDisplayMode *)[mode_class alloc] initWithWidth:options.width
+                                                                   height:options.height
+                                                              refreshRate:options.fps];
+    if (!mode) throw std::runtime_error("macOS rejected the virtual display mode");
+    MDDisplaySettings *settings = [settings_class new];
+    settings.hiDPI = 0;
+    settings.modes = @[mode];
+    MDDisplay *display = [(MDDisplay *)[display_class alloc] initWithDescriptor:descriptor];
+    if (!display || ![display applySettings:settings] || display.displayID == kCGNullDirectDisplay)
+        throw std::runtime_error("macOS could not register MaxDisplay with the requested display mode");
+    return display;
+}
+
+void extend_display(CGDirectDisplayID display_id) {
+    if (!CGDisplayIsInMirrorSet(display_id)) return;
+    CGDisplayConfigRef change = nullptr;
+    if (CGBeginDisplayConfiguration(&change) != kCGErrorSuccess)
+        throw std::runtime_error("Could not begin display configuration");
+    if (CGConfigureDisplayMirrorOfDisplay(change, display_id, kCGNullDirectDisplay) != kCGErrorSuccess) {
+        CGCancelDisplayConfiguration(change);
+        throw std::runtime_error("Could not disable mirroring for MaxDisplay");
+    }
+    if (CGCompleteDisplayConfiguration(change, kCGConfigureForAppOnly) != kCGErrorSuccess)
+        throw std::runtime_error("Could not apply extended display configuration");
+}
+
+SCDisplay *find_display(CGDirectDisplayID display_id) {
+    // WindowServer and ScreenCaptureKit observe new displays asynchronously.
+    auto deadline = Clock::now() + 10s;
+    bool requested_extension = false;
+    while (Clock::now() < deadline && !interrupted) {
+        if (CGDisplayIsOnline(display_id)) {
+            if (CGDisplayIsInMirrorSet(display_id)) {
+                if (!requested_extension) {
+                    extend_display(display_id);
+                    requested_extension = true;
+                }
+            } else if (CGDisplayIsActive(display_id)) {
+                __block SCDisplay *found = nil;
+                __block NSError *failure = nil;
+                auto done = dispatch_semaphore_create(0);
+                [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:NO
+                    completionHandler:^(SCShareableContent *content, NSError *error) {
+                        failure = error;
+                        for (SCDisplay *screen in content.displays) {
+                            if (screen.displayID == display_id) { found = screen; break; }
+                        }
+                        dispatch_semaphore_signal(done);
+                    }];
+                wait_for(done, deadline, "Enumerating displays");
+                if (failure) throw capture_error("Enumerating displays", failure);
+                if (found) return found;
+            }
+        }
+        pump(0.1);
+    }
+    throw std::runtime_error("MaxDisplay did not appear as an active extended display. Check System Settings > Displays.");
+}
+
+// A serial writer keeps TCP I/O off the capture and VideoToolbox callback
+// queues. Never discard an encoded P-frame while continuing the same stream.
+class Connection : public std::enable_shared_from_this<Connection> {
+public:
+    explicit Connection(net::Socket socket) : socket_(std::move(socket)) {}
+
+    void send(std::vector<uint8_t> frame) {
+        if (closing_.load()) return;
+        if (pending_.fetch_add(1) >= 12) {
+            --pending_;
+            throw std::runtime_error("Receiver is too slow. Try a lower bitrate or frame rate.");
+        }
+        auto self = shared_from_this();
+        auto payload = std::make_shared<std::vector<uint8_t>>(std::move(frame));
+        dispatch_async(writes_, ^{
+            if (!self->closing_) {
+                try { wire::send_frame(self->socket_, *payload); }
+                catch (...) { self->fail(std::current_exception()); }
+            }
+            --self->pending_;
+        });
+    }
+
+    void fail(std::exception_ptr error) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!error_) error_ = std::move(error);
+        closing_ = true;
+    }
+
+    void check() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (error_) std::rethrow_exception(error_);
+        }
+        if (socket_.peer_closed()) throw std::runtime_error("Windows receiver disconnected");
+    }
+
+    void close() {
+        closing_ = true;
+        socket_.shutdown();
+        dispatch_sync(writes_, ^{});
+    }
+private:
+    net::Socket socket_;
+    dispatch_queue_t writes_ = dispatch_queue_create("maxdisplay.network", DISPATCH_QUEUE_SERIAL);
+    std::atomic<unsigned> pending_{0};
+    std::atomic<bool> closing_{false};
+    std::mutex mutex_;
+    std::exception_ptr error_;
+};
+} // namespace
+
+@interface MDStreamSink : NSObject <SCStreamOutput, SCStreamDelegate> {
+@public
+    std::shared_ptr<Connection> connection;
+    std::shared_ptr<Encoder> encoder; // accessed only on the serial sample queue after registration
+}
+@end
+
+@implementation MDStreamSink
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
+    connection->fail(std::make_exception_ptr(capture_error("Screen capture stopped", error)));
+}
+
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample
+        ofType:(SCStreamOutputType)type {
+    @autoreleasepool {
+        if (type != SCStreamOutputTypeScreen || !encoder || !CMSampleBufferIsValid(sample)) return;
+        NSArray *attachments = (__bridge NSArray *)CMSampleBufferGetSampleAttachmentsArray(sample, false);
+        NSNumber *status = attachments.firstObject[SCStreamFrameInfoStatus];
+        if (!status || (status.integerValue != SCFrameStatusComplete && status.integerValue != SCFrameStatusStarted))
+            return;
+        CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
+        if (!pixels) return;
+        try { encoder->encode(pixels, CMSampleBufferGetPresentationTimeStamp(sample)); }
+        catch (...) { connection->fail(std::current_exception()); }
+    }
+}
+@end
+
+namespace {
+void change_capture(SCStream *stream, bool start) {
+    __block NSError *failure = nil;
+    auto done = dispatch_semaphore_create(0);
+    void (^complete)(NSError *) = ^(NSError *error) {
+        failure = error;
+        dispatch_semaphore_signal(done);
+    };
+    if (start) [stream startCaptureWithCompletionHandler:complete];
+    else [stream stopCaptureWithCompletionHandler:complete];
+    const char *operation = start ? "Starting screen capture" : "Stopping screen capture";
+    wait_for(done, Clock::now() + 10s, operation, start);
+    if (failure) throw capture_error(operation, failure);
+}
+
+int stream_desktop(const SenderOptions& options) {
+    if (!CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess())
+        throw std::runtime_error("Allow Screen Recording for MaxDisplay or your terminal in System Settings "
+                                 "> Privacy & Security, then quit, reopen and retry.");
+
+    auto socket = net::connect_tcp(options.host, options.port);
+    // ARC may otherwise release the display immediately after its last message.
+    __attribute__((objc_precise_lifetime)) MDDisplay *display = make_display(options);
+    CGDirectDisplayID display_id = display.displayID;
+    SCDisplay *source = find_display(display_id);
+    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:source excludingWindows:@[]];
+    SCStreamConfiguration *config = [SCStreamConfiguration new];
+    config.width = options.width;
+    config.height = options.height;
+    config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    config.colorMatrix = options.height >= 720 ? kCGDisplayStreamYCbCrMatrix_ITU_R_709_2
+                                               : kCGDisplayStreamYCbCrMatrix_ITU_R_601_4;
+    config.minimumFrameInterval = CMTimeMake(1, static_cast<int32_t>(options.fps));
+    config.queueDepth = 3;
+    config.showsCursor = YES;
+    config.capturesAudio = NO;
+
+    wire::send_header(socket, options.width, options.height, options.fps);
+    auto connection = std::make_shared<Connection>(std::move(socket));
+    auto encoder = std::make_shared<Encoder>(options.width, options.height, options.fps, options.bitrate,
+        [connection](std::vector<uint8_t> frame) { connection->send(std::move(frame)); });
+    MDStreamSink *sink = [MDStreamSink new];
+    sink->encoder = encoder;
+    sink->connection = connection;
+    SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:sink];
+    auto samples = dispatch_queue_create("maxdisplay.capture", DISPATCH_QUEUE_SERIAL);
+    NSError *error = nil;
+    if (![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:samples error:&error])
+        throw capture_error("Adding capture output", error);
+
+    std::exception_ptr failure;
+    try {
+        change_capture(stream, true);
+        std::cout << "Streaming MaxDisplay " << options.width << 'x' << options.height << " to "
+                  << options.host << ':' << options.port << ". Press Ctrl+C to stop." << std::endl;
+        while (!interrupted) {
+            connection->check();
+            encoder->check_error();
+            if (!CGDisplayIsOnline(display_id) || CGDisplayIsInMirrorSet(display_id))
+                throw std::runtime_error("MaxDisplay is no longer an independent display");
+            pump(0.2);
+        }
+    } catch (...) { failure = std::current_exception(); }
+
+    connection->close();
+    try { change_capture(stream, false); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+    [stream removeStreamOutput:sink type:SCStreamOutputTypeScreen error:nullptr];
+    // A late delivery after a stop timeout must not race encoder destruction.
+    dispatch_sync(samples, ^{ sink->encoder.reset(); });
+    try { encoder->finish(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+    if (failure && !interrupted) std::rethrow_exception(failure);
+    return 0;
+}
+} // namespace
+
+int run_sender(const SenderOptions& options) {
+    @autoreleasepool {
+        StopSignals signals;
+        try { return stream_desktop(options); }
+        catch (...) {
+            if (interrupted) return 0;
+            throw;
+        }
+    }
+}
