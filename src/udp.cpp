@@ -56,6 +56,11 @@ Host make_host(const ENetAddress* bind) {
 }
 
 void configure_peer(ENetPeer* peer) {
+    // StreamControl responds to delivery feedback. Keep ENet from silently
+    // discarding dependent pictures on RTT spikes as well. Configure only
+    // after CONNECT so both peers accept the throttle configuration command.
+    enet_peer_throttle_configure(peer, ENET_PEER_PACKET_THROTTLE_INTERVAL,
+                                 ENET_PEER_PACKET_THROTTLE_SCALE, 0);
     enet_peer_ping_interval(peer, 500);
     enet_peer_timeout(peer, ENET_PEER_TIMEOUT_LIMIT, 2000, 6000);
 }
@@ -102,13 +107,13 @@ struct Sender::Impl {
         host = make_host(nullptr);
         peer = enet_host_connect(host.get(), &address, 1, protocol_id);
         if (!peer) throw std::runtime_error("Cannot start UDP connection");
-        configure_peer(peer);
         const auto event = poll(host.get(), 5000);
         Packet unexpected(event.packet, enet_packet_destroy);
         if (event.type != ENET_EVENT_TYPE_CONNECT) {
             enet_peer_reset(peer);
             throw std::runtime_error("UDP connection failed. Check receiver transport, address and firewall.");
         }
+        configure_peer(peer);
         // Connect on the calling thread, then transfer exclusive ENet ownership
         // to this worker. Keep servicing acknowledgments even on a static desktop.
         worker = std::thread([this] { run(); });

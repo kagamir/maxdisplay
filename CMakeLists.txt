@@ -75,7 +75,7 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(test_name IN ITEMS rate_control recovery)
+    foreach(test_name IN ITEMS rate_control rate_sim recovery)
         add_executable(${test_name}_tests tests/${test_name}.cpp)
         target_include_directories(${test_name}_tests PRIVATE src)
         add_test(NAME ${test_name} COMMAND ${test_name}_tests)

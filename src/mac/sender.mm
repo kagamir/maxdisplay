@@ -19,9 +19,12 @@
 #include <chrono>
 #include <csignal>
 #include <exception>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -137,7 +140,8 @@ public:
         bool force_key;
     };
 
-    std::optional<EncodeRequest> prepare(std::uint64_t capture, bool refresh_only) {
+    std::optional<EncodeRequest> prepare(std::uint64_t capture, bool refresh_only, bool& refining) {
+        refining = false;
         std::lock_guard lock(mutex_);
         if (closing_) return std::nullopt;
         const auto now = now_us();
@@ -146,10 +150,11 @@ public:
             // This sample was already old when ScreenCaptureKit delivered it.
             // The timer can resample its image if no newer sample arrives.
             pending_.clear();
-            control_->loss(now);
+            control_->loss(now, StreamControl::Cause::stale_capture);
             return std::nullopt;
         }
         const auto action = control_->next_capture(now, !refresh_only);
+        refining = control_->refining(now);
         if (action == StreamControl::Capture::skip) return std::nullopt;
         // On a timer tick the retained image is re-sampled. The capture queue
         // owns that image and replaces it on every subsequent screen change.
@@ -166,16 +171,43 @@ public:
         const auto now = now_us();
         expire(now);
         control_->observe_encode_time(now - encode_start_us_, keyframe);
-        const bool stale = !legacy_ && control_->expired(now, capture_us_);
+        const bool stale = !legacy_ && control_->expired(now, capture_us_, keyframe);
         if (stale || pending_.size() >= 4) {
             pending_.clear();
-            control_->loss(now);
+            control_->loss(now, stale ? StreamControl::Cause::slow_encode : StreamControl::Cause::backlog);
             if (stale) return;
         }
         const auto sequence = next_sequence_++;
         if (!control_->accept_encoded(sequence, keyframe)) return;
         pending_.push_back({sequence, capture_us_, keyframe, std::move(bytes)});
         wake_.notify_one();
+    }
+
+    void encode_skipped(bool requested_key) {
+        std::lock_guard lock(mutex_);
+        if (closing_) return;
+        control_->observe_encode_time(now_us() - encode_start_us_, requested_key);
+        control_->encode_skipped();
+    }
+
+    void observe_quality(std::optional<double> psnr, std::optional<int> quantizer) {
+        std::lock_guard lock(mutex_);
+        if (closing_) return;
+        last_psnr_ = psnr;
+        last_quantizer_ = quantizer;
+        control_->observe_quality(now_us(), psnr, quantizer);
+    }
+
+    struct Snapshot {
+        StreamControl::Stats stats;
+        std::uint32_t bitrate, fps;
+        std::optional<double> psnr;
+        std::optional<int> quantizer;
+    };
+
+    Snapshot snapshot() {
+        std::lock_guard lock(mutex_);
+        return {control_->stats(), control_->bitrate(), control_->fps(), last_psnr_, last_quantizer_};
     }
 
     void fail(std::exception_ptr error) {
@@ -204,9 +236,10 @@ public:
 private:
     void expire(std::uint64_t now) {
         if (control_->poll(now)) pending_.clear();
-        if (!legacy_ && !pending_.empty() && control_->expired(now, pending_.front().timestamp_us)) {
+        if (!legacy_ && !pending_.empty() &&
+            control_->expired(now, pending_.front().timestamp_us, pending_.front().keyframe)) {
             pending_.clear();
-            control_->loss(now);
+            control_->loss(now, StreamControl::Cause::queue_expired);
         }
     }
 
@@ -252,22 +285,27 @@ private:
                 if (pending_.empty()) continue;
                 frame = std::move(pending_.front());
                 pending_.pop_front();
-                control_->sent(frame.sequence, now, frame.data.size());
+                // A blocking write can overlap a recovery on the capture queue.
+                // Register before the write so recovery can retire its old GOP.
+                control_->start_send(frame.sequence, now, frame.data.size(), frame.keyframe);
             }
+            bool sent = true;
             if (legacy_) {
                 if (udp_) udp_->send(frame.data);
                 else wire::send_frame(tcp_, frame.data);
-                continue;
+            } else {
+                const auto message = wire::pack_frame(frame);
+                const auto age_limit = std::chrono::microseconds(control_->deadline(frame.timestamp_us, frame.keyframe));
+                const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
+                sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
+                            : wire::send_frame_before(tcp_, message, deadline);
             }
-            const auto message = wire::pack_frame(frame);
-            const auto age_limit = std::chrono::microseconds(control_->deadline(frame.timestamp_us));
-            const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
-            const bool sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
-                                   : wire::send_frame_before(tcp_, message, deadline);
-            if (!sent) {
-                std::lock_guard lock(mutex_);
+            std::lock_guard lock(mutex_);
+            if (sent) {
+                control_->confirm_send(frame.data.size(), frame.keyframe);
+            } else {
                 pending_.clear();
-                control_->loss(now_us());
+                control_->loss(now_us(), StreamControl::Cause::send_blocked);
             }
         }
     }
@@ -286,7 +324,40 @@ private:
     std::uint64_t capture_us_ = 0, encode_start_us_ = 0;
     std::vector<std::uint8_t> ack_ = std::vector<std::uint8_t>(wire::feedback_size);
     std::size_t ack_used_ = 0;
+    std::optional<double> last_psnr_;
+    std::optional<int> last_quantizer_;
 };
+
+constexpr std::uint64_t idle_tick_us = 25'000;
+void schedule_refresh(dispatch_source_t timer, std::uint64_t us) {
+    const auto ns = us * NSEC_PER_USEC;
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, ns), ns, ns / 40);
+}
+
+void print_stats(const Connection::Snapshot& current, const StreamControl::Stats& previous, double seconds) {
+    const auto& s = current.stats;
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1)
+        << "sender target_kbps=" << current.bitrate / 1000.0
+        << " sent_kbps=" << (s.bytes - previous.bytes) * 0.008 / seconds
+        << " target_fps=" << current.fps << " sent_fps=" << (s.frames - previous.frames) / seconds
+        << " delivery_kbps=" << s.delivery_bps / 1000.0
+        << " rtt_ms=" << s.rtt_us / 1000.0 << " queue_ms=" << s.queue_us / 1000.0
+        << " encode_ms=" << s.encode_us / 1000.0 << " psnr_db=";
+    if (current.psnr) out << *current.psnr;
+    else out << "n/a";
+    if (current.quantizer) out << " av1_q=" << *current.quantizer;
+    out << " keys_sent=" << s.keyframes - previous.keyframes
+        << " last_sent_key_bytes=" << s.key_bytes << " last_acked_key_rtt_ms=" << s.key_rtt_us / 1000.0;
+    constexpr const char* names[] = {"stale_capture", "slow_encode", "backlog", "queue_expired",
+                                     "send_blocked", "unacknowledged", "receiver_request", "ack_delay"};
+    static_assert(std::size(names) == static_cast<std::size_t>(StreamControl::Cause::count));
+    out << " cuts/key_requests";
+    for (std::size_t i = 0; i < std::size(names); ++i)
+        out << ' ' << names[i] << '=' << s.cuts[i] - previous.cuts[i] << '/'
+            << s.key_requests[i] - previous.key_requests[i];
+    std::clog << out.str() << '\n';
+}
 } // namespace
 
 @interface MDStreamSink : NSObject <SCStreamOutput, SCStreamDelegate> {
@@ -295,6 +366,9 @@ private:
     std::shared_ptr<Encoder> encoder;
     // Accessed only on the capture queue once capture starts.
     CVPixelBufferRef latest;
+    dispatch_source_t refresh_timer;
+    std::uint64_t refresh_tick_us;
+    bool timer_follows_capture;
     std::uint32_t bitrate, fps;
 }
 - (void)encodeLatestAt:(std::uint64_t)capture refreshOnly:(bool)refresh;
@@ -308,7 +382,17 @@ private:
 - (void)encodeLatestAt:(std::uint64_t)capture refreshOnly:(bool)refresh {
     if (!encoder || !latest) return;
     try {
-        const auto request = connection->prepare(capture, refresh);
+        bool refining;
+        const auto request = connection->prepare(capture, refresh, refining);
+        // Anchor to each actual capture. A free-running timer can miss a
+        // Windows decoder's two-period idle drain before its first refinement.
+        if (!refresh) {
+            schedule_refresh(refresh_timer, refresh_tick_us);
+            timer_follows_capture = true;
+        } else if (timer_follows_capture && !refining) {
+            schedule_refresh(refresh_timer, idle_tick_us);
+            timer_follows_capture = false;
+        }
         if (!request) return;
         if (bitrate != request->bitrate) {
             encoder->set_bitrate(request->bitrate);
@@ -319,7 +403,10 @@ private:
             fps = request->fps;
             std::clog << "Adaptive frame rate: " << fps << " fps" << std::endl;
         }
-        encoder->encode(latest, CMTimeMake(now_us(), 1'000'000), request->force_key);
+        if (encoder->encode(latest, CMTimeMake(now_us(), 1'000'000), request->force_key, fps))
+            connection->observe_quality(encoder->last_psnr(), encoder->last_quantizer());
+        else
+            connection->encode_skipped(request->force_key);
     } catch (...) { connection->fail(std::current_exception()); }
 }
 
@@ -402,7 +489,7 @@ int stream_desktop(SenderOptions options) {
     connection->send_header(options, mode);
     auto encoder = std::make_shared<Encoder>(mode.stream_width, mode.stream_height, mode.fps, options.bitrate,
         [connection](std::vector<uint8_t> frame, bool keyframe) { connection->encoded(std::move(frame), keyframe); },
-        options.codec, options.require_hardware);
+        options.codec, options.require_hardware, options.legacy);
     MDStreamSink *sink = [MDStreamSink new];
     sink->encoder = encoder;
     sink->bitrate = options.bitrate;
@@ -414,13 +501,18 @@ int stream_desktop(SenderOptions options) {
     if (![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:samples error:&error])
         throw capture_error("Adding capture output", error);
 
-    // Dispatch timers coalesce when encoding is busy. One retained image is
-    // sufficient to regenerate an IDR if a stationary desktop loses a packet.
+    // Dispatch timers coalesce on the serial capture queue. Refreshes reuse
+    // the latest image for both keyframe recovery and static quality updates.
     auto refresh = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, samples);
-    dispatch_source_set_timer(refresh, DISPATCH_TIME_NOW, 25 * NSEC_PER_MSEC, 3 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(refresh, ^{ [sink encodeLatestAt:now_us() refreshOnly:true]; });
+    sink->refresh_timer = refresh;
+    sink->refresh_tick_us = StreamControl::refresh_tick_us(options.fps);
+    schedule_refresh(refresh, idle_tick_us);
+    __weak MDStreamSink *refresh_sink = sink;
+    dispatch_source_set_event_handler(refresh, ^{ [refresh_sink encodeLatestAt:now_us() refreshOnly:true]; });
     dispatch_resume(refresh);
     std::exception_ptr failure;
+    StreamControl::Stats previous_stats{};
+    auto last_report = Clock::now();
     try {
         change_capture(stream, true);
         std::cout << "Streaming MaxDisplay " << mode.logical_width << 'x' << mode.logical_height
@@ -438,6 +530,13 @@ int stream_desktop(SenderOptions options) {
         std::cout << ". Press Ctrl+C to stop." << std::endl;
         while (!interrupted) {
             connection->check();
+            const auto now = Clock::now();
+            if (options.stats && now - last_report >= 1s) {
+                const auto snapshot = connection->snapshot();
+                print_stats(snapshot, previous_stats, std::chrono::duration<double>(now - last_report).count());
+                previous_stats = snapshot.stats;
+                last_report = now;
+            }
             if (!CGDisplayIsOnline(display_id) || CGDisplayIsInMirrorSet(display_id))
                 throw std::runtime_error("MaxDisplay is no longer an independent display");
             pump(0.2);
