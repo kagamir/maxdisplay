@@ -80,8 +80,8 @@ struct Surface {
     }
 };
 
-// Sample the center of each right-hand quadrant on the receiver's letterboxed image.
-std::array<COLORREF, 2> read_colors(HWND window) {
+// Sample the right-hand quadrants at a chosen video x-coordinate.
+std::array<COLORREF, 2> read_colors(HWND window, int video_x = 3 * width / 4) {
     RECT client{};
     if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0)
         throw std::runtime_error("Viewer has no paintable client area");
@@ -105,7 +105,7 @@ std::array<COLORREF, 2> read_colors(HWND window) {
     }
     const int image_w = std::min<int>(client.right, client.bottom * width / height);
     const int image_h = std::min<int>(client.bottom, client.right * height / width);
-    const int x = (client.right - image_w) / 2 + 3 * image_w / 4;
+    const int x = (client.right - image_w) / 2 + video_x * image_w / width;
     const int top = (client.bottom - image_h) / 2;
     return {GetPixel(surface.dc, x, top + image_h / 4), GetPixel(surface.dc, x, top + 3 * image_h / 4)};
 }
@@ -330,8 +330,13 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             if (!wait_until([&] { return sees_pattern(window, true); }, 8s))
                 throw std::runtime_error("The live window never painted the recovered gray level");
             if (codec == Codec::h264 && !late) client->check_overlay(window, frames);
+            // The overlay can still cover the center of the green quadrant. Its
+            // right edge stays green until teardown and is black on the idle screen.
+            auto edge = [&] { return read_colors(window, width - 2)[0]; };
+            if (!near_color(edge(), RGB(20, 220, 20), 18))
+                throw std::runtime_error("Missing video at the disconnect probe before closing the client");
             client.reset();
-            if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
+            if (!wait_until([&] { return edge() == RGB(0, 0, 0); }, 4s))
                 throw std::runtime_error("Disconnected window did not clear its last frame");
         }
         client.emplace(options, transport, codec);
