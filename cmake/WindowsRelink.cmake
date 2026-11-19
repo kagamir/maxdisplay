@@ -8,6 +8,7 @@ string(REPLACE "|" ";" libraries "${APP_LIBRARIES}")
 file(COPY ${objects} DESTINATION "${kit}/objects")
 file(COPY ${libraries} DESTINATION "${kit}/libraries")
 file(COPY "${HEVC_SOURCE}/" DESTINATION "${kit}/libde265" PATTERN ".git" EXCLUDE)
+configure_file("${CMAKE_CURRENT_LIST_DIR}/de265-cache.cmake" "${kit}/de265-cache.cmake" COPYONLY)
 configure_file("${CMAKE_CURRENT_LIST_DIR}/relink/CMakeLists.txt" "${kit}/CMakeLists.txt" COPYONLY)
 configure_file("${CMAKE_CURRENT_LIST_DIR}/relink/README.txt" "${kit}/README.txt" COPYONLY)
 execute_process(COMMAND "${CMAKE_COMMAND}" -E tar cf "${BUILD_ROOT}/maxdisplay-windows-relink.zip" --format=zip -- .

@@ -26,12 +26,19 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+class DecoderFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 void check(HRESULT hr, const char* operation) {
     if (FAILED(hr)) {
         std::ostringstream message;
         message << operation << " failed (HRESULT 0x" << std::hex
                 << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(hr) << ')';
-        throw std::runtime_error(message.str());
+        // A damaged access unit should trigger keyframe recovery on the same device.
+        if (hr == MF_E_INVALID_STREAM_DATA) throw std::runtime_error(message.str());
+        throw DecoderFailure(message.str());
     }
 }
 
@@ -113,7 +120,7 @@ ComPtr<IMFTransform> create_decoder(Codec codec) {
                     MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
                     &input, nullptr, &matches.entries, &matches.count), "Find Windows video decoder");
     if (!matches.count)
-        throw std::runtime_error(std::string("No Media Foundation ") + codec_name(codec) + " decoder is registered");
+        throw DecoderFailure(std::string("No Media Foundation ") + codec_name(codec) + " decoder is registered");
     for (UINT32 i = 0; i < matches.count; ++i) {
         const auto hr = matches.entries[i]->ActivateObject(IID_PPV_ARGS(transform.ReleaseAndGetAddressOf()));
         ComPtr<IMFAttributes> attributes;
@@ -121,7 +128,7 @@ ComPtr<IMFTransform> create_decoder(Codec codec) {
             MFGetAttributeUINT32(attributes.Get(), MF_SA_D3D11_AWARE, FALSE))
             return transform;
     }
-    throw std::runtime_error(std::string("No D3D11-aware Windows ") + codec_name(codec) + " decoder");
+    throw DecoderFailure(std::string("No D3D11-aware Windows ") + codec_name(codec) + " decoder");
 }
 
 struct MappedTexture {
@@ -143,10 +150,14 @@ struct GpuDecoderDevice {
 
     void attach(IMFTransform* transform, IMFAttributes* attributes, Codec codec, UINT w, UINT h) {
         if (!MFGetAttributeUINT32(attributes, MF_SA_D3D11_AWARE, FALSE))
-            throw std::runtime_error("Windows decoder does not support D3D11");
+            throw DecoderFailure("Windows decoder does not support D3D11");
         ComPtr<IDXGIFactory1> factory;
         check(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "Find D3D11 graphics adapters");
-        const GUID profile = codec == Codec::av1 ? D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0 :
+        // DXVA_ModeAV1_VLD_Profile0 from dxva.h. Some D3D11 SDKs only
+        // provide the DXVA name for this standard decoder GUID.
+        static constexpr GUID av1_main = {0xb8be4ccb, 0xcf53, 0x46ba,
+            {0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a}};
+        const GUID profile = codec == Codec::av1 ? av1_main :
                              codec == Codec::h265 ? D3D11_DECODER_PROFILE_HEVC_VLD_MAIN :
                                                     D3D11_DECODER_PROFILE_H264_VLD_NOFGT;
         const D3D11_VIDEO_DECODER_DESC decoder_desc{profile, w, h, DXGI_FORMAT_NV12};
@@ -154,7 +165,7 @@ struct GpuDecoderDevice {
             ComPtr<IDXGIAdapter1> adapter;
             auto hr = factory->EnumAdapters1(i, &adapter);
             if (hr == DXGI_ERROR_NOT_FOUND)
-                throw std::runtime_error("No graphics adapter supports hardware decoding for this codec and size");
+                throw DecoderFailure("No graphics adapter supports hardware decoding for this codec and size");
             check(hr, "Enumerate D3D11 graphics adapters");
             DXGI_ADAPTER_DESC1 info{};
             check(adapter->GetDesc1(&info), "Read D3D11 graphics adapter");
@@ -194,7 +205,7 @@ struct GpuDecoderDevice {
             src.MipLevels != 1 || subresource >= src.ArraySize || src.SampleDesc.Count != 1 ||
             src.Width < coded_width || src.Height < coded_height ||
             src.Width > 4096 + 255 || src.Height > 2304 + 255) {
-            throw std::runtime_error("Windows decoder returned an incompatible NV12 texture");
+            throw DecoderFailure("Windows decoder returned an incompatible NV12 texture");
         }
         decoder_surface = (src.BindFlags & D3D11_BIND_DECODER) != 0;
         if (!staging || staging_width != src.Width || staging_height != src.Height) {
@@ -280,7 +291,7 @@ struct Decoder::Impl {
             ComPtr<IMFMediaType> type;
             const HRESULT hr = transform->GetOutputAvailableType(0, i, &type);
             if (hr == MF_E_NO_MORE_TYPES) {
-                throw std::runtime_error("Windows decoder did not offer NV12 output");
+                throw DecoderFailure("Windows decoder did not offer NV12 output");
             }
             check(hr, "Get decoder output type");
             GUID subtype{};
@@ -297,7 +308,7 @@ struct Decoder::Impl {
 
     void record_backend(bool accelerated) {
         if (gpu && !accelerated)
-            throw HardwareDecodeUnavailable("Windows decoder did not output a hardware decoder surface");
+            throw DecoderFailure("Windows decoder did not output a hardware decoder surface");
         if (!reported_backend || hardware != accelerated) {
             std::clog << codec_name(codec) << " decoder: "
                       << (accelerated ? "D3D11 hardware" : "software") << '\n';
@@ -312,7 +323,7 @@ struct Decoder::Impl {
               "Read decoded dimensions");
         if (coded_width < width || coded_width > 4096 || coded_height < height ||
             coded_height > 2304 || (coded_width | coded_height) % 2) {
-            throw std::runtime_error("Decoded frame size conflicts with stream header");
+            throw DecoderFailure("Decoded frame size conflicts with stream header");
         }
         UINT32 left = 0, top = 0;
         MFVideoArea crop{};
@@ -321,7 +332,7 @@ struct Decoder::Impl {
         if (SUCCEEDED(aperture)) {
             if (crop.Area.cx != static_cast<LONG>(width) || crop.Area.cy != static_cast<LONG>(height) ||
                 crop.OffsetX.value < 0 || crop.OffsetY.value < 0 || crop.OffsetX.fract || crop.OffsetY.fract) {
-                throw std::runtime_error("Invalid decoded display aperture");
+                throw DecoderFailure("Invalid decoded display aperture");
             }
             left = static_cast<UINT32>(crop.OffsetX.value);
             top = static_cast<UINT32>(crop.OffsetY.value);
@@ -329,10 +340,10 @@ struct Decoder::Impl {
             check(aperture, "Read display aperture");
         } else if (coded_width - width > (codec == Codec::h264 ? 15u : 127u) ||
                    coded_height - height > (codec == Codec::h264 ? 15u : 127u)) {
-            throw std::runtime_error("Unexpected coded frame padding");
+            throw DecoderFailure("Unexpected coded frame padding");
         }
         if (left > coded_width - width || top > coded_height - height || (left | top) % 2) {
-            throw std::runtime_error("Aperture outside the NV12 frame");
+            throw DecoderFailure("Aperture outside the NV12 frame");
         }
 
         auto pixels = [&](const BYTE* bytes, UINT stride, UINT surface_height) {
@@ -350,7 +361,7 @@ struct Decoder::Impl {
             auto* texture = gpu->copy_surface(dxgi.Get(), coded_width, coded_height, accelerated);
             MappedTexture mapped(gpu->context.Get(), texture);
             if (!mapped.planes.pData || mapped.planes.RowPitch < gpu->staging_width)
-                throw std::runtime_error("Invalid mapped NV12 row pitch");
+                throw DecoderFailure("Invalid mapped NV12 row pitch");
             record_backend(accelerated);
             // UV starts after the physical texture height, including padding.
             return pixels(static_cast<const BYTE*>(mapped.planes.pData), mapped.planes.RowPitch,
@@ -363,7 +374,7 @@ struct Decoder::Impl {
         check(sample->ConvertToContiguousBuffer(buffer.ReleaseAndGetAddressOf()), "Get contiguous NV12 output");
         BufferLock lock(buffer.Get());
         if (stride < coded_width || bytes_needed > lock.length)
-            throw std::runtime_error("Short NV12 output buffer or invalid stride");
+            throw DecoderFailure("Short NV12 output buffer or invalid stride");
         return pixels(lock.bytes, stride, coded_height);
     }
 
@@ -373,7 +384,7 @@ struct Decoder::Impl {
             ComPtr<IMFSample> sample;
             if (!(output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES))) {
                 if (output_info.cbSize == 0 || output_info.cbSize > 64u * 1024 * 1024) {
-                    throw std::runtime_error("Invalid decoder output buffer size");
+                    throw DecoderFailure("Invalid decoder output buffer size");
                 }
                 sample = make_sample(output_info.cbSize, output_info.cbAlignment);
                 result.pSample = sample.Get();
@@ -417,7 +428,7 @@ void Decoder::Impl::decode(const std::vector<uint8_t>& access_unit, const Output
     const DWORD length = static_cast<DWORD>(access_unit.size());
     const DWORD buffer_size = (std::max)(length, input_info.cbSize);
     if (buffer_size > wire::max_frame_bytes) {
-        throw std::runtime_error("Invalid decoder input buffer size");
+        throw DecoderFailure("Invalid decoder input buffer size");
     }
     auto sample = make_sample(buffer_size, input_info.cbAlignment);
     ComPtr<IMFMediaBuffer> buffer;
@@ -477,7 +488,7 @@ bool Decoder::decode(const std::vector<uint8_t>& unit, const Output& output) {
             impl_->decode(unit, output);
             fresh_ = false;
             return true;
-        } catch (const std::runtime_error& error) {
+        } catch (const DecoderFailure& error) {
             fallback(error);
             waiting_for_sync_ = true;
             // Previously buffered pictures may have been abandoned. Let the live
@@ -500,7 +511,7 @@ void Decoder::reset() {
     if (hevc_) return hevc_->reset();
     try {
         impl_->reset();
-    } catch (const std::runtime_error& error) {
+    } catch (const DecoderFailure& error) {
         if (!impl_->gpu) throw;
         fallback(error);
     }
@@ -511,7 +522,7 @@ void Decoder::finish(const Output& output) {
     if (hevc_) return hevc_->finish(output);
     try {
         impl_->finish(output);
-    } catch (const std::runtime_error& error) {
+    } catch (const DecoderFailure& error) {
         if (!impl_->gpu) throw;
         fallback(error);
         waiting_for_sync_ = true;

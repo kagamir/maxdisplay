@@ -37,13 +37,35 @@ if(APPLE OR WIN32)
         string(APPEND notices "\n${notice}\n${license_text}\n")
     endforeach()
     if(WIN32)
-        # ENABLE_DECODER controls the upstream example executable. The library always builds.
-        set(ENABLE_DECODER OFF CACHE BOOL "Build the libde265 decoder application" FORCE)
-        set(ENABLE_SDL OFF CACHE BOOL "Build libde265 SDL viewers" FORCE)
+        # The two codec projects both create a global 'dist' target. Build
+        # libde265 in its own CMake project, with matching CRT and configuration.
         FetchContent_Declare(libde265
             GIT_REPOSITORY https://github.com/strukturag/libde265.git
-            GIT_TAG ba62bf4cfb3242f3bf0a45617ff09e35236e4d82)
+            GIT_TAG ba62bf4cfb3242f3bf0a45617ff09e35236e4d82
+            SOURCE_SUBDIR maxdisplay-populate-only)
         FetchContent_MakeAvailable(libde265)
+        include(ExternalProject)
+        set(de265_output "${libde265_BINARY_DIR}/lib")
+        set(de265_archive "libde265${CMAKE_STATIC_LIBRARY_SUFFIX}")
+        set(de265_path "${de265_output}/${de265_archive}")
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(de265_path "${de265_output}/$<CONFIG>/${de265_archive}")
+        endif()
+        ExternalProject_Add(build_de265
+            SOURCE_DIR "${libde265_SOURCE_DIR}" BINARY_DIR "${libde265_BINARY_DIR}"
+            DOWNLOAD_COMMAND "" UPDATE_COMMAND "" INSTALL_COMMAND ""
+            CMAKE_ARGS -C "${CMAKE_CURRENT_LIST_DIR}/de265-cache.cmake"
+                       "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}" "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+                       "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${de265_output}"
+            BUILD_COMMAND "${CMAKE_COMMAND}" --build <BINARY_DIR> --config "$<CONFIG>" --target de265 --parallel
+            BUILD_BYPRODUCTS "${de265_path}")
+        add_library(de265 STATIC IMPORTED GLOBAL)
+        set_target_properties(de265 PROPERTIES IMPORTED_LOCATION "${de265_output}/${de265_archive}")
+        foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
+            string(TOUPPER "${config}" config_upper)
+            set_target_properties(de265 PROPERTIES IMPORTED_LOCATION_${config_upper} "${de265_output}/${config}/${de265_archive}")
+        endforeach()
+        add_dependencies(de265 build_de265)
         file(READ "${libde265_SOURCE_DIR}/COPYING" de265_license)
         string(APPEND notices "\nlibde265 1.1.3 - Copyright struktur AG and contributors. LGPL-3.0-or-later.\n"
                "The Windows release includes a source and relinking kit.\n${de265_license}")
