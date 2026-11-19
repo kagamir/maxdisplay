@@ -14,8 +14,9 @@ public:
     Sender(const std::string& host, std::uint16_t port);
     ~Sender();
     void send(const std::vector<std::uint8_t>& message);
-    // Timed frames use sequenced unreliable delivery. False means the local queue is full.
-    bool send_frame(const std::vector<std::uint8_t>& message);
+    // Sync pictures can retransmit missing fragments. Delta pictures are sequenced/unreliable.
+    // False reports a full local queue or a preceding sync picture still in flight.
+    bool send_frame(const std::vector<std::uint8_t>& message, bool keyframe);
     std::optional<std::vector<std::uint8_t>> take_feedback();
     bool peer_closed() const;
     void shutdown() noexcept;

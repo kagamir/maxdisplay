@@ -146,10 +146,11 @@ public:
             else wire::send_frame(tcp_, frames[index]);
             return;
         }
-        auto bytes = wire::pack_frame({sequence, stamp, index == 0 || index == 5, frames[index]});
+        const bool keyframe = index == 0 || index == 5;
+        auto bytes = wire::pack_frame({sequence, stamp, keyframe, frames[index]});
         std::vector<uint8_t> reply;
         if (udp_) {
-            if (!udp_->send_frame(bytes)) throw std::runtime_error("UDP loopback queue is full");
+            if (!udp_->send_frame(bytes, keyframe)) throw std::runtime_error("UDP loopback queue is full");
             if (!wait_until([&] {
                 auto received = udp_->take_feedback();
                 if (!received) return false;

@@ -56,20 +56,26 @@ void exercise(udp::Listener& listener, bool close_sender) {
 }
 
 void timed_stream(udp::Listener& listener) {
-    const std::vector<std::uint8_t> video(9000, 0x65); // Multiple unreliable MTU-sized fragments.
+    const std::vector<std::uint8_t> video(1024 * 1024, 0x65);
+    const std::vector<std::uint8_t> delta(9000, 0x41); // Multiple unreliable MTU-sized fragments.
     const auto port = listener.local_port();
-    auto sending = std::async(std::launch::async, [port, &video] {
+    std::promise<void> queued;
+    auto queued_signal = queued.get_future();
+    auto sending = std::async(std::launch::async, [&] {
         udp::Sender sender("127.0.0.1", port);
         sender.send(wire::encode_header({1920, 1080, 60, Codec::h265, 100}));
-        require(sender.send_frame(wire::pack_frame({1, 5000, true, video})), "First timed frame dropped");
+        const auto first = wire::pack_frame({1, 5000, true, video});
+        require(sender.send_frame(first, true), "First timed frame dropped");
+        require(!sender.send_frame(first, true), "Queued duplicate sync while first still in flight");
         // Frame 2 missed its sender deadline. The receiver must see the gap and be able to request an IDR.
-        require(sender.send_frame(wire::pack_frame({3, 38000, false, {0x41}})), "Second timed frame dropped");
+        require(sender.send_frame(wire::pack_frame({3, 38000, false, delta}), false), "Second timed frame dropped");
+        queued.set_value();
         for (auto deadline = Clock::now() + 5s; Clock::now() < deadline;) {
             auto bytes = sender.take_feedback();
             if (bytes) {
                 const auto feedback = wire::unpack_feedback(*bytes);
                 require(feedback.sequence == 3 && feedback.request_keyframe, "Incorrect loss feedback");
-                require(sender.send_frame(wire::pack_frame({4, 55000, true, video})), "Recovery frame dropped");
+                require(sender.send_frame(wire::pack_frame({4, 55000, true, video}), true), "Recovery frame dropped");
                 while (!sender.peer_closed() && Clock::now() < deadline)
                     std::this_thread::sleep_for(2ms);
                 return;
@@ -79,6 +85,7 @@ void timed_stream(udp::Listener& listener) {
         throw std::runtime_error("Reverse UDP feedback timed out");
     });
     require(listener.accept(6000), "Timed UDP session did not connect");
+    require(queued_signal.wait_for(5s) == std::future_status::ready, "Timed UDP frames were not queued");
     std::vector<std::uint8_t> bytes;
     auto next = [&] {
         const auto deadline = Clock::now() + 6s;
@@ -93,10 +100,10 @@ void timed_stream(udp::Listener& listener) {
     require(wire::decode_header(bytes).timeout_ms == 100, "Reliable header did not precede timed frames");
     next();
     auto frame = wire::unpack_frame(bytes);
-    require(frame.sequence == 1 && frame.keyframe && frame.data == video, "Unreliable fragment reassembly failed");
+    require(frame.sequence == 1 && frame.keyframe && frame.data == video, "Reliable key reassembly failed");
     next();
     frame = wire::unpack_frame(bytes);
-    require(frame.sequence == 3 && !frame.keyframe, "Timed UDP frame gap was hidden");
+    require(frame.sequence == 3 && !frame.keyframe && frame.data == delta, "Fragmented delta or frame gap lost");
     listener.send_feedback(wire::pack_feedback({frame.sequence, true}));
     next();
     frame = wire::unpack_frame(bytes);

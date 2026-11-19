@@ -2,6 +2,7 @@
 #include "app.hpp"
 #include "av1.hpp"
 #include "display_scale.hpp"
+#include "frame_recovery.hpp"
 #include "udp.hpp"
 #include "wire.hpp"
 
@@ -106,11 +107,8 @@ void capture(Codec codec, Transport transport) {
                 check_av1(key.data, expected_width, expected_height);
                 return;
             }
-            const auto& au = key.data;
-            if (au.size() < 6 || au[0] || au[1] || au[2] || au[3] != 1)
-                throw std::runtime_error("Expected an Annex B keyframe");
-            if (codec == Codec::h264 ? (au[4] & 31) != 7 : ((au[4] >> 1) & 63) != 32)
-                throw std::runtime_error("Recovery frame did not begin with codec parameter sets");
+            if (!has_recovery_picture(codec, key.data))
+                throw std::runtime_error("Random access slice is missing its codec parameter sets");
         };
         auto wait_key = [&](const char* stage, uint32_t previous, bool request_missing) {
             const auto deadline = std::chrono::steady_clock::now() + 8s;

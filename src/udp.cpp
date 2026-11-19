@@ -24,6 +24,7 @@ constexpr enet_uint32 protocol_id = 0x4d584455; // MXDU, ENet connect handshake
 constexpr std::size_t backlog_bytes = 2 * wire::max_frame_bytes;
 constexpr std::size_t backlog_messages = 32;
 constexpr std::size_t live_backlog_messages = 3;
+enum class Delivery { reliable, keyframe, delta };
 
 struct Runtime {
     Runtime() {
@@ -44,6 +45,9 @@ ENetAddress address_for(const std::string& host, std::uint16_t port) {
 Host make_host(const ENetAddress* bind) {
     Host host(enet_host_create(bind, 1, 1, 0, 0), enet_host_destroy);
     if (!host) throw std::runtime_error("Cannot open UDP socket (is the address already in use?)");
+    // Leave room for a burst of video fragments while the receiver is decoding.
+    // ENet has already installed its defaults if the OS declines the larger buffer.
+    enet_socket_set_option(host->socket, ENET_SOCKOPT_RCVBUF, 1024 * 1024);
     host->maximumPacketSize = wire::max_frame_bytes;
     host->maximumWaitingData = backlog_bytes;
     return host;
@@ -75,12 +79,13 @@ struct Sender::Impl {
     std::mutex mutex;
     struct Message {
         std::vector<std::uint8_t> bytes;
-        enet_uint32 flags;
+        Delivery delivery;
     };
     std::deque<Message> queue;
     std::optional<std::vector<std::uint8_t>> feedback;
     std::size_t outstanding_bytes = 0;
     std::size_t outstanding_messages = 0;
+    bool key_in_flight = false;
     std::exception_ptr error;
     std::atomic<bool> stopping{false};
     std::atomic<bool> closed{false};
@@ -109,31 +114,36 @@ struct Sender::Impl {
         if (worker.joinable()) worker.join();
     }
 
-    bool enqueue(const std::vector<std::uint8_t>& bytes, enet_uint32 flags) {
+    bool enqueue(const std::vector<std::uint8_t>& bytes, Delivery delivery) {
         if (bytes.empty() || bytes.size() > wire::max_frame_bytes)
             throw std::runtime_error("UDP message is outside protocol size limits");
         std::lock_guard lock(mutex);
         if (error) std::rethrow_exception(error);
         if (stopping || closed) throw std::runtime_error("UDP connection closed");
-        const bool reliable = flags == ENET_PACKET_FLAG_RELIABLE;
-        if (outstanding_messages >= (reliable ? backlog_messages : live_backlog_messages) ||
+        const bool live = delivery != Delivery::reliable;
+        if (delivery == Delivery::keyframe && key_in_flight) return false;
+        if (outstanding_messages >= (live ? live_backlog_messages : backlog_messages) ||
             bytes.size() > backlog_bytes - outstanding_bytes) {
-            if (reliable) throw std::runtime_error("UDP receiver is too slow. Try a lower bitrate or frame rate.");
+            if (!live) throw std::runtime_error("UDP receiver is too slow. Try a lower bitrate or frame rate.");
             return false;
         }
-        queue.push_back({bytes, flags});
+        queue.push_back({bytes, delivery});
+        if (delivery == Delivery::keyframe) key_in_flight = true;
         ++outstanding_messages;
         outstanding_bytes += bytes.size();
         return true;
     }
 
-    static void ENET_CALLBACK released(ENetPacket* packet) {
+    static void release(ENetPacket* packet, bool keyframe) {
         // Count queued and in-flight packets until ENet releases them.
         auto* self = static_cast<Impl*>(packet->userData);
         std::lock_guard lock(self->mutex);
         --self->outstanding_messages;
         self->outstanding_bytes -= packet->dataLength;
+        if (keyframe) self->key_in_flight = false;
     }
+    static void ENET_CALLBACK released(ENetPacket* packet) { release(packet, false); }
+    static void ENET_CALLBACK key_released(ENetPacket* packet) { release(packet, true); }
 
     void submit_pending() {
         std::deque<Message> pending;
@@ -142,12 +152,14 @@ struct Sender::Impl {
             pending.swap(queue);
         }
         for (const auto& message : pending) {
-            Packet packet(enet_packet_create(message.bytes.data(), message.bytes.size(), message.flags),
+            const auto flags = message.delivery == Delivery::delta ? ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT
+                                                                   : ENET_PACKET_FLAG_RELIABLE;
+            Packet packet(enet_packet_create(message.bytes.data(), message.bytes.size(), flags),
                           enet_packet_destroy);
             if (!packet) throw std::runtime_error("Cannot allocate UDP video packet");
             packet->userData = this;
-            packet->freeCallback = released;
-            // The reliable header precedes timed frames on the same ENet channel.
+            packet->freeCallback = message.delivery == Delivery::keyframe ? key_released : released;
+            // Keep each GOP's dependent pictures ordered after its sync picture.
             if (enet_peer_send(peer, 0, packet.get()) != 0)
                 throw std::runtime_error("Could not send UDP video packet");
             packet.release();
@@ -192,10 +204,10 @@ struct Sender::Impl {
 Sender::Sender(const std::string& host, std::uint16_t port) : impl_(std::make_unique<Impl>(host, port)) {}
 Sender::~Sender() = default;
 void Sender::send(const std::vector<std::uint8_t>& message) {
-    impl_->enqueue(message, ENET_PACKET_FLAG_RELIABLE);
+    impl_->enqueue(message, Delivery::reliable);
 }
-bool Sender::send_frame(const std::vector<std::uint8_t>& message) {
-    return impl_->enqueue(message, ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
+bool Sender::send_frame(const std::vector<std::uint8_t>& message, bool keyframe) {
+    return impl_->enqueue(message, keyframe ? Delivery::keyframe : Delivery::delta);
 }
 std::optional<std::vector<std::uint8_t>> Sender::take_feedback() {
     std::lock_guard lock(impl_->mutex);

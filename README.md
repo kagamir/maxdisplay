@@ -54,13 +54,13 @@ Mac 用 `--codec h264`、`--codec h265` 或 `--codec av1` 选择编码，Windows
 ./maxdisplay send 192.168.1.50 --codec h265 --transport udp --size 1280x720 --scale 2 --fps 60 --bitrate-mbps 16 --frame-timeout-ms 150 --require-hardware
 ```
 
-H.264 和 H.265 均优先在 Mac 通过 VideoToolbox 硬编码，在 Windows 通过 Media Foundation 和 D3D11/DXVA 硬解码。两端可分别添加 `--require-hardware` 强制本机使用硬件。若省略该参数，程序在支持的系统上也可使用软件编解码。Windows 控制台在解出画面后显示实际后端。Windows 播放 H.265 需要系统提供 HEVC 解码器，缺少时请安装微软的「HEVC 视频扩展」或在 Mac 上选择 H.264。AV1 始终使用 CPU，在高分辨率和高帧率下开销较高。
+H.264 和 H.265 均优先在 Mac 通过 VideoToolbox 硬编码，在 Windows 通过 Media Foundation 和 D3D11/DXVA 硬解码。两端可分别添加 `--require-hardware` 强制本机使用硬件。若省略该参数，程序在支持的系统上也可使用软件编解码。Mac 启动日志显示实际编码后端，Windows 在收到解码画面后报告实际解码后端。Windows 播放 H.265 需要系统提供 HEVC 解码器，缺少时请安装微软的「HEVC 视频扩展」或在 Mac 上选择 H.264。AV1 始终使用 CPU，在高分辨率和高帧率下开销较高。
 
 ### 动态码率和超时恢复
 
-- 默认开启动态码率。`--bitrate-mbps` 设置起始码率和上限。发送端根据接收反馈、往返时间、积压和近期交付速率判断拥塞，拥塞时快速降码率，稳定后逐步升回上限。`--fixed-bitrate` 可固定编码目标，仍会丢弃过期帧并请求关键帧。
+- 默认开启动态码率。`--bitrate-mbps` 设置起始码率和上限。发送端根据接收反馈、往返时间、积压和近期交付速率判断拥塞，拥塞时快速降码率，稳定后逐步升回上限。Mac 控制台会显示调整后的目标码率。`--fixed-bitrate` 可固定编码目标，仍会丢弃过期帧并请求关键帧。
 - `--frame-timeout-ms` 设置实时帧预算，默认 200 ms。发送端丢弃排队过久的帧，接收端用两帧之间的相对时间变化估算新增排队延迟，无需两台机器校时。发生序号缺口、超时或解码错误时，接收端保留最后一幅已显示的画面，等待可独立解码的关键帧，然后恢复。该预算无法保证从采集到屏幕点亮的总延迟。
-- TCP 保证按序交付，已经写入 TCP 的数据仍需传完。UDP 会分片并发送实时画面，遗失视频分片时可跳过该帧。需要在有丢包的网络上优先保持低延迟时，可在两端选择 `--transport udp`。
+- TCP 保证按序交付，已经写入 TCP 的数据仍需传完。UDP 会分片发送画面。关键帧缺失的分片可单独重传，同一时间最多有一个关键帧等待传输确认。普通视频帧丢失分片后直接跳过。需要在有丢包的网络上优先保持低延迟时，可在两端选择 `--transport udp`。
 - 新接收端可读取旧版 Mac 的 H.264 和 AV1 流。新 Mac 连接旧版 Windows 时加 `--legacy`，使用原有协议和固定码率。H.265、双向反馈和按时限恢复需要两端都升级。
 
 ## 从源码构建
@@ -86,7 +86,7 @@ cmake --build build --config Release --parallel
 ## 实现与验证
 
 - macOS 通过 CoreGraphics 的私有 `CGVirtualDisplay` 接口建立虚拟屏，用 ScreenCaptureKit 捕获画面和指针。VideoToolbox 使用实时模式并关闭帧重排。H.264 关键帧携带 SPS/PPS，HEVC Main 关键帧携带 VPS/SPS/PPS，均以 Annex B 发送。AV1 使用低延迟的 libaom 编码。
-- v3 握手协商编码、画面尺寸、帧率和超时，每个访问单元附带序号、发送端时间戳及实际关键帧标记。Windows 反馈接收进度与关键帧请求。TCP 对每帧使用大端长度前缀，UDP 通过 ENet 可靠传递握手，并使用可丢弃的有序消息传输实时帧。
+- v3 握手协商编码、画面尺寸、帧率和超时，每个访问单元附带序号、发送端时间戳及实际关键帧标记。Windows 反馈接收进度与关键帧请求。TCP 对每帧使用大端长度前缀，UDP 通过 ENet 可靠传递握手及关键帧，其他视频帧使用可丢弃的有序消息。
 - Windows 从解码器的 NV12 输出生成显示画面，按比例缩放并在需要时留黑边。D3D11 路径读取实际解码表面，AV1 由 libaom 解码。
 - 构建后执行 `ctest --test-dir build -C Release --output-on-failure`。测试覆盖协议、参数、码率调整和关键帧恢复。macOS 测试在已获得屏幕录制权限的环境中启动虚拟显示器并采集画面。CI 还会编码测试图，在 Windows 上验证解码像素、帧序和 TCP/UDP 接收。Windows 的 HEVC 解码测试需要运行机安装相应系统组件。
 - 双机验收可将窗口拖到虚拟屏，移动指针，观察 Windows 桌面是否只显示扩展区域。停止发送后检查 Mac 的显示器列表，再发起一次连接确认可以重新使用。

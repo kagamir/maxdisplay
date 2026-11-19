@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-// Both codecs use 4:2:0 frames. Accept a size only when the requested product
+// All supported codecs use 4:2:0 frames. Accept a size only when the requested product
 // gives whole, even pixel dimensions; fractional input still scales exactly.
 inline void set_display_size(SenderOptions& options, std::uint32_t base_width,
                              std::uint32_t base_height, double scale) {

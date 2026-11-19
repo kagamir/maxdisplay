@@ -251,7 +251,7 @@ private:
             const auto message = wire::pack_frame(frame);
             const auto age_limit = std::chrono::microseconds(control_.deadline(frame.timestamp_us));
             const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
-            const bool sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message))
+            const bool sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
                                    : wire::send_frame_before(tcp_, message, deadline);
             if (!sent) {
                 std::lock_guard lock(mutex_);
