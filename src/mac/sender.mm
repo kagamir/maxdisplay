@@ -107,8 +107,7 @@ std::uint64_t now_us() {
 // stream so a frame already partially written is completed or the socket closed.
 class Connection {
 public:
-    explicit Connection(const SenderOptions& options)
-        : legacy_(options.legacy) {
+    explicit Connection(const SenderOptions& options) {
         if (options.transport == Transport::udp) {
             udp_ = std::make_unique<udp::Sender>(options.host, options.port, options.password);
         } else {
@@ -125,9 +124,9 @@ public:
 
     void send_header(const SenderOptions& options, const DisplayGeometry& mode) {
         control_.emplace(options.bitrate, options.fps, options.timeout_ms,
-                         options.adaptive, options.adaptive_fps, !legacy_);
+                         options.adaptive, options.adaptive_fps);
         const wire::Header header{mode.stream_width, mode.stream_height, options.fps, options.codec,
-                                  legacy_ ? 0u : options.timeout_ms};
+                                  options.timeout_ms};
         if (udp_) udp_->send_header(header);
         else tcp_->send_header(header);
         writer_ = std::thread([this] {
@@ -148,7 +147,7 @@ public:
         if (closing_) return std::nullopt;
         const auto now = now_us();
         expire(now);
-        if (!refresh_only && !legacy_ && control_->expired(now, capture)) {
+        if (!refresh_only && control_->expired(now, capture)) {
             // This sample was already old when ScreenCaptureKit delivered it.
             // The timer can resample its image if no newer sample arrives.
             pending_.clear();
@@ -173,7 +172,7 @@ public:
         const auto now = now_us();
         expire(now);
         control_->observe_encode_time(now - encode_start_us_, keyframe);
-        const bool stale = !legacy_ && control_->expired(now, capture_us_, keyframe);
+        const bool stale = control_->expired(now, capture_us_, keyframe);
         if (stale || pending_.size() >= 4) {
             pending_.clear();
             control_->loss(now, stale ? StreamControl::Cause::slow_encode : StreamControl::Cause::backlog);
@@ -238,7 +237,7 @@ public:
 private:
     void expire(std::uint64_t now) {
         if (control_->poll(now)) pending_.clear();
-        if (!legacy_ && !pending_.empty() &&
+        if (!pending_.empty() &&
             control_->expired(now, pending_.front().timestamp_us, pending_.front().keyframe)) {
             pending_.clear();
             control_->loss(now, StreamControl::Cause::queue_expired);
@@ -254,11 +253,7 @@ private:
     void receive_feedback() {
         if (udp_) {
             if (udp_->peer_closed()) throw std::runtime_error("Windows receiver disconnected");
-            if (!legacy_) {
-                if (auto message = udp_->take_feedback()) feedback(*message);
-            }
-        } else if (legacy_) {
-            if (socket_.peer_closed()) throw std::runtime_error("Windows receiver disconnected");
+            if (auto message = udp_->take_feedback()) feedback(*message);
         } else {
             // Leave time to transmit when feedback arrives in a burst.
             for (unsigned i = 0; i < 64; ++i) {
@@ -286,17 +281,11 @@ private:
                 // Register before the write so recovery can retire its old GOP.
                 control_->start_send(frame.sequence, now, frame.data.size(), frame.keyframe);
             }
-            bool sent = true;
-            if (legacy_) {
-                if (udp_) udp_->send(frame.data);
-                else tcp_->send_frame(frame.data);
-            } else {
-                const auto message = wire::pack_frame(frame);
-                const auto age_limit = std::chrono::microseconds(control_->deadline(frame.timestamp_us, frame.keyframe));
-                const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
-                sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
-                            : tcp_->send_frame_before(message, deadline);
-            }
+            const auto message = wire::pack_frame(frame);
+            const auto age_limit = std::chrono::microseconds(control_->deadline(frame.timestamp_us, frame.keyframe));
+            const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
+            const bool sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
+                                   : tcp_->send_frame_before(message, deadline);
             std::lock_guard lock(mutex_);
             if (sent) {
                 control_->confirm_send(frame.data.size(), frame.keyframe);
@@ -307,7 +296,6 @@ private:
         }
     }
 
-    bool legacy_;
     std::optional<StreamControl> control_;
     net::Socket socket_;
     std::optional<secure::TcpChannel> tcp_;
@@ -485,7 +473,7 @@ int stream_desktop(SenderOptions options) {
     connection->send_header(options, mode);
     auto encoder = std::make_shared<Encoder>(mode.stream_width, mode.stream_height, mode.fps, options.bitrate,
         [connection](std::vector<uint8_t> frame, bool keyframe) { connection->encoded(std::move(frame), keyframe); },
-        options.codec, options.require_hardware, options.legacy);
+        options.codec, options.require_hardware);
     MDStreamSink *sink = [MDStreamSink new];
     sink->encoder = encoder;
     sink->bitrate = options.bitrate;
@@ -518,13 +506,11 @@ int stream_desktop(SenderOptions options) {
                   << " over "
                   << (options.transport == Transport::udp ? "UDP" : "TCP")
                   << (options.password.empty() ? ", " : " (AES-128-GCM), ")
-                  << (options.adaptive && !options.legacy ? "adaptive" : "fixed")
+                  << (options.adaptive ? "adaptive" : "fixed")
                   << " bitrate " << options.bitrate / 1000 << " kbps, "
-                  << (options.adaptive_fps && !options.legacy ? "adaptive" : "fixed")
-                  << " frame rate up to " << options.fps << " fps";
-        if (options.legacy) std::cout << ", legacy stream";
-        else std::cout << ", frame budget " << options.timeout_ms << " ms";
-        std::cout << ". Press Ctrl+C to stop." << std::endl;
+                  << (options.adaptive_fps ? "adaptive" : "fixed")
+                  << " frame rate up to " << options.fps << " fps, frame budget " << options.timeout_ms
+                  << " ms. Press Ctrl+C to stop." << std::endl;
         while (!interrupted) {
             connection->check();
             const auto now = Clock::now();

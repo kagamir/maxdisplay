@@ -77,29 +77,23 @@ wire::DisplaySize TcpChannel::request_display_size() {
 }
 
 void TcpChannel::send_header(wire::Header header) {
-    const auto bytes = wire::encode_header(header);
-    if (session_) wire::send_frame(socket_, session_->seal(Kind::header, bytes));
-    else socket_.write_all(bytes.data(), bytes.size());
+    if (session_) wire::send_frame(socket_, session_->seal(Kind::header, wire::encode_header(header)));
+    else wire::send_header(socket_, header);
 }
 
 wire::Header TcpChannel::receive_header(const std::function<wire::DisplaySize()>& display_size) {
     if (!session_) return wire::receive_header(socket_, display_size);
     const auto deadline = Clock::now() + wire::header_timeout;
-    auto record = read_control(socket_, wire::max_header_size, deadline);
+    auto record = read_control(socket_, wire::header_size, deadline);
     if (record.front() == static_cast<std::uint8_t>(Kind::display_query)) {
         const auto query = session_->open(Kind::display_query, record);
         if (query != wire::display_query || !display_size)
             throw std::runtime_error("Invalid encrypted display query");
         const auto reply = wire::encode_display_reply(display_size());
         wire::send_frame(socket_, session_->seal(Kind::display_reply, reply));
-        record = read_control(socket_, wire::max_header_size, deadline);
+        record = read_control(socket_, wire::header_size, deadline);
     }
     return wire::decode_header(session_->open(Kind::header, record));
-}
-
-void TcpChannel::send_frame(const Bytes& frame) {
-    if (session_) wire::send_frame(socket_, session_->seal(Kind::frame, frame), max_sealed_frame);
-    else wire::send_frame(socket_, frame);
 }
 
 bool TcpChannel::send_frame_before(const Bytes& frame, Clock::time_point deadline) {

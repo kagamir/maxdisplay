@@ -38,7 +38,7 @@ struct Scenario {
 class StreamSim {
 public:
     explicit StreamSim(const Scenario& scenario)
-        : control(scenario.bitrate, scenario.fps, scenario.timeout_ms, true, true, true),
+        : control(scenario.bitrate, scenario.fps, scenario.timeout_ms, true, true),
           options_(scenario), receiver_(scenario.timeout_ms), encoder_bps_(scenario.bitrate) {}
 
     void run_until(Time end) {

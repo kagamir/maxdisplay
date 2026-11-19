@@ -63,7 +63,7 @@ bool probe(const char* path, Codec codec, bool strict, bool topoff = false) {
         stream.write(reinterpret_cast<const char*>(length), sizeof(length));
         stream.write(reinterpret_cast<const char*>(au.data()), n);
         ++packets;
-    }, codec, strict, !topoff);
+    }, codec, strict);
     const bool hardware = encoder.hardware_accelerated();
     if (strict && !hardware) throw std::runtime_error("Required hardware encoder was not selected");
     std::cout << "Encoder: " << (hardware ? "hardware" : "software") << '\n';

@@ -16,47 +16,10 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void exercise(udp::Listener& listener, bool close_sender) {
-    const std::vector<std::uint8_t> hello{0x4d, 0x58, 0x44, 0x53};
-    std::vector<std::uint8_t> fragmented(512 * 1024);
-    for (std::size_t i = 0; i < fragmented.size(); ++i)
-        fragmented[i] = static_cast<std::uint8_t>((i >> 8) ^ i);
-
-    auto receive = std::async(std::launch::async, [&] {
-        require(listener.accept(6000), "UDP session did not connect");
-        std::vector<std::uint8_t> bytes;
-        auto deadline = Clock::now() + 8s;
-        unsigned received = 0;
-        while (received < 3 && Clock::now() < deadline) {
-            auto result = listener.receive(bytes, 100);
-            if (result == udp::ReadResult::timeout) continue;
-            require(result == udp::ReadResult::message, "UDP disconnected before delivering all messages");
-            require(bytes == (received == 1 ? fragmented : hello), "UDP message contents or order changed");
-            ++received;
-        }
-        require(received == 3, "UDP messages timed out");
-        if (close_sender) {
-            while (Clock::now() < deadline) {
-                if (listener.receive(bytes, 100) == udp::ReadResult::disconnected) return;
-            }
-            throw std::runtime_error("Sender disconnect was not observed");
-        }
-        listener.disconnect();
-    });
-
-    udp::Sender sender("127.0.0.1", listener.local_port());
-    sender.send(hello);
-    sender.send(fragmented);
-    sender.send(hello);
-    if (close_sender) sender.shutdown();
-    receive.get();
-    auto deadline = Clock::now() + 8s;
-    while (!sender.peer_closed() && Clock::now() < deadline) std::this_thread::sleep_for(10ms);
-    require(sender.peer_closed(), "Receiver disconnect was not observed");
-}
-
-void timed_stream(udp::Listener& listener, const std::string& password = {}) {
-    const std::vector<std::uint8_t> video(1024 * 1024, 0x65);
+void timed_stream(udp::Listener& listener, bool close_sender, const std::string& password = {}) {
+    std::vector<std::uint8_t> video(1024 * 1024);
+    for (std::size_t i = 0; i < video.size(); ++i)
+        video[i] = static_cast<std::uint8_t>((i >> 8) ^ i);
     const std::vector<std::uint8_t> delta(9000, 0x41); // Multiple unreliable MTU-sized fragments.
     const auto port = listener.local_port();
     std::promise<void> queued;
@@ -76,8 +39,13 @@ void timed_stream(udp::Listener& listener, const std::string& password = {}) {
                 const auto feedback = wire::unpack_feedback(*bytes);
                 require(feedback.sequence == 3 && feedback.request_keyframe, "Incorrect loss feedback");
                 require(sender.send_frame(wire::pack_frame({4, 55000, true, video}), true), "Recovery frame dropped");
-                while (!sender.peer_closed() && Clock::now() < deadline)
-                    std::this_thread::sleep_for(2ms);
+                if (close_sender) {
+                    sender.shutdown();
+                } else {
+                    while (!sender.peer_closed() && Clock::now() < deadline)
+                        std::this_thread::sleep_for(2ms);
+                    require(sender.peer_closed(), "Receiver disconnect was not observed");
+                }
                 return;
             }
             std::this_thread::sleep_for(2ms);
@@ -107,12 +75,21 @@ void timed_stream(udp::Listener& listener, const std::string& password = {}) {
     next();
     frame = wire::unpack_frame(bytes);
     require(frame.sequence == 4 && frame.keyframe && frame.data == video, "UDP recovery frame mismatch");
-    listener.disconnect();
+    if (close_sender) {
+        const auto deadline = Clock::now() + 6s;
+        auto result = udp::ReadResult::timeout;
+        while (result == udp::ReadResult::timeout && Clock::now() < deadline)
+            result = listener.receive(bytes, 100);
+        require(result == udp::ReadResult::disconnected, "Sender disconnect was not observed");
+    } else {
+        listener.disconnect();
+    }
     sending.get();
 }
 
 void display_negotiation(udp::Listener& listener, bool automatic, const std::string& password = {}) {
     const auto port = listener.local_port();
+    const auto first = wire::pack_frame({1, 5000, true, {0x42, 0x10}});
     auto receiver = std::async(std::launch::async, [&] {
         require(listener.accept(6000), "Display negotiation peer did not connect");
         bool queried = false;
@@ -123,10 +100,11 @@ void display_negotiation(udp::Listener& listener, bool automatic, const std::str
         std::vector<std::uint8_t> bytes;
         const auto deadline = Clock::now() + 5s;
         while (Clock::now() < deadline && listener.receive(bytes, 100) == udp::ReadResult::timeout) {}
-        require(bytes == std::vector<std::uint8_t>({0x42, 0x10}), "Lost reliable legacy access unit");
+        require(bytes == first, "First timed frame did not follow the UDP stream header");
         listener.disconnect();
         require(queried == automatic, "Unexpected UDP display query");
-        require(header.width == 1920 && header.height == 1080 && header.fps == 60,
+        require(header.width == 1920 && header.height == 1080 && header.fps == 60 &&
+                header.codec == Codec::h265 && header.timeout_ms == 100,
                 "Lost UDP stream header after display query");
     });
     udp::Sender sender("127.0.0.1", port, password);
@@ -135,30 +113,37 @@ void display_negotiation(udp::Listener& listener, bool automatic, const std::str
         require(size.width == 3840 && size.height == 2160, "Incorrect UDP monitor size");
         require(!sender.take_feedback(), "Resolution reply leaked into frame feedback");
     }
-    sender.send_header({1920, 1080, 60});
-    sender.send({0x42, 0x10});
+    sender.send_header({1920, 1080, 60, Codec::h265, 100});
+    require(sender.send_frame(first, true), "First UDP frame dropped");
     receiver.get();
 }
 
 void unavailable_display(udp::Listener& listener) {
     const auto port = listener.local_port();
-    auto legacy = std::async(std::launch::async, [&] {
-        require(listener.accept(6000), "Legacy UDP peer did not connect");
-        std::vector<std::uint8_t> first;
-        require(listener.receive(first, 5000) == udp::ReadResult::message && first == wire::display_query,
-                "Missing display query on legacy connection");
-        listener.disconnect(); // Old receivers reject the unfamiliar header.
+    auto receiver = std::async(std::launch::async, [&] {
+        require(listener.accept(6000), "UDP peer did not connect");
+        bool queried = false;
+        try {
+            listener.receive_header([&]() -> wire::DisplaySize {
+                queried = true;
+                throw std::runtime_error("Monitor unavailable");
+            });
+        } catch (const std::runtime_error&) {
+            listener.disconnect();
+        }
+        require(queried, "Missing display query");
     });
     udp::Sender sender("127.0.0.1", port);
-    bool manual_hint = false;
+    bool rejected = false;
     try {
         sender.request_display_size();
-    } catch (const std::runtime_error& e) {
-        manual_hint = std::string(e.what()).find("--size") != std::string::npos;
+    } catch (const std::runtime_error&) {
+        rejected = true;
     }
-    legacy.get();
-    require(manual_hint, "No manual size hint when a legacy UDP peer rejected the query");
+    receiver.get();
+    require(rejected, "Missing display reply silently accepted");
 }
+
 void wrong_password(udp::Listener& listener) {
     const auto port = listener.local_port();
     auto receive = std::async(std::launch::async, [&] {
@@ -197,9 +182,8 @@ int main() {
         udp::Listener listener("127.0.0.1", 0);
         require(listener.local_port() != 0, "No bound UDP port");
         require(!listener.accept(10), "Unexpected idle connection");
-        exercise(listener, false);
-        exercise(listener, true); // Same listener, new peer. Drain queued frames on shutdown.
-        timed_stream(listener);
+        timed_stream(listener, false);
+        timed_stream(listener, true); // Accept a new session, then drain its last frame on sender shutdown.
         display_negotiation(listener, true);
         display_negotiation(listener, false);
         unavailable_display(listener);
@@ -210,7 +194,7 @@ int main() {
         password_mode_mismatch(listener, password);
         display_negotiation(encrypted, true, password);
         display_negotiation(encrypted, false, password);
-        timed_stream(encrypted, password);
+        timed_stream(encrypted, false, password);
         std::cout << "UDP ordering, fragmentation, disconnect and reconnect passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

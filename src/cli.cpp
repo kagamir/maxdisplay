@@ -20,7 +20,7 @@ void print_help() {
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|h265|av1] [--transport tcp|udp]\n"
                  "                                      [--frame-timeout-ms MS] [--fixed-bitrate] [--fixed-fps]\n"
-                 "                                      [--require-hardware] [--legacy] [--stats] [--password PASSWORD]\n\n"
+                 "                                      [--require-hardware] [--stats] [--password PASSWORD]\n\n"
                  "Start Windows first. Defaults: H.264 over TCP 49300, scale 1, up to 60 fps and 12 Mbps.\n"
                  "Use --password PASSWORD on both devices for AES-128-GCM encryption. Omit it on both for plaintext.\n"
                  "Use --password=VALUE for a password beginning with a dash.\n"
@@ -29,7 +29,7 @@ void print_help() {
                  "Omit --size to use the Windows monitor's pixel dimensions divided by --scale for the desktop.\n"
                  "H.264/H.265 prefer hardware and warn on software fallback. --require-hardware disables fallback.\n"
                  "--fps and --bitrate-mbps are adaptive ceilings. Each can be fixed independently.\n"
-                 "The default frame deadline is 200 ms. Use --legacy for older H.264/AV1 receivers.\n"
+                 "The default frame deadline is 200 ms.\n"
                  "Windows: F11 toggles full screen, Esc exits. Mac: Ctrl+C stops sharing.\n"
                  "Use --licenses to view bundled third-party notices.\n";
 }
@@ -108,7 +108,6 @@ int run_cli(int argc, char** argv) {
     }
     SenderOptions options;
     options.host = argv[2];
-    bool explicit_timeout = false;
     for (int i = 3; i < argc; ++i) {
         const std::string_view key = argv[i];
         if (key == "--size") {
@@ -129,7 +128,6 @@ int run_cli(int argc, char** argv) {
             options.bitrate = number(option_value(i, argc, argv), 1, 100, key) * 1'000'000;
         } else if (key == "--frame-timeout-ms") {
             options.timeout_ms = number(option_value(i, argc, argv), 1, 60'000, key);
-            explicit_timeout = true;
         } else if (key == "--fixed-bitrate") {
             options.adaptive = false;
         } else if (key == "--fixed-fps") {
@@ -140,8 +138,6 @@ int run_cli(int argc, char** argv) {
             options.stats = true;
         } else if (key == "--require-hardware") {
             options.require_hardware = true;
-        } else if (key == "--legacy") {
-            options.legacy = true;
         } else if (key == "--port") {
             options.port = static_cast<std::uint16_t>(number(option_value(i, argc, argv), 1, 65535, key));
         } else {
@@ -150,16 +146,6 @@ int run_cli(int argc, char** argv) {
     }
     if (options.require_hardware && options.codec == Codec::av1)
         throw std::invalid_argument("--require-hardware requires --codec h264 or --codec h265");
-    if (options.legacy) {
-        if (options.codec == Codec::h265 || explicit_timeout)
-            throw std::invalid_argument("--legacy supports H.264 or AV1 and the old protocol has no frame deadline");
-        options.adaptive = false;
-        options.adaptive_fps = false;
-        if (!options.width) {
-            options.width = 1920;
-            options.height = 1080;
-        }
-    }
     if (options.width) resolve_display_geometry(options);
     return run_sender(options);
 #elif defined(_WIN32)

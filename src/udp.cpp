@@ -27,9 +27,8 @@ constexpr enet_uint32 protocol_id = 0x4d584455; // MXDU, ENet connect handshake
 constexpr enet_uint32 encrypted_protocol_id = 0x4d584445; // MXDE
 constexpr enet_uint32 password_mode_mismatch = 0x4d585057; // MXPW, disconnect reason
 constexpr std::size_t backlog_bytes = 2 * wire::max_frame_bytes;
-constexpr std::size_t backlog_messages = 32;
-constexpr std::size_t live_backlog_messages = 3;
-enum class Delivery { reliable, keyframe, delta };
+constexpr std::size_t backlog_messages = 3;
+enum class Delivery { control, keyframe, delta };
 
 struct Runtime {
     Runtime() {
@@ -175,12 +174,10 @@ struct Sender::Impl {
         std::lock_guard lock(mutex);
         if (error) std::rethrow_exception(error);
         if (stopping || closed) throw std::runtime_error("UDP connection closed");
-        const bool live = delivery != Delivery::reliable;
         if (delivery == Delivery::keyframe && key_in_flight) return false;
         const auto wire_size = bytes.size() + (session ? secure::record_overhead : 0);
-        if (outstanding_messages >= (live ? live_backlog_messages : backlog_messages) ||
-            wire_size > backlog_bytes - outstanding_bytes) {
-            if (!live) throw std::runtime_error("UDP receiver is too slow. Try a lower bitrate or frame rate.");
+        if (outstanding_messages >= backlog_messages || wire_size > backlog_bytes - outstanding_bytes) {
+            if (delivery == Delivery::control) throw std::runtime_error("UDP control message queue is full");
             return false;
         }
         queue.push_back({bytes, delivery, kind});
@@ -286,7 +283,7 @@ wire::DisplaySize Sender::request_display_size(unsigned timeout_ms) {
                 throw std::logic_error("Display resolution was already requested");
             impl_->awaiting_display = true;
         }
-        impl_->enqueue(wire::display_query, Delivery::reliable, secure::Kind::display_query);
+        impl_->enqueue(wire::display_query, Delivery::control, secure::Kind::display_query);
         std::unique_lock lock(impl_->mutex);
         if (!impl_->display_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
                 [&] { return impl_->display || impl_->closed || impl_->stopping; }))
@@ -295,14 +292,11 @@ wire::DisplaySize Sender::request_display_size(unsigned timeout_ms) {
         if (!impl_->display) throw std::runtime_error("Receiver disconnected");
         return *impl_->display;
     } catch (const std::runtime_error& e) {
-        throw std::runtime_error(std::string(wire::display_query_hint) + e.what());
+        throw std::runtime_error(std::string(wire::display_query_error) + e.what());
     }
 }
 void Sender::send_header(const wire::Header& header) {
-    impl_->enqueue(wire::encode_header(header), Delivery::reliable, secure::Kind::header);
-}
-void Sender::send(const std::vector<std::uint8_t>& message) {
-    impl_->enqueue(message, Delivery::reliable, secure::Kind::frame);
+    impl_->enqueue(wire::encode_header(header), Delivery::control, secure::Kind::header);
 }
 bool Sender::send_frame(const std::vector<std::uint8_t>& message, bool keyframe) {
     return impl_->enqueue(message, keyframe ? Delivery::keyframe : Delivery::delta, secure::Kind::frame);
@@ -407,7 +401,7 @@ wire::Header Listener::receive_header(const std::function<wire::DisplaySize()>& 
     std::vector<std::uint8_t> bytes;
     bool answered = false;
     while ((!stopping || !stopping()) && Clock::now() < deadline) {
-        const auto limit = wire::max_header_size + (impl_->session ? secure::record_overhead : 0);
+        const auto limit = wire::header_size + (impl_->session ? secure::record_overhead : 0);
         const auto result = impl_->read_packet(bytes, std::min(100u, remaining(deadline)), limit);
         if (result == ReadResult::timeout) continue;
         if (result == ReadResult::disconnected)

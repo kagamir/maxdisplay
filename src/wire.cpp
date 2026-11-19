@@ -12,8 +12,8 @@ using Word = std::array<std::uint8_t, 4>;
 constexpr Word magic{'M', 'X', 'D', 'S'};
 constexpr Word feedback_magic{'M', 'X', 'F', 'B'};
 constexpr Word display_magic{'M', 'X', 'D', 'R'};
-constexpr std::size_t legacy_size = 20;
-constexpr std::size_t extended_size = 24;
+constexpr std::uint32_t stream_version = 3;
+constexpr std::size_t prefix_size = 8;
 constexpr std::size_t frame_prefix_size = 16;
 
 Word to_bytes(std::uint32_t value) {
@@ -31,24 +31,16 @@ void append_word(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
     bytes.insert(bytes.end(), word.begin(), word.end());
 }
 
-std::size_t header_size(const std::uint8_t* prefix) {
-    if (std::equal(magic.begin(), magic.end(), prefix)) {
-        switch (from_bytes(prefix + 4)) {
-            case 1: return legacy_size;
-            case 2: return extended_size;
-            case 3: return max_header_size;
-        }
-    }
-    throw std::runtime_error("Unrecognized MaxDisplay stream or protocol version");
+void check_header_prefix(const std::uint8_t* prefix) {
+    if (!std::equal(magic.begin(), magic.end(), prefix) || from_bytes(prefix + 4) != stream_version)
+        throw std::runtime_error("Unrecognized MaxDisplay stream or protocol version");
 }
 
 void check_mode(const Header& header) {
     if (!valid_mode(header.width, header.height, header.fps, header.codec))
         throw std::runtime_error("Unsupported codec, dimensions or frame rate");
-    if (header.timeout_ms > max_timeout_ms)
-        throw std::runtime_error("Frame deadline exceeds protocol limits");
-    if (header.codec == Codec::h265 && !header.timeout_ms)
-        throw std::runtime_error("H.265 requires stream protocol version 3");
+    if (!header.timeout_ms || header.timeout_ms > max_timeout_ms)
+        throw std::runtime_error("Frame deadline is outside protocol limits");
 }
 
 void check_size(std::size_t size, std::size_t max_bytes) {
@@ -69,8 +61,7 @@ void validate_display(DisplaySize size) {
 
 } // namespace
 
-// Twenty bytes lets older TCP receivers reject this immediately on reading their v1 header.
-const std::vector<std::uint8_t> display_query{'M','X','D','Q', 0,0,0,1, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+const std::vector<std::uint8_t> display_query{'M','X','D','Q', 0,0,0,2};
 
 std::vector<std::uint8_t> encode_display_reply(DisplaySize size) {
     validate_display(size);
@@ -103,7 +94,7 @@ DisplaySize request_display_size(net::Socket& socket, unsigned timeout_ms) {
             throw std::runtime_error("Receiver disconnected");
         return decode_display_reply(bytes);
     } catch (const std::runtime_error& e) {
-        throw std::runtime_error(std::string(display_query_hint) + e.what());
+        throw std::runtime_error(std::string(display_query_error) + e.what());
     }
 }
 
@@ -118,42 +109,36 @@ bool valid_mode(std::uint32_t width, std::uint32_t height, std::uint32_t fps, Co
 
 std::vector<std::uint8_t> encode_header(Header header) {
     check_mode(header);
-    const unsigned version = header.timeout_ms ? 3 : (header.codec == Codec::h264 ? 1 : 2);
     std::vector<std::uint8_t> data(magic.begin(), magic.end());
-    data.reserve(max_header_size);
-    append_word(data, version);
+    data.reserve(header_size);
+    append_word(data, stream_version);
     append_word(data, header.width);
     append_word(data, header.height);
     append_word(data, header.fps);
-    if (version >= 2) append_word(data, static_cast<std::uint32_t>(header.codec));
-    if (version == 3) append_word(data, header.timeout_ms);
+    append_word(data, static_cast<std::uint32_t>(header.codec));
+    append_word(data, header.timeout_ms);
     return data;
 }
 
 Header decode_header(const std::vector<std::uint8_t>& bytes) {
-    if (bytes.size() < 8 || bytes.size() != header_size(bytes.data()))
+    if (bytes.size() != header_size)
         throw std::runtime_error("Incorrect stream header size");
-    Header header{from_bytes(bytes.data() + 8), from_bytes(bytes.data() + 12),
-                  from_bytes(bytes.data() + 16)};
-    if (bytes.size() >= extended_size) header.codec = static_cast<Codec>(from_bytes(bytes.data() + 20));
-    if (bytes.size() == max_header_size) {
-        header.timeout_ms = from_bytes(bytes.data() + 24);
-        if (!header.timeout_ms) throw std::runtime_error("Missing frame deadline");
-    }
+    check_header_prefix(bytes.data());
+    Header header{from_bytes(bytes.data() + 8), from_bytes(bytes.data() + 12), from_bytes(bytes.data() + 16),
+                  static_cast<Codec>(from_bytes(bytes.data() + 20)), from_bytes(bytes.data() + 24)};
     check_mode(header);
     return header;
 }
 
-void send_header(net::Socket& socket, std::uint32_t width, std::uint32_t height,
-                 std::uint32_t fps, Codec codec, std::uint32_t timeout_ms) {
-    auto bytes = encode_header({width, height, fps, codec, timeout_ms});
+void send_header(net::Socket& socket, Header header) {
+    const auto bytes = encode_header(header);
     socket.write_all(bytes.data(), bytes.size());
 }
 
 Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size) {
     const auto deadline = std::chrono::steady_clock::now() + header_timeout;
     auto poll = [&] { return wait_remaining(deadline); };
-    std::vector<std::uint8_t> bytes(legacy_size);
+    std::vector<std::uint8_t> bytes(prefix_size);
     if (!socket.read_exact(bytes.data(), bytes.size(), poll))
         throw std::runtime_error("Peer disconnected before sending the stream header");
     if (bytes == display_query && display_size) {
@@ -162,12 +147,10 @@ Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& d
         if (!socket.read_exact(bytes.data(), bytes.size(), poll))
             throw std::runtime_error("Peer disconnected after requesting the display resolution");
     }
-    const auto size = header_size(bytes.data());
-    if (size > legacy_size) {
-        bytes.resize(size);
-        if (!socket.read_exact(bytes.data() + legacy_size, size - legacy_size, poll))
-            throw std::runtime_error("Peer disconnected before completing the stream header");
-    }
+    check_header_prefix(bytes.data());
+    bytes.resize(header_size);
+    if (!socket.read_exact(bytes.data() + prefix_size, header_size - prefix_size, poll))
+        throw std::runtime_error("Peer disconnected before completing the stream header");
     return decode_header(bytes);
 }
 

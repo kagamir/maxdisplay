@@ -13,7 +13,7 @@ void expect(bool condition, const char* message) {
 }
 
 struct Link {
-    StreamControl control{ceiling, 60, 200, true, true, true};
+    StreamControl control{ceiling, 60, 200, true, true};
     std::uint64_t now = 0;
     std::uint32_t sequence = 0;
 
@@ -29,7 +29,7 @@ struct Link {
 };
 
 void key_deadline_extended() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     expect(control.next_capture(0, true) == Capture::force_key, "Initial frame must be a key");
     expect(!control.accept_encoded(5, false), "Predicted startup frame escaped");
     expect(control.accept_encoded(6, true), "Actual keyframe was rejected");
@@ -79,7 +79,7 @@ void key_rtt_is_neutral() {
 }
 
 void local_drop_keeps_bitrate() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     control.accept_encoded(1, true);
     control.loss(0, Cause::stale_capture);
     control.accept_encoded(2, true);
@@ -94,7 +94,7 @@ void local_drop_keeps_bitrate() {
 }
 
 void key_request_without_delay_keeps_rates() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     control.accept_encoded(1, true);
     control.sent(1, 0, 2000, true);
     expect(control.acknowledge(1, true, 10'000), "Isolated request did not start a fresh GOP");
@@ -102,7 +102,7 @@ void key_request_without_delay_keeps_rates() {
 }
 
 void repeated_loss_trims_bitrate() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     for (unsigned i = 0; i < 4; ++i) {
         control.accept_encoded(i + 1, true);
         const auto now = i ? 11'000'000 + i * 100'000 : 0;
@@ -148,7 +148,7 @@ void unrelieved_delay_steps_fps() {
 }
 
 void fixed_and_wrapped() {
-    StreamControl fixed(120'000, 30, 150, false, false, true);
+    StreamControl fixed(120'000, 30, 150, false, false);
     fixed.accept_encoded(0xffffffffu, true);
     fixed.sent(0xffffffffu, 100, 1000, true);
     expect(fixed.acknowledge(0, true, 130'000), "Wraparound broke key requests");
@@ -156,14 +156,14 @@ void fixed_and_wrapped() {
     expect(fixed.accept_encoded(0, true), "Wrapped IDR was rejected");
     expect(!fixed.acknowledge(0xffffffffu, true, 130'001), "Pre-wrap request reset new GOP");
 
-    StreamControl legacy(6'000'000, 30, 100, true, true, false);
-    legacy.accept_encoded(1, true);
-    legacy.sent(1, 0, 1000, true);
-    expect(!legacy.poll(10'000'000), "Legacy stream expected an ACK");
-    legacy.loss(10'000'000, Cause::backlog);
-    expect(legacy.needs_key() && legacy.bitrate() == 6'000'000, "Legacy drop lost its recovery key");
+    fixed.sent(0, 130'010, 1000, true);
+    fixed.acknowledge(0, false, 140'010);
+    expect(fixed.stats().key_rtt_us == 10'000, "Fixed-rate stream missed its keyframe ACK");
+    fixed.sent(1, 150'000, 500, false);
+    expect(fixed.poll(300'000) && fixed.needs_key(), "Fixed-rate stream ignored a missing ACK");
+    expect(fixed.bitrate() == 120'000 && fixed.fps() == 30, "Fixed rates changed during recovery");
 
-    StreamControl congested(1'000'000, 10, 100, true, true, true);
+    StreamControl congested(1'000'000, 10, 100, true, true);
     for (unsigned i = 1; i <= 5; ++i) congested.sent(i, 0, 1000, false);
     expect(congested.poll(500), "Excessive in-flight deltas failed to trigger recovery");
 }
@@ -227,31 +227,31 @@ void plateau_slows_probing() {
 }
 
 void rungs_are_divisors() {
-    StreamControl control(ceiling, 60, 200, false, true, true);
+    StreamControl control(ceiling, 60, 200, false, true);
     std::uint64_t now = 0;
     for (auto expected : {30u, 20u, 15u, 12u, 10u, 10u}) {
         control.loss(now += 100'000, Cause::slow_encode);
         control.loss(now += 100'000, Cause::stale_capture);
         expect(control.fps() == expected && control.bitrate() == ceiling, "FPS did not follow capture divisors");
     }
-    StreamControl cpu(ceiling, 60, 200, true, true, true);
+    StreamControl cpu(ceiling, 60, 200, true, true);
     cpu.observe_encode_time(150'000, true);
     expect(cpu.fps() == 60, "Single slow IDR cut FPS");
     for (unsigned i = 0; i < 3; ++i) cpu.observe_encode_time(40'000, false);
     expect(cpu.fps() == 20 && cpu.bitrate() == ceiling, "Encode cost did not round down to a divisor");
     for (auto max_fps : {1u, 17u}) {
-        StreamControl prime(ceiling, max_fps, 200, true, true, true);
+        StreamControl prime(ceiling, max_fps, 200, true, true);
         prime.loss(0, Cause::slow_encode);
         prime.loss(1, Cause::slow_encode);
         expect(prime.fps() == max_fps, "Prime input fell below the FPS floor");
     }
-    StreamControl fixed(ceiling, 60, 200, true, false, true);
+    StreamControl fixed(ceiling, 60, 200, true, false);
     for (unsigned i = 0; i < 16; ++i) fixed.loss(i * 500'000, Cause::backlog);
     expect(fixed.fps() == 60 && fixed.bitrate() == ceiling / 8, "Fixed FPS prevented bitrate adaptation");
 }
 
 void pacer_tolerates_capture_jitter() {
-    StreamControl control(ceiling, 60, 200, false, true, true);
+    StreamControl control(ceiling, 60, 200, false, true);
     control.loss(0, Cause::slow_encode);
     control.loss(10, Cause::slow_encode);
     expect(control.next_capture(100, true) == Capture::force_key && control.accept_encoded(1, true),
@@ -267,7 +267,7 @@ void pacer_tolerates_capture_jitter() {
 
 void pacer_with_refresh_timer() {
     for (auto timer_phase : {0u, 1'000u, 5'000u, 10'000u, 16'000u, 20'000u}) {
-        StreamControl control(ceiling, 60, 200, true, true, true);
+        StreamControl control(ceiling, 60, 200, true, true);
         control.loss(0, Cause::slow_encode);
         control.loss(1, Cause::slow_encode);
         control.next_capture(10, true);
@@ -295,7 +295,7 @@ void pacer_with_refresh_timer() {
 }
 
 void skipped_encode_rearms_change() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     control.next_capture(0, true);
     control.accept_encoded(1, true);
     expect(control.next_capture(20'000, true) == Capture::encode, "Lost original change");
@@ -305,7 +305,7 @@ void skipped_encode_rearms_change() {
 }
 
 void topoff_arms_after_change() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     control.next_capture(0, true);
     control.accept_encoded(1, true);
     expect(control.next_capture(19'000, false) == Capture::skip, "Timer inserted an extra motion frame");
@@ -318,7 +318,7 @@ void topoff_arms_after_change() {
 
 void topoff_before_idle_drain() {
     for (auto fps : {1u, 24u, 30u, 48u, 60u, 120u}) {
-        StreamControl control(ceiling, fps, 200, true, true, true);
+        StreamControl control(ceiling, fps, 200, true, true);
         control.next_capture(0, true);
         control.accept_encoded(1, true);
         const auto period = 1'000'000u / fps;
@@ -333,7 +333,7 @@ void topoff_before_idle_drain() {
 }
 
 void topoff_stops_on_quality() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     control.next_capture(0, true);
     control.accept_encoded(1, true);
     control.observe_quality(1'000, 30.0, {});
@@ -363,7 +363,7 @@ void topoff_stops_on_congestion() {
 }
 
 void topoff_bounded_without_signal() {
-    StreamControl control(ceiling, 60, 200, true, true, true);
+    StreamControl control(ceiling, 60, 200, true, true);
     control.next_capture(0, true);
     control.accept_encoded(1, true);
     for (unsigned i = 2; i < 80; ++i)

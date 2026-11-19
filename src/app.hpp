@@ -22,7 +22,6 @@ struct SenderOptions {
     bool adaptive = true;
     bool adaptive_fps = true;
     bool require_hardware = false;
-    bool legacy = false;
     bool stats = false;
     std::string password;
 };

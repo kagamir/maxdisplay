@@ -28,7 +28,7 @@ MaxDisplay adds a virtual display named **MaxDisplay** to your Mac and streams i
 | Prebuilt download | Apple Silicon | x64 |
 | Setup | Screen Recording permission | Windows N editions need the Media Feature Pack, followed by a restart |
 
-The Mac must be able to reach the Windows receiver over the selected transport. By default, MaxDisplay sends video and feedback in plaintext. Use this default on a trusted private network, or enable password encryption on both computers.
+Use the same MaxDisplay version on both computers. The Mac must be able to reach the Windows receiver over the selected transport. By default, MaxDisplay sends video and feedback in plaintext. Use this default on a trusted private network, or enable password encryption on both computers.
 
 ## Quick start
 
@@ -182,7 +182,7 @@ Start the Windows receiver and the Mac sender with the same nonempty password. R
 
 Both peers contribute fresh random values on each connection. PBKDF2-HMAC-SHA256 runs for 600,000 iterations at connection setup. The peers prove they have the same password before exchanging display dimensions, stream settings, video or feedback. AES-128-GCM encrypts and authenticates these messages with separate keys for each direction.
 
-Omit `--password` on **both** computers to use plaintext. A password mismatch or a peer configured for a different mode ends the connection. Encryption requires an updated build on both computers, including when using `--legacy`. A password passed on the command line can appear in shell history and process listings.
+Omit `--password` on **both** computers to use plaintext. A password mismatch or a peer configured for a different mode ends the connection. A password passed on the command line can appear in shell history and process listings.
 
 ### Adaptive bitrate and frame rate
 
@@ -221,13 +221,6 @@ Add `--stats` on either side to print per-second statistics on that device. Use 
 - **Mac:** target and actual bitrate and frame rate, round-trip time, estimated queueing delay, encoding time, available quality metrics, and counts of step-downs and keyframes by cause.
 - **Windows:** frames received, decoded and actually drawn, with their timings, the decoder type, and the reasons for keyframe requests.
 
-### Older receivers
-
-A current receiver accepts every earlier version of the stream protocol. For a current Mac sending to an older Windows receiver:
-
-- If the receiver speaks protocol v3 but predates automatic size detection, pass `--size` explicitly.
-- For a v1 or v2 receiver, add `--legacy`. This uses the old H.264 or AV1 handshake with a fixed bitrate and frame rate, and a 1920×1080 logical desktop when `--size` is omitted. It cannot be combined with `--codec h265` or `--frame-timeout-ms`.
-
 ## Command reference
 
 ### `maxdisplay send <windows-host>` on macOS
@@ -245,7 +238,6 @@ A current receiver accepts every earlier version of the stream protocol. For a c
 | `--fixed-bitrate` | off | Hold the bitrate at its target |
 | `--fixed-fps` | off | Hold the frame rate at its target |
 | `--require-hardware` | off | Use the hardware encoder only. H.264 and H.265 |
-| `--legacy` | off | Talk to a v1 or v2 receiver |
 | `--stats` | off | Print per-second statistics |
 
 ### `maxdisplay [receive]` on Windows
@@ -283,9 +275,6 @@ The stream cannot exceed 4096×2304, and with an explicit `--size` the width and
 
 **3840×2160 runs at 30 fps.**
 That is the H.264 Level 5.1 limit at that size.
-
-**The Windows receiver is an older build.**
-See [Older receivers](#older-receivers).
 
 ## Building from source
 

@@ -35,7 +35,7 @@ struct Av1Encoder::Impl : Context {
     uint32_t width, height;
     aom_codec_enc_cfg_t cfg{};
 
-    Impl(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate, bool periodic_keyframes)
+    Impl(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate)
         : width(w), height(h) {
         if (!wire::valid_mode(w, h, fps, Codec::av1) || !bitrate)
             throw std::invalid_argument("Invalid AV1 encoder dimensions, frame rate or bitrate");
@@ -48,8 +48,7 @@ struct Av1Encoder::Impl : Context {
         cfg.rc_end_usage = AOM_CBR;
         cfg.rc_target_bitrate = std::max(1u, bitrate / 1000);
         cfg.rc_dropframe_thresh = 0;
-        if (periodic_keyframes) cfg.kf_max_dist = fps * 2;
-        else cfg.kf_mode = AOM_KF_DISABLED;
+        cfg.kf_mode = AOM_KF_DISABLED;
         check(aom_codec_enc_init(&codec, aom_codec_av1_cx(), &cfg, 0), "encoder init");
         initialized = true;
         check(aom_codec_control(&codec, AOME_SET_CPUUSED, 10), "realtime speed");
@@ -80,8 +79,8 @@ struct Av1Encoder::Impl : Context {
     }
 };
 
-Av1Encoder::Av1Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, bool periodic_keyframes)
-    : impl_(std::make_unique<Impl>(width, height, fps, bitrate, periodic_keyframes)) {}
+Av1Encoder::Av1Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate)
+    : impl_(std::make_unique<Impl>(width, height, fps, bitrate)) {}
 Av1Encoder::~Av1Encoder() = default;
 
 bool Av1Encoder::encode_nv12(uint8_t* y, size_t y_stride, uint8_t* uv, size_t uv_stride,

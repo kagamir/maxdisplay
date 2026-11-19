@@ -21,14 +21,13 @@ public:
     };
 
     StreamControl(std::uint32_t ceiling, std::uint32_t fps, std::uint32_t timeout_ms,
-                  bool adaptive_bitrate, bool adaptive_fps, bool feedback)
+                  bool adaptive_bitrate, bool adaptive_fps)
         : ceiling_(ceiling), floor_(std::min(ceiling, std::max(250'000u, ceiling / 8))),
           bitrate_(ceiling), verified_(floor_), max_fps_(fps),
           min_fps_(std::min(10u, (fps + 3) / 4)), fps_(fps),
           budget_(std::uint64_t(timeout_ms) * 1000),
           key_budget_(std::clamp(4 * budget_, min_key_budget, max_key_budget)),
-          adaptive_bitrate_(adaptive_bitrate && feedback), adaptive_fps_(adaptive_fps && feedback),
-          feedback_(feedback) {}
+          adaptive_bitrate_(adaptive_bitrate), adaptive_fps_(adaptive_fps) {}
 
     std::uint32_t bitrate() const { return bitrate_; }
     std::uint32_t fps() const { return fps_; }
@@ -86,7 +85,7 @@ public:
             }
         } else if (cause == Cause::receiver_request &&
                    (!last_delay_ || now - *last_delay_ > cut_interval)) {
-            // A late request after an idle drain looks just like UDP loss in v3.
+            // A late request after an idle drain looks just like UDP loss.
             // Pause the ACK clock without erasing credit earned before the idle.
             last_healthy_ack_.reset();
             while (!requests_.empty() && now - requests_.front() > request_window)
@@ -189,8 +188,7 @@ public:
     // invalidate this sample even if the subsequent socket write blocks.
     void start_send(std::uint32_t sequence, std::uint64_t now, std::size_t bytes, bool keyframe) {
         if (keyframe) last_key_sent_ = now;
-        if (feedback_) flight_.push_back({sequence, now, bytes, keyframe,
-                                         last_key_sent_ && now - *last_key_sent_ < budget_});
+        flight_.push_back({sequence, now, bytes, keyframe, last_key_sent_ && now - *last_key_sent_ < budget_});
     }
 
     void confirm_send(std::size_t bytes, bool keyframe) {
@@ -210,7 +208,6 @@ public:
     // True tells the queue to discard dependent frames. A separate key request
     // may follow an ordinary ACK for the same sequence after an idle drain.
     bool acknowledge(std::uint32_t sequence, bool request_key, std::uint64_t now) {
-        if (!feedback_) return false;
         const bool valid_request = request_key && latest_key_ &&
             (sequence - *latest_key_) < 0x80000000u && !needs_key_;
         auto it = std::find_if(flight_.begin(), flight_.end(),
@@ -265,7 +262,7 @@ private:
     struct Sample { std::uint32_t sequence; std::uint64_t sent; std::size_t bytes; bool keyframe, behind_key; };
     std::uint32_t ceiling_, floor_, bitrate_, verified_, max_fps_, min_fps_, fps_;
     std::uint64_t budget_, key_budget_;
-    bool adaptive_bitrate_, adaptive_fps_, feedback_, needs_key_ = true;
+    bool adaptive_bitrate_, adaptive_fps_, needs_key_ = true;
     bool pending_change_ = false, submitted_change_ = false, fast_rising_ = false;
     Stats stats_;
     std::optional<std::uint64_t> last_slot_, last_request_, last_key_sent_, key_ack_, topoff_since_, quality_start_;

@@ -54,7 +54,8 @@ void encrypted_roundtrip() {
     Connection connection;
     const wire::Header header{1920, 1080, 60, Codec::h265, 200};
     // Encryption overhead must not reduce the existing maximum payload.
-    const Bytes image(wire::max_frame_bytes, 0x65);
+    auto image = wire::pack_frame({1234, 5000, true, {0x65}});
+    image.resize(wire::max_frame_bytes, 0x65);
     const auto ack = wire::pack_feedback({1234, true});
     auto server = std::async(std::launch::async, [&] {
         TcpChannel channel(connection.receiver, password, Role::receiver);
@@ -67,7 +68,7 @@ void encrypted_roundtrip() {
     TcpChannel client(connection.sender, password, Role::sender);
     require(client.request_display_size().width == 1920, "Incorrect protected display reply");
     client.send_header(header);
-    require(!client.send_frame_before({1, 2, 3}, Clock::now() - 1ms), "Expired protected frame sent");
+    require(!client.send_frame_before(image, Clock::now() - 1ms), "Expired protected frame sent");
     require(client.send_frame_before(image, Clock::now() + 5s), "Fresh protected frame dropped");
     server.get();
     require(read_feedback(client, connection.sender) == ack, "Incorrect protected feedback");
@@ -75,7 +76,9 @@ void encrypted_roundtrip() {
 
 void raw_peer_checks() {
     Connection connection;
-    const Bytes image(4096, 0x66);
+    const wire::Header header{1280, 720, 30, Codec::h264, 100};
+    const Bytes payload(4096, 0x66);
+    const auto image = wire::pack_frame({7, 5000, true, payload});
     const auto ack = wire::pack_feedback({7, false});
     std::promise<void> split;
     auto prefix_written = split.get_future();
@@ -93,8 +96,10 @@ void raw_peer_checks() {
         session.open(Kind::confirm, proof);
 
         Bytes record;
-        require(wire::receive_frame(connection.receiver, record), "Missing encrypted access unit");
-        require(std::search(record.begin(), record.end(), image.begin(), image.begin() + 32) == record.end(),
+        require(wire::receive_frame(connection.receiver, record), "Missing encrypted header");
+        require(session.open(Kind::header, record) == wire::encode_header(header), "Incorrect encrypted header");
+        require(wire::receive_frame(connection.receiver, record), "Missing encrypted timed frame");
+        require(std::search(record.begin(), record.end(), payload.begin(), payload.begin() + 32) == record.end(),
                 "Video pattern visible on protected TCP");
         require(session.open(Kind::frame, record) == image, "Wire record does not authenticate");
         auto feedback = session.seal(Kind::feedback, ack);
@@ -107,7 +112,8 @@ void raw_peer_checks() {
         connection.receiver.write_all(feedback.data(), feedback.size());
     });
     TcpChannel client(connection.sender, password, Role::sender);
-    client.send_frame(image);
+    client.send_header(header);
+    require(client.send_frame_before(image, Clock::now() + 5s), "Protected frame dropped");
     require(prefix_written.wait_for(5s) == std::future_status::ready, "Partial feedback was not sent");
     require(net::wait_readable(connection.sender, 1000) && !client.take_feedback(), "Partial protected feedback accepted");
     ready.set_value();
@@ -126,21 +132,22 @@ void wrong_password() {
     server.get();
 }
 
-void modes_and_cleartext_compatibility() {
-    const wire::Header legacy{1280, 720, 30};
+void plaintext_and_password_modes() {
+    const wire::Header header{1280, 720, 30, Codec::h264, 150};
+    const auto video = wire::pack_frame({7, 5000, true, {4, 5, 6}});
     Connection plain;
     TcpChannel client(plain.sender, "", Role::sender);
-    client.send_header(legacy);
-    client.send_frame({4, 5, 6});
-    require(wire::receive_header(plain.receiver).height == 720, "Old receiver cannot read cleartext header");
+    client.send_header(header);
+    require(client.send_frame_before(video, Clock::now() + 5s), "Cleartext frame dropped");
+    require(wire::receive_header(plain.receiver).timeout_ms == 150, "Incorrect cleartext header");
     Bytes frame;
-    require(wire::receive_frame(plain.receiver, frame) && frame == Bytes{4, 5, 6}, "Old receiver cannot read cleartext frame");
+    require(wire::receive_frame(plain.receiver, frame) && frame == video, "Incorrect cleartext frame");
     const auto ack = wire::pack_feedback({7, false});
     plain.receiver.write_all(ack.data(), ack.size());
-    require(read_feedback(client, plain.sender) == ack, "Old receiver cannot send cleartext feedback");
+    require(read_feedback(client, plain.sender) == ack, "Incorrect cleartext feedback");
 
     Connection mismatched;
-    wire::send_header(mismatched.sender, 1280, 720, 30);
+    wire::send_header(mismatched.sender, header);
     rejects([&] { TcpChannel protected_receiver(mismatched.receiver, password, Role::receiver); },
             "Password-protected receiver accepted a cleartext peer");
     require(!net::wait_readable(mismatched.sender, 0), "Protected receiver replied to a cleartext peer");
@@ -161,7 +168,7 @@ int main() {
         encrypted_roundtrip();
         raw_peer_checks();
         wrong_password();
-        modes_and_cleartext_compatibility();
+        plaintext_and_password_modes();
         std::cout << "Encrypted TCP checks passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

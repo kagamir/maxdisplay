@@ -29,6 +29,7 @@ namespace {
 using namespace std::chrono_literals;
 using Frames = std::array<std::vector<std::uint8_t>, 8>;
 constexpr unsigned width = 320, height = 180, fps = 30;
+constexpr auto frame_timeout = 1000ms;
 
 Frames read_frames(const char* path) {
     Frames frames;
@@ -124,8 +125,7 @@ bool sees_pattern(HWND window, bool final) {
 
 class TestSender {
 public:
-    TestSender(const ReceiverOptions& options, Codec codec, uint32_t timeout_ms, HWND query_window = nullptr)
-        : timed_(timeout_ms != 0) {
+    TestSender(const ReceiverOptions& options, Codec codec, HWND query_window = nullptr) {
         if (options.transport == Transport::udp) {
             udp_.emplace(options.bind, options.port, options.password);
         } else {
@@ -143,7 +143,7 @@ public:
                 size.height != static_cast<unsigned>(info.rcMonitor.bottom - info.rcMonitor.top))
                 throw std::runtime_error("Receiver reported a display size other than the window's monitor");
         }
-        const wire::Header header{width, height, fps, codec, timeout_ms};
+        const wire::Header header{width, height, fps, codec, frame_timeout.count()};
         if (udp_) udp_->send_header(header);
         else tcp_->send_header(header);
     }
@@ -155,17 +155,12 @@ public:
 
     void send(const Frames& frames, unsigned index, uint32_t sequence,
               bool expect_request = false, uint64_t stamp = now_us()) {
-        if (!timed_) {
-            if (udp_) udp_->send(frames[index]);
-            else tcp_->send_frame(frames[index]);
-            return;
-        }
         const bool keyframe = index == 0 || index == 5;
         auto bytes = wire::pack_frame({sequence, stamp, keyframe, frames[index]});
         if (udp_) {
             if (!udp_->send_frame(bytes, keyframe)) throw std::runtime_error("UDP loopback queue is full");
-        } else {
-            tcp_->send_frame(bytes);
+        } else if (!tcp_->send_frame_before(bytes, std::chrono::steady_clock::now() + frame_timeout)) {
+            throw std::runtime_error("Timed out sending TCP loopback frame");
         }
         std::optional<std::vector<uint8_t>> reply;
         if (!wait_until([&] {
@@ -180,7 +175,6 @@ private:
     net::Socket socket_;
     std::optional<secure::TcpChannel> tcp_;
     std::optional<udp::Sender> udp_;
-    bool timed_;
 };
 
 void send_initial_frames(TestSender& sender, const Frames& frames, HWND window) {
@@ -216,9 +210,8 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             return window || ui.wait_for(0s) == std::future_status::ready;
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
-        constexpr uint32_t timeout_ms = 1000;
         for (bool late : {false, true}) {
-            client.emplace(options, codec, timeout_ms, late ? nullptr : window);
+            client.emplace(options, codec, late ? nullptr : window);
             if (late) {
                 // A static desktop may produce just one picture. It must paint while the session stays open.
                 client->send(frames, 0, 1);
@@ -226,7 +219,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
                     throw std::runtime_error("A single keyframe never appeared on the idle connection");
                 // Sequence 2 arrives in order, but its timestamp is older than the deadline.
                 const auto stamp = TestSender::now_us();
-                std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms) + 150ms);
+                std::this_thread::sleep_for(frame_timeout + 150ms);
                 client->send(frames, 1, 2, true, stamp);
             } else {
                 send_initial_frames(*client, frames, window);
@@ -241,8 +234,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
                 throw std::runtime_error("Disconnected window did not clear its last frame");
         }
-        // Use the legacy wire format for the codecs it supports, and keep the socket open during Escape.
-        client.emplace(options, codec, codec == Codec::h265 ? timeout_ms : 0);
+        client.emplace(options, codec);
         send_initial_frames(*client, frames, window);
     } catch (...) {
         failure = std::current_exception();

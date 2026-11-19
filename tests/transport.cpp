@@ -40,14 +40,14 @@ struct Connection {
     }
 };
 
-const Bytes hello{'M', 'X', 'D', 'S', 0, 0, 0, 1, 0, 0, 7, 128, 0, 0, 4, 56, 0, 0, 0, 60};
+constexpr wire::Header mode{1920, 1080, 60, Codec::h264, 200};
+const Bytes hello{'M', 'X', 'D', 'S', 0,0,0,3, 0,0,7,128, 0,0,4,56, 0,0,0,60, 0,0,0,1, 0,0,0,200};
 
 void round_trip() {
     Connection connection;
-    require(!connection.writer.peer_closed(), "Connected receiver reported as closed");
-    wire::send_header(connection.writer, 1920, 1080, 60);
-    const Bytes first{0, 0, 0, 1, 0x67, 0xaa, 0xbb};
-    const Bytes second{0, 0, 1, 0x41, 0x42};
+    wire::send_header(connection.writer, mode);
+    const auto first = wire::pack_frame({1, 1500, true, {0, 0, 0, 1, 0x67, 0xaa, 0xbb}});
+    const auto second = wire::pack_frame({2, 18000, false, {0, 0, 1, 0x41, 0x42}});
     wire::send_frame(connection.writer, first);
     wire::send_frame(connection.writer, second);
     connection.writer = {};
@@ -61,7 +61,7 @@ void round_trip() {
 
 void check_layout() {
     Connection connection;
-    wire::send_header(connection.writer, 1920, 1080, 60);
+    wire::send_header(connection.writer, mode);
     Bytes bytes(hello.size());
     require(connection.reader.read_exact(bytes.data(), bytes.size()) && bytes == hello,
             "Header byte layout does not match protocol");
@@ -72,6 +72,7 @@ void check_layout() {
 }
 
 void display_negotiation() {
+    require(wire::display_query == Bytes{'M','X','D','Q', 0,0,0,2}, "Incorrect display query byte layout");
     Connection connection;
     unsigned queries = 0;
     auto receiver = std::async(std::launch::async, [&] {
@@ -81,18 +82,18 @@ void display_negotiation() {
         });
     });
     const auto size = wire::request_display_size(connection.writer);
-    wire::send_header(connection.writer, 2560, 1440, 60, Codec::h265, 200);
+    wire::send_header(connection.writer, {2560, 1440, 60, Codec::h265, 200});
     const auto header = receiver.get();
     require(queries == 1 && size.width == 5120 && size.height == 2880, "TCP returned wrong monitor size");
     require(header.width == 2560 && header.codec == Codec::h265, "TCP display negotiation lost stream header");
 
     Connection direct;
-    wire::send_header(direct.writer, 640, 480, 30);
-    const auto legacy = wire::receive_header(direct.reader, [&]() -> wire::DisplaySize {
+    wire::send_header(direct.writer, {640, 480, 30, Codec::h264, 200});
+    const auto manual = wire::receive_header(direct.reader, [&]() -> wire::DisplaySize {
         throw std::runtime_error("Unsolicited resolution exchange");
     });
-    require(legacy.width == 640 && !net::wait_readable(direct.writer, 0),
-            "Unsolicited data sent to legacy TCP sender");
+    require(manual.width == 640 && !net::wait_readable(direct.writer, 0),
+            "Unsolicited data sent to explicit-size TCP sender");
 
     auto malformed = wire::encode_display_reply({1920, 1080});
     malformed[7] = 2;
@@ -100,33 +101,68 @@ void display_negotiation() {
     expect_failure([] { wire::encode_display_reply({0, 1080}); }, "Zero width accepted");
     expect_failure([] { wire::decode_display_reply({'M','X','D','R'}); }, "Truncated resolution accepted");
 
-    // A silent or stalled legacy peer must not leave the Mac waiting indefinitely.
+    Connection invalid_query;
+    const Bytes padded_query{'M','X','D','Q', 0,0,0,1, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+    invalid_query.writer.write_all(padded_query.data(), padded_query.size());
+    wire::send_header(invalid_query.writer, mode);
+    expect_failure([&] {
+        wire::receive_header(invalid_query.reader, [] { return wire::DisplaySize{1920, 1080}; });
+    }, "Padded revision-1 display query accepted");
+    require(!net::wait_readable(invalid_query.writer, 0), "Replied to obsolete display query");
+
     Connection stalled;
     const auto reply = wire::encode_display_reply({1920, 1080});
     stalled.reader.write_all(reply.data(), 3);
-    try {
-        wire::request_display_size(stalled.writer, 40);
-    } catch (const std::runtime_error& error) {
-        require(std::string(error.what()).find("--size") != std::string::npos, "No manual size hint");
-        return;
-    }
-    throw std::runtime_error("Partial TCP display reply did not time out");
+    expect_failure([&] { wire::request_display_size(stalled.writer, 40); }, "Partial TCP display reply did not time out");
 }
 
 void codec_headers() {
-    require(wire::encode_header({1920, 1080, 60}) == hello, "Legacy H.264 header changed");
+    require(wire::encode_header(mode) == hello, "Incorrect H.264 header byte layout");
     Connection connection;
-    wire::send_header(connection.writer, 3840, 2160, 60, Codec::av1);
-    wire::send_frame(connection.writer, {0x12, 0x00});
+    wire::send_header(connection.writer, {3840, 2160, 60, Codec::av1, 200});
+    wire::send_frame(connection.writer, wire::pack_frame({1, 12345, true, {0x12, 0x00}}));
     const auto header = wire::receive_header(connection.reader);
     require(header.codec == Codec::av1 && header.width == 3840 && header.fps == 60, "AV1 header mismatch");
     Bytes frame;
-    require(wire::receive_frame(connection.reader, frame) && frame == Bytes{0x12, 0x00}, "Lost frame boundary");
+    require(wire::receive_frame(connection.reader, frame) && wire::unpack_frame(frame).data == Bytes{0x12, 0x00},
+            "Lost frame boundary");
     auto bad = wire::encode_header(header);
-    bad.back() = 255;
+    bad[23] = 255;
     expect_failure([&] { wire::decode_header(bad); }, "Accepted unknown codec identifier");
     bad.resize(20);
-    expect_failure([&] { wire::decode_header(bad); }, "Accepted truncated extended header");
+    expect_failure([&] { wire::decode_header(bad); }, "Accepted truncated header");
+}
+
+void require_current_protocol() {
+    for (auto version : {1, 2, 4}) {
+        auto bytes = hello;
+        bytes[7] = static_cast<std::uint8_t>(version);
+        expect_failure([&] { wire::decode_header(bytes); }, "Accepted unsupported version in full-size header");
+        if (version < 3) {
+            bytes.resize(version == 1 ? 20 : 24);
+            expect_failure([&] { wire::decode_header(bytes); }, "Accepted previous header format");
+        }
+
+        Connection connection;
+        connection.writer.write_all(bytes.data(), 8);
+        auto reader = std::async(std::launch::async, [&] {
+            expect_failure([&] { wire::receive_header(connection.reader); }, "Accepted unsupported TCP version");
+        });
+        const auto ready = reader.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        if (!ready) connection.writer.shutdown();
+        reader.get();
+        require(ready, "TCP waited for more than eight bytes before rejecting the protocol version");
+    }
+
+    for (Codec codec : {Codec::h264, Codec::av1, Codec::h265}) {
+        expect_failure([&] { wire::encode_header({640, 480, 30, codec, 0}); }, "Encoded a zero deadline");
+        auto bytes = wire::encode_header({640, 480, 30, codec, wire::max_timeout_ms});
+        bytes[24] = bytes[25] = bytes[26] = bytes[27] = 0;
+        expect_failure([&] { wire::decode_header(bytes); }, "Accepted a zero deadline");
+    }
+    auto oversized = hello;
+    oversized.push_back(0);
+    expect_failure([&] { wire::decode_header(oversized); }, "Accepted an oversized header");
 }
 
 void large_frame() {
@@ -146,7 +182,7 @@ void large_frame() {
 
 void timed_frames_and_feedback() {
     Connection connection;
-    wire::send_header(connection.writer, 3840, 2160, 60, Codec::h265, 125);
+    wire::send_header(connection.writer, {3840, 2160, 60, Codec::h265, 125});
     const auto header = wire::receive_header(connection.reader);
     require(header.codec == Codec::h265 && header.timeout_ms == 125, "Timed header lost codec or deadline");
     const auto bytes = wire::pack_frame({0xffffffff, 0x0102030405060708ull, true, {0x65}});
@@ -164,8 +200,7 @@ void timed_frames_and_feedback() {
     Bytes record(wire::feedback_size);
     require(connection.writer.try_read(record.data(), record.size()) == 0, "No feedback expected yet");
     connection.reader.write_all(request.data(), 1);
-    require(net::wait_readable(connection.writer, 1000) && !connection.writer.peer_closed(),
-            "Feedback mistaken for disconnect");
+    require(net::wait_readable(connection.writer, 1000), "Feedback did not arrive");
     require(connection.writer.try_read(record.data(), record.size()) == 1, "Split feedback lost");
     connection.reader.write_all(request.data() + 1, request.size() - 1);
     require(connection.writer.read_exact(record.data() + 1, record.size() - 1), "Feedback truncated");
@@ -266,7 +301,8 @@ void cancel_read() {
     require(worker.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
             "Read did not terminate on shutdown");
     require(worker.get(), "Got an unexpected frame");
-    require(net::wait_readable(connection.writer, 1000) && connection.writer.peer_closed(),
+    std::uint8_t byte;
+    require(net::wait_readable(connection.writer, 1000) && !connection.writer.read_exact(&byte, 1),
             "Sender missed receiver disconnect");
 }
 
@@ -278,15 +314,13 @@ int main() {
         check_layout();
         display_negotiation();
         codec_headers();
+        require_current_protocol();
         timed_frames_and_feedback();
         partial_frame_polling();
         frame_commit_deadline();
         large_frame();
         auto header = hello;
         header[0] = 0;
-        malformed_header(header);
-        header = hello;
-        header[7] = 2;
         malformed_header(header);
         header = hello;
         header[11] = 129; // Odd width, incompatible with 4:2:0.

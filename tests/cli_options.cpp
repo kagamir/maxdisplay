@@ -41,7 +41,7 @@ int main() {
         expect(invoke({"send", "example"}) == 0 && sender.width == 0 && sender.height == 0 &&
                sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp &&
                sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware &&
-               !sender.legacy && !sender.stats && sender.password.empty(),
+               !sender.stats && sender.password.empty(),
                "Unexpected Mac defaults");
         expect(invoke({"send", "example", "--codec", "av1", "--transport", "udp", "--size", "640x360",
                        "--scale", "1.5"}) == 0 && sender.width == 640 && sender.height == 360 &&
@@ -50,23 +50,19 @@ int main() {
         expect(invoke({"send", "example", "--codec", "h265", "--require-hardware", "--frame-timeout-ms", "150",
                        "--bitrate-mbps", "16", "--fixed-bitrate", "--stats"}) == 0 && sender.codec == Codec::h265 &&
                sender.require_hardware && sender.timeout_ms == 150 && sender.bitrate == 16'000'000 &&
-               !sender.adaptive && sender.adaptive_fps && !sender.legacy && sender.stats, "HEVC streaming options lost");
+               !sender.adaptive && sender.adaptive_fps && sender.stats, "HEVC streaming options lost");
         expect(invoke({"send", "example", "--fps", "48", "--fixed-fps", "--scale", "0.75"}) == 0 &&
                sender.fps == 48 && !sender.adaptive_fps && sender.adaptive && sender.width == 0,
                "Fixed frame rate interfered with adaptive bitrate or monitor sizing");
-        expect(invoke({"send", "example", "--legacy"}) == 0 && sender.legacy && !sender.adaptive &&
-               !sender.adaptive_fps && sender.width == 1920 && sender.height == 1080,
-               "Legacy protocol selected adaptive feedback");
-        expect(invoke({"send", "example", "--password", u8"共享 密碼", "--legacy"}) == 0 &&
-               sender.password == u8"共享 密碼" && sender.legacy, "Legacy sender lost its UTF-8 password");
+        expect(invoke({"send", "example", "--password", u8"共享 密碼"}) == 0 &&
+               sender.password == u8"共享 密碼", "Sender lost its UTF-8 password");
         expect(invoke({"send", "example", "--password=--help"}) == 0 && sender.password == "--help",
                "Option-like password triggered help");
         invalid({"send", "example", "--password"});
         invalid({"send", "example", "--password", ""});
         invalid({"send", "example", "--password="});
         invalid({"send", "example", "--password", "--help"});
-        invalid({"send", "example", "--legacy", "--codec", "hevc"});
-        invalid({"send", "example", "--legacy", "--frame-timeout-ms", "300"});
+        invalid({"send", "example", "--legacy"});
         invalid({"send", "example", "--require-hardware", "--codec", "av1"});
         invalid({"send", "example", "--frame-timeout-ms", "0"});
         invalid({"send", "example", "--frame-timeout-ms", "60001"});

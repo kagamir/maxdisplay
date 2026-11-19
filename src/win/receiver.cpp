@@ -184,6 +184,7 @@ struct Receiver {
                 recovery.recover(Reason::decode_deadline);
         };
         auto poll_interval = [&]() -> unsigned {
+            if (stats_enabled) report_if_due(stats, decoder, header.codec);
             if (deadlines.empty() || recovery.waiting_for_keyframe()) return 100;
             const auto now = Clock::now();
             if (now < drain_at) {
@@ -276,31 +277,7 @@ struct Receiver {
                 ++session_id;
                 paint_stats = {};
             }
-            auto read = [&](std::vector<std::uint8_t>& bytes, const auto& poll) {
-                if (!stats_enabled) return read_frame(bytes, poll);
-                return read_frame(bytes, [&] {
-                    report_if_due(stats, decoder, header.codec);
-                    return poll();
-                });
-            };
-            if (header.timeout_ms) {
-                receive_live(header, decoder, stats, read, feedback);
-            } else {
-                auto display = [&](VideoFrame&& decoded) {
-                    if (stats_enabled) ++stats.decoded;
-                    present(std::move(decoded));
-                };
-                std::vector<std::uint8_t> bytes;
-                while (!stopping && read(bytes, [] { return 100u; })) {
-                    if (stats_enabled) ++stats.received;
-                    DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
-                    decoder.decode(bytes, display);
-                }
-                if (!stopping) {
-                    DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
-                    decoder.finish(display);
-                }
-            }
+            receive_live(header, decoder, stats, read_frame, feedback);
             if (stats_enabled) report_if_due(stats, decoder, header.codec);
         } catch (const std::exception& e) {
             if (!stopping) std::cerr << "Stream error: " << e.what() << '\n';

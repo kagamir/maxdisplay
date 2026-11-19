@@ -189,15 +189,6 @@ void Socket::shutdown() const noexcept {
         ::shutdown(handle_, shutdown_both);
 }
 
-bool Socket::peer_closed() const {
-    if (handle_ == invalid || stopped_.load()) return true;
-    char byte;
-    const auto result = recv(handle_, &byte, 1, MSG_PEEK);
-    if (result >= 0) return result == 0;
-    const int error = last_error();
-    return !would_block(error) && !interrupted(error);
-}
-
 std::size_t Socket::try_read(void* destination, std::size_t size) const {
     if (!size) return 0;
     const int chunk = static_cast<int>(std::min<std::size_t>(size, INT_MAX));

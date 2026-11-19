@@ -29,8 +29,6 @@ public:
 
     // Safe alongside reads/writes. Keep the Socket alive until those calls return.
     void shutdown() const noexcept;
-    // Probe without consuming incoming feedback.
-    bool peer_closed() const;
 
     // Returns false on EOF before the first byte. A partial read at EOF throws.
     // Before each read, poll_interval can service pending video and choose how

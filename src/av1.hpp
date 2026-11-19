@@ -9,8 +9,7 @@
 class Av1Encoder {
 public:
     using Output = std::function<void(std::vector<uint8_t>, bool keyframe)>;
-    Av1Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate,
-               bool periodic_keyframes = true);
+    Av1Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate);
     ~Av1Encoder();
 
     // PTS is in ticks of the configured (maximum) frame rate; current_fps is

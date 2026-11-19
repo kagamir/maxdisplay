@@ -17,8 +17,6 @@ public:
     ~Sender();
     wire::DisplaySize request_display_size(unsigned timeout_ms = wire::display_query_timeout_ms);
     void send_header(const wire::Header& header);
-    // Reliable legacy access unit.
-    void send(const std::vector<std::uint8_t>& message);
     // Sync pictures can retransmit missing fragments. Delta pictures are sequenced/unreliable.
     // False reports a full local queue or a preceding sync picture still in flight.
     bool send_frame(const std::vector<std::uint8_t>& message, bool keyframe);

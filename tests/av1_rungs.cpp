@@ -6,12 +6,11 @@
 namespace {
 constexpr unsigned width = 160, height = 96, maximum_fps = 30;
 
-size_t encode_sequence(unsigned rung, bool periodic) {
-    Av1Encoder encoder(width, height, maximum_fps, 300'000, periodic);
+size_t encode_sequence(unsigned rung) {
+    Av1Encoder encoder(width, height, maximum_fps, 300'000);
     std::vector<uint8_t> y(width * height), uv(width * height / 2, 128);
     uint32_t random = 42;
     size_t bytes = 0;
-    bool periodic_key_seen = false;
     for (unsigned i = 0; i < 100; ++i) {
         for (auto& luma : y) {
             random = random * 1664525u + 1013904223u;
@@ -20,7 +19,7 @@ size_t encode_sequence(unsigned rung, bool periodic) {
         const bool force = i == 90;
         auto output = [&](std::vector<uint8_t> packet, bool key) {
             if ((i == 0 || force) && !key) throw std::runtime_error("Missing AV1 recovery keyframe");
-            if (i && !force && key) periodic_key_seen = true;
+            if (i && !force && key) throw std::runtime_error("Unexpected periodic AV1 keyframe");
             // Compare steady-state inter frames at identical PTS and pixel complexity.
             if (i >= 30 && i < 90) bytes += packet.size();
         };
@@ -29,19 +28,17 @@ size_t encode_sequence(unsigned rung, bool periodic) {
         const int quantizer = encoder.last_quantizer();
         if (quantizer < 0 || quantizer > 63) throw std::runtime_error("Invalid AV1 quantizer");
     }
-    if (periodic_key_seen != periodic) throw std::runtime_error("Unexpected AV1 keyframe cadence");
     return bytes;
 }
 } // namespace
 
 int main() {
     try {
-        const auto full = encode_sequence(maximum_fps, false);
-        const auto reduced = encode_sequence(maximum_fps / 3, false);
+        const auto full = encode_sequence(maximum_fps);
+        const auto reduced = encode_sequence(maximum_fps / 3);
         std::cout << "AV1 bytes with 1-tick / 3-tick duration: " << full << " / " << reduced << '\n';
         if (reduced < full * 3 / 2)
             throw std::runtime_error("Lower FPS did not increase the AV1 frame budget");
-        encode_sequence(maximum_fps, true);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

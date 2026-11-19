@@ -123,7 +123,7 @@ struct Encoder::Impl {
     std::unique_ptr<Av1Encoder> av1;
     uint32_t width, height, fps, bitrate;
     Codec codec;
-    bool require_hardware, periodic_keyframes;
+    bool require_hardware;
     std::atomic<bool> hardware{false};
     bool need_sync = true;
     int64_t last_av1_pts = -1;
@@ -142,9 +142,9 @@ struct Encoder::Impl {
     Frame result;
     std::exception_ptr callback_error;
 
-    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps, uint32_t bps, Codec codec, bool strict, bool periodic)
+    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps, uint32_t bps, Codec codec, bool strict)
         : output(std::move(cb)), width(w), height(h), fps(fps), bitrate(bps), codec(codec),
-          require_hardware(strict), periodic_keyframes(periodic), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
+          require_hardware(strict), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
 
     void close() noexcept {
         if (session) {
@@ -192,7 +192,7 @@ void Encoder::Impl::open(bool use_hardware) {
         (__bridge NSString*)kVTCompressionPropertyKey_YCbCrMatrix: (__bridge NSString*)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
         (__bridge NSString*)kVTCompressionPropertyKey_AverageBitRate: @(bitrate),
         (__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate: @(fps),
-        (__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval: @(periodic_keyframes ? fps * 2 : INT32_MAX)
+        (__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval: @(INT32_MAX)
     };
     NSDictionary* spec = use_hardware ?
         @{(__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES} :
@@ -204,8 +204,7 @@ void Encoder::Impl::open(bool use_hardware) {
                  hevc ? "Create VideoToolbox HEVC encoder" : "Create VideoToolbox H.264 encoder");
     check_status(VTSessionSetProperties(session, (__bridge CFDictionaryRef)properties),
                  "Configure VideoToolbox encoder");
-    if (!periodic_keyframes)
-        VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@0);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, (__bridge CFNumberRef)@0);
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140400
     if (@available(macOS 14.4, *)) {
         // Quality metrics are optional even on systems that export this key.
@@ -265,19 +264,13 @@ Encoder::Impl::Frame Encoder::Impl::submit(CVPixelBufferRef pixels, CMTime pts, 
     return frame;
 }
 
-Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate,
-                 std::function<void(std::vector<uint8_t>)> output, Codec codec, bool require_hardware, bool periodic_keyframes)
-    : Encoder(width, height, fps, bitrate, [cb = std::move(output)](std::vector<uint8_t> data, bool) {
-          cb(std::move(data));
-      }, codec, require_hardware, periodic_keyframes) {}
-
 Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output,
-                 Codec codec, bool require_hardware, bool periodic_keyframes)
-    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps, bitrate, codec, require_hardware, periodic_keyframes)) {
+                 Codec codec, bool require_hardware)
+    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps, bitrate, codec, require_hardware)) {
     if (codec == Codec::av1) {
         if (require_hardware) throw std::invalid_argument("AV1 encoding uses software libaom");
         std::cerr << "Warning: AV1 hardware encoding is unavailable in this build. Using software libaom.\n";
-        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate, periodic_keyframes);
+        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate);
         return;
     }
     if (codec != Codec::h264 && codec != Codec::h265)

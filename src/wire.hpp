@@ -15,8 +15,8 @@ struct Header {
     std::uint32_t width;
     std::uint32_t height;
     std::uint32_t fps;
-    Codec codec = Codec::h264;
-    std::uint32_t timeout_ms = 0; // Zero identifies the legacy access-unit-only stream.
+    Codec codec;
+    std::uint32_t timeout_ms;
 };
 
 struct Frame {
@@ -35,18 +35,18 @@ struct DisplaySize {
     std::uint32_t width, height;
 };
 
-// Optional preamble before any v1/v2/v3 stream header. Explicit-size senders skip it.
+// Optional preamble when the sender needs the receiver display dimensions.
 extern const std::vector<std::uint8_t> display_query;
 constexpr std::size_t display_reply_size = 16;
 constexpr unsigned display_query_timeout_ms = 5000;
 constexpr auto header_timeout = std::chrono::seconds(30);
-inline constexpr char display_query_hint[] =
-    "Cannot obtain the Windows display resolution. Update the receiver or specify --size WIDTHxHEIGHT. ";
+inline constexpr char display_query_error[] =
+    "Cannot obtain the Windows display resolution. Set --size WIDTHxHEIGHT to use a manual resolution. ";
 std::vector<std::uint8_t> encode_display_reply(DisplaySize size);
 DisplaySize decode_display_reply(const std::vector<std::uint8_t>& bytes);
 DisplaySize request_display_size(net::Socket& socket, unsigned timeout_ms = display_query_timeout_ms);
 
-constexpr std::size_t max_header_size = 28; // Longest inner stream header (v3).
+constexpr std::size_t header_size = 28;
 constexpr std::uint32_t max_frame_bytes = 16 * 1024 * 1024;
 constexpr std::uint32_t max_timeout_ms = 60000;
 constexpr std::size_t feedback_size = 12;
@@ -55,8 +55,7 @@ bool valid_mode(std::uint32_t width, std::uint32_t height, std::uint32_t fps,
 
 std::vector<std::uint8_t> encode_header(Header header);
 Header decode_header(const std::vector<std::uint8_t>& bytes);
-void send_header(net::Socket& socket, std::uint32_t width, std::uint32_t height,
-                 std::uint32_t fps, Codec codec = Codec::h264, std::uint32_t timeout_ms = 0);
+void send_header(net::Socket& socket, Header header);
 Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size = {});
 std::vector<std::uint8_t> pack_frame(const Frame& frame);
 Frame unpack_frame(const std::vector<std::uint8_t>& bytes);
