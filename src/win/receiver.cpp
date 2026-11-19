@@ -129,9 +129,7 @@ void toggle_fullscreen(Receiver& receiver) {
     }
 }
 
-void paint(Receiver& receiver) {
-    PAINTSTRUCT paint_state{};
-    HDC dc = BeginPaint(receiver.window, &paint_state);
+void paint_client(Receiver& receiver, HDC dc) {
     RECT area{};
     GetClientRect(receiver.window, &area);
     const int width = area.right;
@@ -178,7 +176,6 @@ void paint(Receiver& receiver) {
         StretchDIBits(dc, x, y, dest_width, dest_height, 0, 0, src_width, src_height,
                       frame->bgra.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
     }
-    EndPaint(receiver.window, &paint_state);
 }
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
@@ -193,9 +190,21 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
-    case WM_PAINT:
-        paint(*receiver);
+    case WM_PAINT: {
+        PAINTSTRUCT state{};
+        HDC dc = BeginPaint(window, &state);
+        paint_client(*receiver, dc);
+        EndPaint(window, &state);
         return 0;
+    }
+    case WM_PRINTCLIENT: {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        const int saved = SaveDC(dc);
+        paint_client(*receiver, dc);
+        if (saved) RestoreDC(dc, saved);
+        GdiFlush(); // The caller can be reading the destination from another thread.
+        return 0;
+    }
     case WM_SIZE:
         InvalidateRect(window, nullptr, FALSE);
         return 0;

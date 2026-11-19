@@ -72,6 +72,17 @@ jobs:
           path: ${{ matrix.path }}
           if-no-files-found: error
 
+      - name: Store Windows test executables
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-video-tests
+          path: |
+            build/Release/codec_probe.exe
+            build/Release/windows_present_tests.exe
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Encode Mac test pattern
         if: runner.os == 'macOS'
         run: ./build/Release/codec_probe test-pattern.frames
@@ -86,23 +97,27 @@ jobs:
           if-no-files-found: error
 
   codec-interop:
-    name: Decode Mac test pattern on Windows
+    name: Decode and display Mac test pattern on Windows
     needs: build
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: mac-encoded-fixture
           path: fixture
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-video-tests
+          path: tools
       - *media-foundation
-      - name: Build Windows probe
+      - name: Check decoded frames
+        run: .\tools\codec_probe.exe fixture\test-pattern.frames
+      - name: Check live Windows presentation
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --config Release --parallel --target codec_probe
-      - name: Decode and check frames
-        run: .\build\Release\codec_probe.exe fixture\test-pattern.frames
+          .\tools\windows_present_tests.exe fixture\test-pattern.frames
+          if ($LASTEXITCODE -eq 77) {
+            Write-Warning "Window readback skipped in this desktop session."
+            exit 0
+          }
+          exit $LASTEXITCODE
