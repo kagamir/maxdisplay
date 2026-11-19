@@ -37,6 +37,10 @@ inline bool has_recovery_picture(Codec codec, const std::vector<std::uint8_t>& b
 class FrameRecovery {
 public:
     enum class Action { drop, restart, decode };
+    enum class Reason {
+        startup, sequence_gap, clock_reset, transit_deadline, decode_deadline, decoder_backlog,
+        malformed_frame, decoder_error, idle_drain, count
+    };
 
     explicit FrameRecovery(std::uint32_t timeout_ms) : budget_us_(std::uint64_t(timeout_ms) * 1000) {}
 
@@ -45,16 +49,17 @@ public:
         if (started_) {
             const std::uint32_t advance = sequence - sequence_;
             if (advance == 0 || advance >= 0x80000000u) return Action::drop;
-            if (advance != 1) recover();
+            if (advance != 1) recover(Reason::sequence_gap);
             if (arrival_us < arrival_us_ || timestamp_us < timestamp_us_) {
                 // New clock origin. Reference pictures may also have been lost.
-                recover();
+                recover(Reason::clock_reset);
                 delay_us_ = 0;
                 cadence_us_ = 0;
                 tracking_late_ = false;
             } else {
                 // Difference of elapsed times removes the arbitrary epochs on
-                // the two hosts. Clamping at zero tracks the best transit seen.
+                // the two hosts. Allow the minimum transit estimate to drift
+                // by 100 us per second so oscillator skew cannot age a live GOP.
                 const auto received = arrival_us - arrival_us_;
                 const auto sent = timestamp_us - timestamp_us_;
                 if (advance == 1) {
@@ -65,6 +70,10 @@ public:
                 }
                 if (received > sent) delay_us_ += received - sent;
                 else delay_us_ -= std::min(delay_us_, sent - received);
+                // Quantize the endpoints, not the interval, to carry fractions
+                // across frames and across long idle gaps.
+                const auto drift = timestamp_us / drift_period - timestamp_us_ / drift_period;
+                delay_us_ -= std::min(delay_us_, drift);
             }
         }
         started_ = true;
@@ -73,7 +82,7 @@ public:
         arrival_us_ = arrival_us;
 
         if (delay_us_ > budget_us_) {
-            recover();
+            recover(Reason::transit_deadline);
             if (!tracking_late_) {
                 late_since_ = arrival_us;
                 tracking_late_ = true;
@@ -92,7 +101,8 @@ public:
         return Action::restart;
     }
 
-    void recover() { waiting_ = true; }
+    void recover(Reason reason = Reason::decoder_error) { waiting_ = true; reason_ = reason; }
+    Reason reason() const { return reason_; }
     bool waiting_for_keyframe() const { return waiting_; }
     std::uint32_t sequence() const { return sequence_; }
     std::uint64_t remaining_us() const { return budget_us_ - std::min(budget_us_, delay_us_); }
@@ -103,9 +113,11 @@ public:
     }
 
 private:
+    static constexpr std::uint64_t drift_period = 10'000; // 1 us per 10 ms (100 ppm)
     std::uint64_t budget_us_;
     std::uint64_t arrival_us_ = 0, timestamp_us_ = 0, delay_us_ = 0, late_since_ = 0;
     std::uint64_t cadence_us_ = 0;
     std::uint32_t sequence_ = 0;
     bool started_ = false, waiting_ = true, tracking_late_ = false;
+    Reason reason_ = Reason::startup;
 };

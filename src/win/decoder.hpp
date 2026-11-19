@@ -28,6 +28,7 @@ public:
     ~Decoder();
     // True only after a decoded frame has arrived on a hardware decoder surface.
     bool hardware_accelerated() const;
+    const char* backend_name() const;
     // False means a failed GPU session was replaced and a fresh keyframe is needed.
     bool decode(const std::vector<uint8_t>& access_unit, const Output& output);
     void reset(); // Drop queued samples before submitting a recovery keyframe.

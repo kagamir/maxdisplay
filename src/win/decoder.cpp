@@ -490,6 +490,14 @@ void Decoder::fallback(const std::exception& error) {
 
 bool Decoder::hardware_accelerated() const { return impl_ && impl_->hardware; }
 
+const char* Decoder::backend_name() const {
+    if (hardware_accelerated()) return "hardware/D3D11";
+    if (impl_ && impl_->gpu) return "pending/D3D11";
+    if (av1_) return "software/libaom";
+    if (hevc_) return "software/libde265";
+    return "software/MediaFoundation";
+}
+
 bool Decoder::decode(const std::vector<uint8_t>& unit, const Output& output) {
     if (unit.empty() || unit.size() > wire::max_frame_bytes)
         throw std::runtime_error("Invalid video access unit length");

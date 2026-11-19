@@ -198,6 +198,7 @@ void check(const Frames& frames, Codec codec, Transport transport) {
     else
         options.port = net::listen_tcp(options.bind, 0).local_port();
     options.windowed = true;
+    options.stats = true;
     std::promise<DWORD> started;
     auto ui_id = started.get_future();
     auto ui = std::async(std::launch::async, [&] {

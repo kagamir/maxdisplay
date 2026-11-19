@@ -12,15 +12,19 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
 #include <cstdint>
 #include <exception>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -35,6 +39,36 @@ constexpr UINT listener_failed = WM_APP + 1;
 constexpr UINT_PTR address_timer = 1;
 using Listener = std::variant<net::Socket, udp::Listener>;
 
+using Clock = std::chrono::steady_clock;
+using Reason = FrameRecovery::Reason;
+constexpr const char* request_names[] = {
+    "startup", "sequence_gap", "clock_reset", "transit_deadline", "decode_deadline",
+    "decoder_backlog", "malformed_frame", "decoder_error", "idle_drain"
+};
+constexpr auto reason_count = static_cast<std::size_t>(Reason::count);
+static_assert(std::size(request_names) == reason_count);
+
+struct StreamStats {
+    std::uint64_t received = 0, decoded = 0, decode_us = 0, idle_drains = 0;
+    std::array<std::uint64_t, reason_count> key_requests{};
+    Clock::time_point last_report;
+};
+
+// Charge drain time as well: buffered decoders may produce their picture in finish().
+struct DecodeTimer {
+    std::uint64_t* total;
+    Clock::time_point start;
+    explicit DecodeTimer(std::uint64_t* total)
+        : total(total), start(total ? Clock::now() : Clock::time_point{}) {}
+    ~DecodeTimer() {
+        if (total) *total += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
+    }
+};
+
+struct PaintStats {
+    std::uint64_t presented = 0, paints = 0, paint_us = 0;
+};
+
 struct Receiver {
     HWND window = nullptr;
     win_info::Binding binding{};
@@ -42,6 +76,7 @@ struct Receiver {
     Transport transport = Transport::tcp;
     std::wstring address_text;
     bool require_hardware = false;
+    bool stats_enabled = false;
     bool fullscreen = false;
     WINDOWPLACEMENT windowed_placement{};
     std::exception_ptr listener_error; // Read after joining the worker.
@@ -49,6 +84,9 @@ struct Receiver {
     std::mutex mutex;
     std::shared_ptr<net::Socket> active;
     std::shared_ptr<const VideoFrame> frame;
+    std::uint64_t session_id = 0; // Prevent a late WM_PAINT from contributing to a reconnected stream.
+    PaintStats paint_stats; // Updated by WM_PAINT and exchanged by the worker under mutex.
+    std::weak_ptr<const VideoFrame> last_painted; // UI thread only.
     const wchar_t* status = L"Waiting for the Mac to connect";
 
     // Only the UI thread reads and updates the network details shown while idle.
@@ -92,25 +130,55 @@ struct Receiver {
         InvalidateRect(window, nullptr, FALSE);
     }
 
+    void report_if_due(StreamStats& stats, const Decoder& decoder, Codec codec) {
+        const auto now = Clock::now();
+        const std::chrono::duration<double> elapsed = now - stats.last_report;
+        if (elapsed.count() < 1.0) return;
+        PaintStats painted;
+        {
+            std::lock_guard lock(mutex);
+            painted = std::exchange(paint_stats, PaintStats{});
+        }
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(2)
+             << "receiver stats window_s=" << elapsed.count() << " codec=" << codec_name(codec)
+             << " decoder=" << decoder.backend_name() << " received=" << stats.received
+             << " decoded=" << stats.decoded << " presented=" << painted.presented
+             << " decode_ms=";
+        if (stats.decoded) line << stats.decode_us / (1000.0 * stats.decoded);
+        else line << "n/a";
+        line << " paint_ms=";
+        if (painted.paints) line << painted.paint_us / (1000.0 * painted.paints);
+        else line << "n/a";
+        line << " idle_drains=" << stats.idle_drains << " key_requests=";
+        for (std::size_t i = 0; i < reason_count; ++i)
+            line << (i ? "," : "") << request_names[i] << '=' << stats.key_requests[i];
+        std::clog << line.str() << '\n';
+        stats = {};
+        stats.last_report = now;
+    }
+
     template<class ReadFrame, class SendFeedback>
-    void receive_live(wire::Header header, ReadFrame& read_frame, SendFeedback& feedback) {
-        using Clock = std::chrono::steady_clock;
+    void receive_live(wire::Header header, Decoder& decoder, StreamStats& stats,
+                      ReadFrame& read_frame, SendFeedback& feedback) {
         FrameRecovery recovery(header.timeout_ms);
-        Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
         bool used_decoder = false;
         std::deque<Clock::time_point> deadlines;
         Clock::time_point drain_at;
         auto acknowledge = [&] {
             feedback(wire::pack_feedback({recovery.sequence(), recovery.waiting_for_keyframe()}));
+            if (stats_enabled && recovery.waiting_for_keyframe())
+                ++stats.key_requests[static_cast<std::size_t>(recovery.reason())];
         };
         auto display = [&](VideoFrame&& decoded) {
+            if (stats_enabled) ++stats.decoded;
             if (deadlines.empty()) return;
             const auto deadline = deadlines.front();
             deadlines.pop_front();
             if (Clock::now() <= deadline && !recovery.waiting_for_keyframe())
                 present(std::move(decoded));
-            else
-                recovery.recover();
+            else if (!recovery.waiting_for_keyframe())
+                recovery.recover(Reason::decode_deadline);
         };
         auto poll_interval = [&]() -> unsigned {
             if (deadlines.empty() || recovery.waiting_for_keyframe()) return 100;
@@ -121,7 +189,9 @@ struct Receiver {
             }
             // Some MFTs buffer an input even in low-latency mode. A static Mac
             // desktop might never send the next sample that would release it.
+            if (stats_enabled) ++stats.idle_drains;
             try {
+                DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
                 decoder.finish(display);
             } catch (const HardwareDecodeUnavailable&) {
                 throw;
@@ -131,7 +201,7 @@ struct Receiver {
             }
             const bool need_image = recovery.waiting_for_keyframe() || !deadlines.empty();
             deadlines.clear();
-            recovery.recover();
+            if (!recovery.waiting_for_keyframe()) recovery.recover(Reason::idle_drain);
             // A successfully displayed static picture can stay idle indefinitely.
             // Request a new key only on the next delta, or if the drain failed.
             if (need_image) acknowledge();
@@ -140,18 +210,21 @@ struct Receiver {
 
         std::vector<std::uint8_t> bytes;
         while (!stopping && read_frame(bytes, poll_interval)) {
+            if (stats_enabled) ++stats.received;
             const auto now = Clock::now();
             const auto arrival = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch());
             wire::Frame packet;
             try {
                 packet = wire::unpack_frame(bytes);
             } catch (const std::runtime_error&) {
-                recovery.recover();
+                recovery.recover(Reason::malformed_frame);
                 acknowledge();
                 continue;
             }
-            if (deadlines.size() >= 32 || (!deadlines.empty() && now > deadlines.front()))
-                recovery.recover();
+            if (!recovery.waiting_for_keyframe()) {
+                if (deadlines.size() >= 32) recovery.recover(Reason::decoder_backlog);
+                else if (!deadlines.empty() && now > deadlines.front()) recovery.recover(Reason::decode_deadline);
+            }
             const bool keyframe = packet.keyframe && has_recovery_picture(header.codec, packet.data);
             const auto action = recovery.inspect(packet.sequence, packet.timestamp_us, keyframe, arrival.count());
             if (action != FrameRecovery::Action::drop) {
@@ -162,6 +235,7 @@ struct Receiver {
                 used_decoder = true;
                 deadlines.push_back(now + std::chrono::microseconds(recovery.remaining_us()));
                 try {
+                    DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
                     if (!decoder.decode(packet.data, display)) recovery.recover();
                 } catch (const HardwareDecodeUnavailable&) {
                     throw;
@@ -179,7 +253,10 @@ struct Receiver {
             }
             acknowledge();
         }
-        if (!stopping && !deadlines.empty() && !recovery.waiting_for_keyframe()) decoder.finish(display);
+        if (!stopping && !deadlines.empty() && !recovery.waiting_for_keyframe()) {
+            DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
+            decoder.finish(display);
+        }
     }
 
     template<class ReadHeader, class ReadFrame, class SendFeedback>
@@ -188,15 +265,40 @@ struct Receiver {
         const wchar_t* next_status = L"Stream ended. Waiting for the Mac to reconnect";
         try {
             const auto header = read_header();
-            if (header.timeout_ms) {
-                receive_live(header, read_frame, feedback);
-            } else {
-                Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
-                auto display = [this](VideoFrame&& decoded) { present(std::move(decoded)); };
-                std::vector<std::uint8_t> bytes;
-                while (!stopping && read_frame(bytes, [] { return 100u; })) decoder.decode(bytes, display);
-                if (!stopping) decoder.finish(display);
+            Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
+            StreamStats stats;
+            if (stats_enabled) {
+                stats.last_report = Clock::now();
+                std::lock_guard lock(mutex);
+                ++session_id;
+                paint_stats = {};
             }
+            auto read = [&](std::vector<std::uint8_t>& bytes, const auto& poll) {
+                if (!stats_enabled) return read_frame(bytes, poll);
+                return read_frame(bytes, [&] {
+                    report_if_due(stats, decoder, header.codec);
+                    return poll();
+                });
+            };
+            if (header.timeout_ms) {
+                receive_live(header, decoder, stats, read, feedback);
+            } else {
+                auto display = [&](VideoFrame&& decoded) {
+                    if (stats_enabled) ++stats.decoded;
+                    present(std::move(decoded));
+                };
+                std::vector<std::uint8_t> bytes;
+                while (!stopping && read(bytes, [] { return 100u; })) {
+                    if (stats_enabled) ++stats.received;
+                    DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
+                    decoder.decode(bytes, display);
+                }
+                if (!stopping) {
+                    DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
+                    decoder.finish(display);
+                }
+            }
+            if (stats_enabled) report_if_due(stats, decoder, header.codec);
         } catch (const std::exception& e) {
             if (!stopping) std::cerr << "Stream error: " << e.what() << '\n';
             next_status = L"Stream error. See the console for details. Waiting for a connection";
@@ -286,7 +388,7 @@ void toggle_fullscreen(Receiver& receiver) {
     }
 }
 
-void paint_client(Receiver& receiver, HDC dc) {
+void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
     RECT area{};
     GetClientRect(receiver.window, &area);
     const int width = area.right;
@@ -295,8 +397,10 @@ void paint_client(Receiver& receiver, HDC dc) {
 
     std::shared_ptr<const VideoFrame> frame;
     const wchar_t* status;
+    std::uint64_t session_id;
     {
         std::lock_guard lock(receiver.mutex);
+        session_id = receiver.session_id;
         frame = receiver.frame;
         status = receiver.status;
     }
@@ -326,6 +430,7 @@ void paint_client(Receiver& receiver, HDC dc) {
         SelectObject(dc, previous);
         if (font) DeleteObject(font);
     } else if (width > 0 && height > 0) {
+        const auto start = track_paint ? Clock::now() : Clock::time_point{};
         const int src_width = static_cast<int>(frame->width);
         const int src_height = static_cast<int>(frame->height);
         const int dest_width = std::max(1, static_cast<int>(std::min<int64_t>(
@@ -349,8 +454,17 @@ void paint_client(Receiver& receiver, HDC dc) {
         header.biBitCount = 32;
         header.biCompression = BI_RGB;
         SetStretchBltMode(dc, COLORONCOLOR);
-        StretchDIBits(dc, x, y, dest_width, dest_height, 0, 0, src_width, src_height,
-                      frame->bgra.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
+        const int lines = StretchDIBits(dc, x, y, dest_width, dest_height, 0, 0, src_width, src_height,
+                                        frame->bgra.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
+        if (track_paint && lines > 0) {
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
+            std::lock_guard lock(receiver.mutex);
+            if (session_id != receiver.session_id) return;
+            if (receiver.last_painted.lock() != frame) ++receiver.paint_stats.presented;
+            receiver.last_painted = frame;
+            ++receiver.paint_stats.paints;
+            receiver.paint_stats.paint_us += us;
+        }
     }
 }
 
@@ -369,14 +483,14 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT state{};
         HDC dc = BeginPaint(window, &state);
-        paint_client(*receiver, dc);
+        paint_client(*receiver, dc, receiver->stats_enabled);
         EndPaint(window, &state);
         return 0;
     }
     case WM_PRINTCLIENT: {
         HDC dc = reinterpret_cast<HDC>(wp);
         const int saved = SaveDC(dc);
-        paint_client(*receiver, dc);
+        paint_client(*receiver, dc, false);
         if (saved) RestoreDC(dc, saved);
         GdiFlush(); // The caller can be reading the destination from another thread.
         return 0;
@@ -455,6 +569,7 @@ int run_receiver(const ReceiverOptions& options) {
     receiver.port = options.port;
     receiver.transport = options.transport;
     receiver.require_hardware = options.require_hardware;
+    receiver.stats_enabled = options.stats;
     receiver.refresh_addresses();
     HWND window = CreateWindowExW(0, window_class, L"MaxDisplay", WS_OVERLAPPEDWINDOW,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1000, 620,

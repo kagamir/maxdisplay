@@ -40,16 +40,16 @@ int main() {
 #ifdef __APPLE__
         expect(invoke({"send", "example"}) == 0 && sender.width == 0 && sender.height == 0 &&
                sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp &&
-               sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware && !sender.legacy,
+               sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware && !sender.legacy && !sender.stats,
                "Unexpected Mac defaults");
         expect(invoke({"send", "example", "--codec", "av1", "--transport", "udp", "--size", "640x360",
                        "--scale", "1.5"}) == 0 && sender.width == 640 && sender.height == 360 &&
                sender.scale == 1.5 && sender.codec == Codec::av1 && sender.transport == Transport::udp,
                "Fractional scale or media selections lost");
         expect(invoke({"send", "example", "--codec", "h265", "--require-hardware", "--frame-timeout-ms", "150",
-                       "--bitrate-mbps", "16", "--fixed-bitrate"}) == 0 && sender.codec == Codec::h265 &&
+                       "--bitrate-mbps", "16", "--fixed-bitrate", "--stats"}) == 0 && sender.codec == Codec::h265 &&
                sender.require_hardware && sender.timeout_ms == 150 && sender.bitrate == 16'000'000 &&
-               !sender.adaptive && sender.adaptive_fps && !sender.legacy, "HEVC streaming options lost");
+               !sender.adaptive && sender.adaptive_fps && !sender.legacy && sender.stats, "HEVC streaming options lost");
         expect(invoke({"send", "example", "--fps", "48", "--fixed-fps", "--scale", "0.75"}) == 0 &&
                sender.fps == 48 && !sender.adaptive_fps && sender.adaptive && sender.width == 0,
                "Fixed frame rate interfered with adaptive bitrate or monitor sizing");
@@ -75,10 +75,10 @@ int main() {
         invalid({"send", "example", "--codec", "unknown"});
         invalid({"send", "example", "--transport", "sctp"});
 #elif defined(_WIN32)
-        expect(invoke({}) == 0 && receiver.transport == Transport::tcp && !receiver.require_hardware,
+        expect(invoke({}) == 0 && receiver.transport == Transport::tcp && !receiver.require_hardware && !receiver.stats,
                "Unexpected Windows defaults");
-        expect(invoke({"receive", "--transport", "udp", "--port", "12345", "--windowed", "--require-hardware"}) == 0 &&
-               receiver.transport == Transport::udp && receiver.port == 12345 && receiver.windowed && receiver.require_hardware,
+        expect(invoke({"receive", "--transport", "udp", "--port", "12345", "--windowed", "--require-hardware", "--stats"}) == 0 &&
+               receiver.transport == Transport::udp && receiver.port == 12345 && receiver.windowed && receiver.require_hardware && receiver.stats,
                "Windows UDP options lost");
         invalid({"receive", "--transport", "invalid"});
 #endif

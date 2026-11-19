@@ -23,6 +23,7 @@ struct SenderOptions {
     bool adaptive_fps = true;
     bool require_hardware = false;
     bool legacy = false;
+    bool stats = false;
 };
 
 struct ReceiverOptions {
@@ -31,6 +32,7 @@ struct ReceiverOptions {
     bool windowed = false;
     Transport transport = Transport::tcp;
     bool require_hardware = false;
+    bool stats = false;
 };
 
 int run_cli(int argc, char** argv);

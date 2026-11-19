@@ -15,13 +15,14 @@ namespace {
 void print_help() {
     std::cout << "MaxDisplay - use a Windows PC as a Mac extended display\n\n"
                  "Windows: maxdisplay [receive] [--bind IP] [--port PORT] [--transport tcp|udp]\n"
-                 "                              [--require-hardware] [--windowed]\n"
+                 "                              [--require-hardware] [--windowed] [--stats]\n"
                  "macOS:   maxdisplay send WINDOWS_HOST [--port PORT] [--size WIDTHxHEIGHT]\n"
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|h265|av1] [--transport tcp|udp]\n"
                  "                                      [--frame-timeout-ms MS] [--fixed-bitrate] [--fixed-fps]\n"
-                 "                                      [--require-hardware] [--legacy]\n\n"
+                 "                                      [--require-hardware] [--legacy] [--stats]\n\n"
                  "Start Windows first. Defaults: H.264 over TCP 49300, scale 1, up to 60 fps and 12 Mbps.\n"
+                 "--stats prints per-second streaming statistics on this device.\n"
                  "--size sets the Mac virtual desktop. The stream size is --size times --scale.\n"
                  "Omit --size to use the Windows monitor's pixel dimensions divided by --scale for the desktop.\n"
                  "H.264/H.265 prefer hardware and warn on software fallback. --require-hardware disables fallback.\n"
@@ -117,6 +118,8 @@ int run_cli(int argc, char** argv) {
             options.adaptive = false;
         } else if (key == "--fixed-fps") {
             options.adaptive_fps = false;
+        } else if (key == "--stats") {
+            options.stats = true;
         } else if (key == "--require-hardware") {
             options.require_hardware = true;
         } else if (key == "--legacy") {
@@ -154,6 +157,8 @@ int run_cli(int argc, char** argv) {
             options.transport = parse_transport(option_value(i, argc, argv));
         } else if (key == "--windowed") {
             options.windowed = true;
+        } else if (key == "--stats") {
+            options.stats = true;
         } else if (key == "--require-hardware") {
             options.require_hardware = true;
         } else {
