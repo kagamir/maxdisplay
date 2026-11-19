@@ -1,5 +1,6 @@
 #pragma once
 
+#include "secure.hpp"
 #include "wire.hpp"
 
 #include <cstdint>
@@ -15,6 +16,9 @@ class Sender {
 public:
     Sender(const std::string& host, std::uint16_t port, const std::string& password = {});
     ~Sender();
+    net::Endpoint peer_endpoint() const;
+    std::unique_ptr<secure::Datagrams> datagrams();
+    wire::CursorOffer request_cursor(std::uint16_t port);
     wire::DisplaySize request_display_size(unsigned timeout_ms = wire::display_query_timeout_ms);
     void send_header(const wire::Header& header);
     // Sync pictures can retransmit missing fragments. Delta pictures are sequenced/unreliable.
@@ -39,8 +43,11 @@ public:
     ~Listener();
     std::uint16_t local_port() const;
     bool accept(unsigned timeout_ms);
+    net::Endpoint peer_endpoint() const;
+    std::unique_ptr<secure::Datagrams> datagrams();
     wire::Header receive_header(const std::function<wire::DisplaySize()>& display_size,
-                                const std::function<bool()>& stopping = {});
+                                const std::function<bool()>& stopping = {},
+                                const wire::CursorResponder& cursor = {});
     ReadResult receive(std::vector<std::uint8_t>& message, unsigned timeout_ms);
     void send_feedback(const std::vector<std::uint8_t>& message);
     void disconnect() noexcept;

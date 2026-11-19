@@ -1,6 +1,7 @@
 // Drives the normal sender in a logged-in session with Screen Recording permission.
 #include "app.hpp"
 #include "av1.hpp"
+#include "cursor_link.hpp"
 #include "frame_recovery.hpp"
 #include "secure_tcp.hpp"
 #include "udp.hpp"
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <future>
@@ -95,11 +97,80 @@ void check_av1(const std::vector<uint8_t>& frame, uint32_t width, uint32_t heigh
     if (!decoded) throw std::runtime_error("No picture decoded from the first AV1 desktop frame");
 }
 
+// Exercise the production sampler, cipher and ARQ without moving the runner's real mouse.
+// Wait for distinct position sequences after acknowledging its bitmap. A stalled sender
+// that just retransmits the same tail packet cannot satisfy this check.
+void check_cursor(net::Socket socket, net::Endpoint peer, std::uint64_t token,
+                  std::unique_ptr<secure::Datagrams> cipher, bool interrupt, const std::atomic<bool>& video_ready) {
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    cursor::Receiver receiver(token);
+    bool shape_seen = false;
+    std::optional<Clock::time_point> reopen_at, first_reply;
+    std::optional<std::uint32_t> last_seq, original_floor, fallback_seq;
+    unsigned positions = 0;
+    while (Clock::now() - start < 30s) {
+        if (!net::wait_readable(socket, 50)) continue;
+        net::Endpoint source;
+        cursor::Bytes bytes;
+        if (!socket.receive_from(source, bytes) || source != peer) continue;
+        const auto now = Clock::now();
+        // In this profile the stream must start with the pointer in video.
+        // Once it hands off to the overlay, simulate a full bidirectional outage.
+        if (interrupt && (!video_ready || (reopen_at && now < *reopen_at))) continue;
+        if (cipher) {
+            auto plain = cipher->open(bytes);
+            if (!plain) throw std::runtime_error("Mac cursor datagram did not authenticate");
+            bytes = std::move(*plain);
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        auto ack = receiver.receive(elapsed, bytes);
+        if (!ack) throw std::runtime_error("Invalid Mac cursor packet");
+        socket.send_to(peer, cipher ? cipher->seal(*ack) : *ack);
+        if (reopen_at && !first_reply) first_reply = now;
+        if (bytes[8] == cursor::detail::shape_type) shape_seen = true;
+        if (!shape_seen || bytes[8] != cursor::detail::state_type) continue;
+        const auto seq = static_cast<std::uint32_t>(cursor::detail::get(bytes, 10, 4));
+        if (last_seq && !cursor::detail::newer(seq, *last_seq)) continue;
+        last_seq = seq;
+        if (!interrupt) {
+            if (++positions == 2) return;
+            continue;
+        }
+
+        // The Mac attaches a video floor even for an off-display hotspot. This
+        // verifies both completed handoffs without warping the system pointer.
+        const bool fenced = (bytes[9] & 2) != 0;
+        if (fenced && !reopen_at) {
+            original_floor = static_cast<std::uint32_t>(cursor::detail::get(bytes, 30, 4));
+            reopen_at = now + 3s;
+            std::cout << "Cursor handoff at video sequence " << *original_floor << "; blocking UDP for 3 s\n";
+        } else if (first_reply && !fenced && bytes[9] == 0) {
+            fallback_seq = seq;
+        } else if (first_reply && fenced) {
+            const auto floor = static_cast<std::uint32_t>(cursor::detail::get(bytes, 30, 4));
+            if (!cursor::detail::newer(floor, *original_floor)) continue;
+            if (!fallback_seq) throw std::runtime_error("Cursor overlay did not transition through the video fallback");
+            if (now - *first_reply < 980ms)
+                throw std::runtime_error("Cursor overlay resumed before a second of healthy ACKs");
+            std::cout << "Cursor UDP recovered at fresh video sequence " << floor << '\n';
+            return;
+        }
+    }
+    if (!shape_seen) throw std::runtime_error("No valid cursor bitmap received from Mac");
+    if (!interrupt) throw std::runtime_error("No acknowledged cursor heartbeats from Mac");
+    if (!original_floor) throw std::runtime_error("Mac never handed off from video to the cursor overlay");
+    if (!fallback_seq) throw std::runtime_error("Mac never hid the cursor overlay after the UDP outage");
+    throw std::runtime_error("Mac never confirmed a fresh cursor-free frame after UDP recovered");
+}
+
 void capture(Codec codec, Transport transport, double scale, bool automatic, wire::DisplaySize expected, bool encrypted) {
     SenderOptions options;
     options.codec = codec;
     options.transport = transport;
     options.host = "127.0.0.1";
+    options.video_cursor = !encrypted && codec == Codec::av1;
+    const bool unavailable_cursor = !encrypted && codec == Codec::h264;
     if (encrypted) options.password = "MaxDisplay test passphrase";
     options.fps = 30;
     // Leave time to decode the scaled AV1 keyframe on a shared runner.
@@ -128,7 +199,23 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
         wire::Header mode{};
         net::Socket peer;
         std::optional<secure::TcpChannel> channel;
-        bool queried = false;
+        bool queried = false, cursor_queried = false;
+        std::atomic<bool> video_ready{false};
+        std::future<void> side;
+        auto offer_cursor = [&](std::uint16_t sender_port) -> wire::CursorOffer {
+            if (queried || cursor_queried || options.video_cursor)
+                throw std::runtime_error("Unexpected cursor query");
+            cursor_queried = true;
+            if (unavailable_cursor) return {};
+            auto socket = net::bind_udp(options.host);
+            const wire::CursorOffer offer{socket.local_port(), secure::random_token()};
+            auto endpoint = datagrams ? datagrams->peer_endpoint() : channel->peer_endpoint();
+            endpoint.port = sender_port;
+            auto cipher = datagrams ? datagrams->datagrams() : channel->datagrams();
+            side = std::async(std::launch::async, check_cursor, std::move(socket), endpoint, offer.token,
+                              std::move(cipher), encrypted && transport == Transport::udp, std::cref(video_ready));
+            return offer;
+        };
         auto monitor = [&] {
             if (!automatic || queried) throw std::runtime_error("Unexpected display size query");
             queried = true;
@@ -136,33 +223,34 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
         };
         if (datagrams) {
             if (!datagrams->accept(8000)) throw std::runtime_error("UDP sender did not connect");
-            mode = datagrams->receive_header(monitor);
+            mode = datagrams->receive_header(monitor, {}, offer_cursor);
         } else {
             if (!net::wait_readable(tcp, 8000)) throw std::runtime_error("TCP sender did not connect");
             peer = net::accept_tcp(tcp);
             if (!peer) throw std::runtime_error("TCP connection withdrawn");
             channel.emplace(peer, options.password, secure::Role::receiver);
-            mode = channel->receive_header(monitor);
+            mode = channel->receive_header(monitor, offer_cursor);
         }
+        if (cursor_queried == options.video_cursor) throw std::runtime_error("Unexpected cursor negotiation mode");
         if (queried != automatic || mode.width != expected.width || mode.height != expected.height || mode.fps != options.fps ||
             mode.codec != codec || mode.timeout_ms != options.timeout_ms)
             throw std::runtime_error("Unexpected captured desktop mode");
         std::cout << "Received v3 header for " << codec_name(codec) << '\n' << std::flush;
-        auto receive_frame = [&](std::chrono::steady_clock::time_point deadline, const char* stage) {
+        auto poll_frame = [&]() -> std::optional<wire::Frame> {
             std::vector<uint8_t> message;
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (datagrams) {
-                    const auto result = datagrams->receive(message, 100);
-                    if (result == udp::ReadResult::timeout) continue;
-                    if (result == udp::ReadResult::disconnected)
-                        throw std::runtime_error(std::string("UDP disconnected during ") + stage);
-                } else {
-                    if (!net::wait_readable(peer, 100)) continue;
-                    if (!channel->receive_frame(message))
-                        throw std::runtime_error(std::string("TCP disconnected during ") + stage);
-                }
-                return wire::unpack_frame(message);
+            if (datagrams) {
+                const auto result = datagrams->receive(message, 100);
+                if (result == udp::ReadResult::timeout) return {};
+                if (result == udp::ReadResult::disconnected) throw std::runtime_error("UDP sender disconnected");
+            } else {
+                if (!net::wait_readable(peer, 100)) return {};
+                if (!channel->receive_frame(message)) throw std::runtime_error("TCP sender disconnected");
             }
+            return wire::unpack_frame(message);
+        };
+        auto receive_frame = [&](std::chrono::steady_clock::time_point deadline, const char* stage) {
+            while (std::chrono::steady_clock::now() < deadline)
+                if (auto frame = poll_frame()) return std::move(*frame);
             throw std::runtime_error(std::string("Timed out during ") + stage);
         };
         auto feedback = [&](uint32_t sequence, bool request_keyframe) {
@@ -203,6 +291,13 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
         // Simulate the last picture going missing: send no feedback or further request.
         auto retry = wait_key("unacknowledged final picture", recovery, false);
         feedback(retry, false);
+        video_ready = true;
+        if (side.valid()) {
+            while (side.wait_for(0ms) != std::future_status::ready) {
+                if (auto next = poll_frame()) feedback(next->sequence, false);
+            }
+            side.get();
+        }
         std::raise(SIGINT);
         const auto end = std::chrono::steady_clock::now() + 4s;
         while (stopped_future.wait_for(0ms) != std::future_status::ready &&

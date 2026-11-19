@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "decoder.hpp"
 #include "display_info.hpp"
+#include "cursor_overlay.hpp"
 #include "frame_recovery.hpp"
 #include "net.hpp"
 #include "secure_tcp.hpp"
@@ -37,6 +38,7 @@ namespace {
 
 constexpr wchar_t window_class[] = L"MaxDisplayReceiver";
 constexpr UINT listener_failed = WM_APP + 1;
+constexpr UINT cursor_changed = WM_APP + 2;
 constexpr UINT_PTR address_timer = 1;
 using Listener = std::variant<net::Socket, udp::Listener>;
 
@@ -68,6 +70,7 @@ struct DecodeTimer {
 
 struct PaintStats {
     std::uint64_t presented = 0, paints = 0, paint_us = 0;
+    std::uint64_t cursor_updates = 0, cursor_gaps = 0, cursor_repaints = 0;
 };
 
 struct Receiver {
@@ -87,10 +90,138 @@ struct Receiver {
     std::mutex mutex;
     std::shared_ptr<net::Socket> active;
     std::shared_ptr<const VideoFrame> frame;
-    std::uint64_t session_id = 0; // Prevent a late WM_PAINT from contributing to a reconnected stream.
+    std::uint32_t frame_sequence = 0; // Published under the same lock as the decoded pixels.
+    std::uint64_t session_id = 0;
     PaintStats paint_stats; // Updated by WM_PAINT and exchanged by the worker under mutex.
     std::weak_ptr<const VideoFrame> last_painted; // UI thread only.
     const wchar_t* status = L"Waiting for the Mac to connect";
+    std::optional<net::Socket> cursor_socket;
+    std::thread cursor_worker;
+    std::atomic<bool> cursor_stopping{false};
+    struct SessionCursor {
+        std::uint64_t session = 0;
+        cursor::View view{};
+    };
+    SessionCursor pending_cursor; // Published by the cursor worker under mutex.
+    bool cursor_posted = false;
+    SessionCursor visible_cursor; // UI thread only, consistent across a WM_PAINT.
+    bool painting_cursor_update = false;
+    win_cursor::Overlay overlay;
+
+    void publish_cursor(cursor::View view) {
+        std::lock_guard lock(mutex);
+        pending_cursor = {session_id, std::move(view)};
+        if (!cursor_posted) cursor_posted = PostMessageW(window, cursor_changed, 0, 0) != FALSE;
+    }
+
+    void apply_cursor() {
+        SessionCursor next;
+        std::shared_ptr<const VideoFrame> video_frame;
+        std::uint32_t sequence;
+        std::uint64_t session;
+        {
+            std::lock_guard lock(mutex);
+            cursor_posted = false;
+            next = pending_cursor;
+            video_frame = frame;
+            sequence = frame_sequence;
+            session = session_id;
+        }
+        RECT old_bounds{}, new_bounds{};
+        if (video_frame) {
+            RECT client{};
+            GetClientRect(window, &client);
+            const RECT video = win_cursor::fit_video(client, *video_frame);
+            if (visible_cursor.session == session)
+                old_bounds = overlay.bounds(video, *video_frame, visible_cursor.view, sequence, session);
+            if (next.session == session)
+                new_bounds = overlay.bounds(video, *video_frame, next.view, sequence, session);
+        }
+        visible_cursor = std::move(next);
+        if (!visible_cursor.view.image) overlay.forget_shape();
+        if (!IsRectEmpty(&old_bounds)) InvalidateRect(window, &old_bounds, FALSE);
+        if (!IsRectEmpty(&new_bounds)) InvalidateRect(window, &new_bounds, FALSE);
+        if (!IsRectEmpty(&old_bounds) || !IsRectEmpty(&new_bounds)) {
+            painting_cursor_update = true;
+            UpdateWindow(window);
+            painting_cursor_update = false;
+        }
+    }
+
+    void cursor_loop(net::Endpoint peer, std::uint64_t token, std::unique_ptr<secure::Datagrams> crypto) {
+        try {
+            cursor::Receiver link(token);
+            const auto start = Clock::now();
+            auto elapsed_ms = [&] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
+            };
+            std::uint64_t revision = link.revision();
+            cursor::ReceiverStats previous{};
+            unsigned punches = 0;
+            while (!stopping && !cursor_stopping) {
+                // Send from the negotiated port to establish a return path through a stateful firewall.
+                if (punches < 3 && elapsed_ms() >= punches * 12) {
+                    cursor_socket->send_to(peer, {});
+                    ++punches;
+                }
+                const bool ready = net::wait_readable(*cursor_socket, punches < 3 ? 4 : 25);
+                const auto now = elapsed_ms();
+                if (ready) {
+                    net::Endpoint source{};
+                    cursor::Bytes bytes;
+                    if (cursor_socket->receive_from(source, bytes) && source == peer) {
+                        if (crypto) {
+                            auto packet = crypto->open(bytes);
+                            if (packet) bytes = std::move(*packet);
+                            else bytes.clear();
+                        }
+                        if (auto ack = link.receive(now, bytes))
+                            cursor_socket->send_to(peer, crypto ? crypto->seal(*ack) : *ack);
+                    }
+                }
+                link.expire(now);
+                if (link.revision() != revision) {
+                    revision = link.revision();
+                    publish_cursor(link.view());
+                }
+                if (stats_enabled) {
+                    const auto totals = link.stats();
+                    if (totals.updates != previous.updates || totals.gaps != previous.gaps) {
+                        std::lock_guard lock(mutex);
+                        paint_stats.cursor_updates += totals.updates - previous.updates;
+                        paint_stats.cursor_gaps += totals.gaps - previous.gaps;
+                        previous = totals;
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            if (!stopping && !cursor_stopping) std::cerr << "Cursor channel stopped: " << e.what() << '\n';
+        }
+        publish_cursor({});
+    }
+
+    template<class Channel>
+    wire::CursorOffer offer_cursor(Channel& channel, std::uint16_t sender_port) {
+        if (!cursor_socket) return {};
+        try {
+            auto peer = channel.peer_endpoint();
+            peer.port = sender_port;
+            const auto token = secure::random_token();
+            const auto port = cursor_socket->local_port();
+            auto crypto = channel.datagrams();
+            cursor_stopping = false;
+            cursor_worker = std::thread(&Receiver::cursor_loop, this, std::move(peer), token, std::move(crypto));
+            return {port, token};
+        } catch (const std::exception& e) {
+            std::cerr << "Cursor channel unavailable: " << e.what() << '\n';
+            return {};
+        }
+    }
+
+    void end_cursor() {
+        cursor_stopping = true;
+        if (cursor_worker.joinable()) cursor_worker.join();
+    }
 
     // Only the UI thread reads and updates the network details shown while idle.
     void refresh_addresses() {
@@ -123,11 +254,12 @@ struct Receiver {
         InvalidateRect(window, nullptr, FALSE);
     }
 
-    void present(VideoFrame&& decoded) {
+    void present(VideoFrame&& decoded, std::uint32_t sequence) {
         auto next = std::make_shared<VideoFrame>(std::move(decoded));
         {
             std::lock_guard lock(mutex);
             frame = std::move(next);
+            frame_sequence = sequence;
         }
         // Windows coalesces invalid regions. A slow repaint takes the newest frame.
         InvalidateRect(window, nullptr, FALSE);
@@ -153,7 +285,9 @@ struct Receiver {
         line << " paint_ms=";
         if (painted.paints) line << painted.paint_us / (1000.0 * painted.paints);
         else line << "n/a";
-        line << " idle_drains=" << stats.idle_drains << " key_requests=";
+        line << " cursor_updates=" << painted.cursor_updates << " cursor_gaps=" << painted.cursor_gaps
+             << " cursor_repaints=" << painted.cursor_repaints
+             << " idle_drains=" << stats.idle_drains << " key_requests=";
         for (std::size_t i = 0; i < reason_count; ++i)
             line << (i ? "," : "") << request_names[i] << '=' << stats.key_requests[i];
         std::clog << line.str() << '\n';
@@ -166,7 +300,9 @@ struct Receiver {
                       ReadFrame& read_frame, SendFeedback& feedback) {
         FrameRecovery recovery(header.timeout_ms);
         bool used_decoder = false;
-        std::deque<Clock::time_point> deadlines;
+        // The low-delay codecs produce in input order, including frames emitted during finish().
+        struct QueuedFrame { std::uint32_t sequence; Clock::time_point deadline; };
+        std::deque<QueuedFrame> pending;
         Clock::time_point drain_at;
         auto acknowledge = [&] {
             feedback(wire::pack_feedback({recovery.sequence(), recovery.waiting_for_keyframe()}));
@@ -175,17 +311,17 @@ struct Receiver {
         };
         auto display = [&](VideoFrame&& decoded) {
             if (stats_enabled) ++stats.decoded;
-            if (deadlines.empty()) return;
-            const auto deadline = deadlines.front();
-            deadlines.pop_front();
-            if (Clock::now() <= deadline && !recovery.waiting_for_keyframe())
-                present(std::move(decoded));
+            if (pending.empty()) return;
+            const auto ready = pending.front();
+            pending.pop_front();
+            if (Clock::now() <= ready.deadline && !recovery.waiting_for_keyframe())
+                present(std::move(decoded), ready.sequence);
             else if (!recovery.waiting_for_keyframe())
                 recovery.recover(Reason::decode_deadline);
         };
         auto poll_interval = [&]() -> unsigned {
             if (stats_enabled) report_if_due(stats, decoder, header.codec);
-            if (deadlines.empty() || recovery.waiting_for_keyframe()) return 100;
+            if (pending.empty() || recovery.waiting_for_keyframe()) return 100;
             const auto now = Clock::now();
             if (now < drain_at) {
                 const auto ms = std::chrono::ceil<std::chrono::milliseconds>(drain_at - now).count();
@@ -203,8 +339,8 @@ struct Receiver {
                 std::cerr << "Failed to drain video decoder: " << e.what() << '\n';
                 recovery.recover();
             }
-            const bool need_image = recovery.waiting_for_keyframe() || !deadlines.empty();
-            deadlines.clear();
+            const bool need_image = recovery.waiting_for_keyframe() || !pending.empty();
+            pending.clear();
             if (!recovery.waiting_for_keyframe()) recovery.recover(Reason::idle_drain);
             // A successfully displayed static picture can stay idle indefinitely.
             // Request a new key only on the next delta, or if the drain failed.
@@ -226,18 +362,18 @@ struct Receiver {
                 continue;
             }
             if (!recovery.waiting_for_keyframe()) {
-                if (deadlines.size() >= 32) recovery.recover(Reason::decoder_backlog);
-                else if (!deadlines.empty() && now > deadlines.front()) recovery.recover(Reason::decode_deadline);
+                if (pending.size() >= 32) recovery.recover(Reason::decoder_backlog);
+                else if (!pending.empty() && now > pending.front().deadline) recovery.recover(Reason::decode_deadline);
             }
             const bool keyframe = packet.keyframe && has_recovery_picture(header.codec, packet.data);
             const auto action = recovery.inspect(packet.sequence, packet.timestamp_us, keyframe, arrival.count());
             if (action != FrameRecovery::Action::drop) {
                 if (action == FrameRecovery::Action::restart) {
-                    deadlines.clear();
+                    pending.clear();
                     if (used_decoder) decoder.reset();
                 }
                 used_decoder = true;
-                deadlines.push_back(now + std::chrono::microseconds(recovery.remaining_us()));
+                pending.push_back({packet.sequence, now + std::chrono::microseconds(recovery.remaining_us())});
                 try {
                     DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
                     if (!decoder.decode(packet.data, display)) recovery.recover();
@@ -248,16 +384,16 @@ struct Receiver {
                               << " frame " << packet.sequence << ": " << e.what() << '\n';
                     recovery.recover();
                 }
-                if (!deadlines.empty()) {
+                if (!pending.empty()) {
                     const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
-                        deadlines.front() - now).count();
+                        pending.front().deadline - now).count();
                     const auto delay = recovery.idle_drain_us(header.fps, std::max<std::int64_t>(0, remaining));
                     drain_at = now + std::chrono::microseconds(delay);
                 }
             }
             acknowledge();
         }
-        if (!stopping && !deadlines.empty() && !recovery.waiting_for_keyframe()) {
+        if (!stopping && !pending.empty() && !recovery.waiting_for_keyframe()) {
             DecodeTimer timer(stats_enabled ? &stats.decode_us : nullptr);
             decoder.finish(display);
         }
@@ -265,24 +401,25 @@ struct Receiver {
 
     template<class ReadHeader, class ReadFrame, class SendFeedback>
     void receive_stream(ReadHeader read_header, ReadFrame read_frame, SendFeedback feedback) {
+        {
+            std::lock_guard lock(mutex);
+            ++session_id;
+            paint_stats = {};
+        }
         show_status(L"Mac connected. Waiting for video");
         const wchar_t* next_status = L"Stream ended. Waiting for the Mac to reconnect";
         try {
             const auto header = read_header();
             Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
             StreamStats stats;
-            if (stats_enabled) {
-                stats.last_report = Clock::now();
-                std::lock_guard lock(mutex);
-                ++session_id;
-                paint_stats = {};
-            }
+            if (stats_enabled) stats.last_report = Clock::now();
             receive_live(header, decoder, stats, read_frame, feedback);
             if (stats_enabled) report_if_due(stats, decoder, header.codec);
         } catch (const std::exception& e) {
             if (!stopping) std::cerr << "Stream error: " << e.what() << '\n';
             next_status = L"Stream error. See the console for details. Waiting for a connection";
         }
+        end_cursor();
         if (!stopping) show_status(next_status);
     }
 
@@ -307,7 +444,8 @@ struct Receiver {
             std::optional<secure::TcpChannel> channel;
             receive_stream([&] {
                 channel.emplace(*client, password, secure::Role::receiver);
-                return channel->receive_header([&] { return display_size(); });
+                return channel->receive_header([&] { return display_size(); },
+                    [&](std::uint16_t port) { return offer_cursor(*channel, port); });
             }, [&](auto& bytes, const auto& poll) { return channel->receive_frame(bytes, poll); },
                [&](const auto& ack) { channel->send_feedback(ack); });
             std::lock_guard lock(mutex);
@@ -329,7 +467,8 @@ struct Receiver {
         while (!stopping) {
             if (!listener.accept(100)) continue;
             receive_stream([&] {
-                return listener.receive_header([&] { return display_size(); }, [&] { return stopping.load(); });
+                return listener.receive_header([&] { return display_size(); }, [&] { return stopping.load(); },
+                    [&](std::uint16_t port) { return offer_cursor(listener, port); });
             }, read, [&](const auto& ack) { listener.send_feedback(ack); });
             listener.disconnect();
         }
@@ -381,10 +520,12 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
     std::shared_ptr<const VideoFrame> frame;
     const wchar_t* status;
     std::uint64_t session_id;
+    std::uint32_t sequence;
     {
         std::lock_guard lock(receiver.mutex);
         session_id = receiver.session_id;
         frame = receiver.frame;
+        sequence = receiver.frame_sequence;
         status = receiver.status;
     }
     if (!frame) {
@@ -414,38 +555,23 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         if (font) DeleteObject(font);
     } else if (width > 0 && height > 0) {
         const auto start = track_paint ? Clock::now() : Clock::time_point{};
-        const int src_width = static_cast<int>(frame->width);
-        const int src_height = static_cast<int>(frame->height);
-        const int dest_width = std::max(1, static_cast<int>(std::min<int64_t>(
-            width, static_cast<int64_t>(height) * src_width / src_height)));
-        const int dest_height = std::max(1, static_cast<int>(std::min<int64_t>(
-            height, static_cast<int64_t>(width) * src_height / src_width)));
-        const int x = (width - dest_width) / 2;
-        const int y = (height - dest_height) / 2;
-        // Erase just the letterbox bars so that repaints don't flash black between frames.
-        const RECT bars[] = {{0, 0, width, y}, {0, y + dest_height, width, height},
-                             {0, y, x, y + dest_height}, {x + dest_width, y, width, y + dest_height}};
+        const auto video = win_cursor::fit_video(area, *frame);
+        const RECT bars[] = {{0, 0, width, video.top}, {0, video.bottom, width, height},
+                             {0, video.top, video.left, video.bottom}, {video.right, video.top, width, video.bottom}};
         for (const RECT& bar : bars) {
             if (!IsRectEmpty(&bar)) FillRect(dc, &bar, black);
         }
-        BITMAPINFO bitmap{};
-        auto& header = bitmap.bmiHeader;
-        header.biSize = sizeof(BITMAPINFOHEADER);
-        header.biWidth = src_width;
-        header.biHeight = -src_height; // Decoder emits packed top-down BGRA.
-        header.biPlanes = 1;
-        header.biBitCount = 32;
-        header.biCompression = BI_RGB;
-        SetStretchBltMode(dc, COLORONCOLOR);
-        const int lines = StretchDIBits(dc, x, y, dest_width, dest_height, 0, 0, src_width, src_height,
-                                        frame->bgra.data(), &bitmap, DIB_RGB_COLORS, SRCCOPY);
-        if (track_paint && lines > 0) {
+        const auto& shown = receiver.visible_cursor;
+        const bool drew = receiver.overlay.paint(dc, video, *frame,
+            shown.session == session_id ? shown.view : cursor::View{}, sequence, session_id);
+        if (track_paint && drew) {
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
             std::lock_guard lock(receiver.mutex);
             if (session_id != receiver.session_id) return;
             if (receiver.last_painted.lock() != frame) ++receiver.paint_stats.presented;
             receiver.last_painted = frame;
             ++receiver.paint_stats.paints;
+            if (receiver.painting_cursor_update) ++receiver.paint_stats.cursor_repaints;
             receiver.paint_stats.paint_us += us;
         }
     }
@@ -461,6 +587,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     auto receiver = reinterpret_cast<Receiver*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (!receiver) return DefWindowProcW(window, message, wp, lp);
     switch (message) {
+    case cursor_changed:
+        receiver->apply_cursor();
+        return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
@@ -490,12 +619,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             }
             receiver->refresh_addresses();
             return 0;
-        }
-        break;
-    case WM_SETCURSOR:
-        if (receiver->fullscreen && LOWORD(lp) == HTCLIENT) {
-            SetCursor(nullptr);
-            return TRUE;
         }
         break;
     case WM_DPICHANGED:
@@ -549,6 +672,15 @@ int run_receiver(const ReceiverOptions& options) {
 
     Receiver receiver(options.password);
     receiver.binding = win_info::resolve_binding(options.bind, options.transport == Transport::udp);
+    try {
+        // ENet resolves names to IPv4, even when the same name has a preferred IPv6 address.
+        const auto& address = receiver.binding.address;
+        const auto bind = address.empty() ? (receiver.binding.family == AF_INET6 ? "::" : "0.0.0.0")
+                                          : std::string(address.begin(), address.end());
+        receiver.cursor_socket.emplace(net::bind_udp(bind));
+    } catch (const std::exception& e) {
+        std::cerr << "Cannot bind the cursor UDP port: " << e.what() << ". Using the video cursor.\n";
+    }
     receiver.port = options.port;
     receiver.transport = options.transport;
     receiver.require_hardware = options.require_hardware;

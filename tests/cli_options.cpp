@@ -41,7 +41,7 @@ int main() {
         expect(invoke({"send", "example"}) == 0 && sender.width == 0 && sender.height == 0 &&
                sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp &&
                sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware &&
-               !sender.stats && sender.password.empty(),
+               !sender.stats && !sender.video_cursor && sender.password.empty(),
                "Unexpected Mac defaults");
         expect(invoke({"send", "example", "--codec", "av1", "--transport", "udp", "--size", "640x360",
                        "--scale", "1.5"}) == 0 && sender.width == 640 && sender.height == 360 &&
@@ -54,6 +54,8 @@ int main() {
         expect(invoke({"send", "example", "--fps", "48", "--fixed-fps", "--scale", "0.75"}) == 0 &&
                sender.fps == 48 && !sender.adaptive_fps && sender.adaptive && sender.width == 0,
                "Fixed frame rate interfered with adaptive bitrate or monitor sizing");
+        expect(invoke({"send", "example", "--video-cursor"}) == 0 && sender.video_cursor,
+               "Could not select the video cursor");
         expect(invoke({"send", "example", "--password", u8"共享 密碼"}) == 0 &&
                sender.password == u8"共享 密碼", "Sender lost its UTF-8 password");
         expect(invoke({"send", "example", "--password=--help"}) == 0 && sender.password == "--help",

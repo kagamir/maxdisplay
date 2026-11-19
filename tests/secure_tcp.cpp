@@ -59,13 +59,20 @@ void encrypted_roundtrip() {
     const auto ack = wire::pack_feedback({1234, true});
     auto server = std::async(std::launch::async, [&] {
         TcpChannel channel(connection.receiver, password, Role::receiver);
-        auto received = channel.receive_header([] { return wire::DisplaySize{1920, 1080}; });
+        auto received = channel.receive_header([] { return wire::DisplaySize{1920, 1080}; }, [&](std::uint16_t port) {
+            require(channel.datagrams() && port == 47001, "Protected cursor query failed");
+            return wire::CursorOffer{47002, 0x1234567812345678ull};
+        });
         require(received.codec == header.codec && received.timeout_ms == header.timeout_ms, "Incorrect protected header");
         Bytes frame;
         require(channel.receive_frame(frame) && frame == image, "Incorrect large protected frame");
         channel.send_feedback(ack);
     });
     TcpChannel client(connection.sender, password, Role::sender);
+    require(client.peer_endpoint().port == connection.receiver.local_port(), "Incorrect TCP side channel peer");
+    const auto cursor = client.request_cursor(47001);
+    require(client.datagrams() && cursor.port == 47002 && cursor.token == 0x1234567812345678ull,
+            "Incorrect protected cursor reply");
     require(client.request_display_size().width == 1920, "Incorrect protected display reply");
     client.send_header(header);
     require(!client.send_frame_before(image, Clock::now() - 1ms), "Expired protected frame sent");

@@ -96,6 +96,10 @@ void display_negotiation(udp::Listener& listener, bool automatic, const std::str
         const auto header = listener.receive_header([&] {
             queried = true;
             return wire::DisplaySize{3840, 2160};
+        }, {}, [&](std::uint16_t sender_port) {
+            require(listener.peer_endpoint().port && sender_port == 47001, "Wrong ENet cursor peer or query");
+            require(static_cast<bool>(listener.datagrams()) == !password.empty(), "Wrong ENet cursor protection");
+            return wire::CursorOffer{47002, 0x1234567812345678ull};
         });
         std::vector<std::uint8_t> bytes;
         const auto deadline = Clock::now() + 5s;
@@ -108,6 +112,10 @@ void display_negotiation(udp::Listener& listener, bool automatic, const std::str
                 "Lost UDP stream header after display query");
     });
     udp::Sender sender("127.0.0.1", port, password);
+    require(sender.peer_endpoint().port == port, "ENet peer endpoint lost the port");
+    const auto cursor = sender.request_cursor(47001);
+    require(cursor.port == 47002 && cursor.token == 0x1234567812345678ull, "Incorrect ENet cursor offer");
+    require(static_cast<bool>(sender.datagrams()) == !password.empty(), "Wrong cursor sender protection");
     if (automatic) {
         const auto size = sender.request_display_size();
         require(size.width == 3840 && size.height == 2160, "Incorrect UDP monitor size");

@@ -109,7 +109,8 @@ secure::Bytes receive_handshake(ENetHost* host, std::size_t size, Clock::time_po
 struct Sender::Impl {
     Host host{nullptr, enet_host_destroy};
     ENetPeer* peer = nullptr;
-    std::unique_ptr<secure::Session> session; // Owned by the worker after handshake.
+    std::unique_ptr<secure::Session> session; // Video records are sealed/opened only by the worker.
+    net::Endpoint remote;
     std::mutex mutex;
     struct Message {
         std::vector<std::uint8_t> bytes;
@@ -118,9 +119,9 @@ struct Sender::Impl {
     };
     std::deque<Message> queue;
     std::optional<std::vector<std::uint8_t>> feedback;
-    std::condition_variable display_ready;
-    bool awaiting_display = false;
-    std::optional<wire::DisplaySize> display;
+    std::condition_variable reply_ready;
+    std::optional<secure::Kind> awaiting;
+    std::optional<secure::Bytes> reply;
     std::size_t outstanding_bytes = 0;
     std::size_t outstanding_messages = 0;
     bool key_in_flight = false;
@@ -142,6 +143,7 @@ struct Sender::Impl {
             throw std::runtime_error("UDP connection failed. Check receiver transport, address and firewall.");
         }
         configure_peer(peer);
+        remote = net::Endpoint::ipv4(peer->address.host, peer->address.port);
         if (!password.empty()) {
             try {
                 const auto deadline = Clock::now() + wire::header_timeout;
@@ -185,6 +187,26 @@ struct Sender::Impl {
         ++outstanding_messages;
         outstanding_bytes += wire_size;
         return true;
+    }
+
+    secure::Bytes exchange_query(secure::Kind query_kind, const secure::Bytes& query,
+                                 secure::Kind reply_kind, unsigned timeout_ms) {
+        {
+            std::lock_guard lock(mutex);
+            if (awaiting) throw std::logic_error("Another UDP query is in progress");
+            awaiting = reply_kind;
+        }
+        enqueue(query, Delivery::control, query_kind);
+        std::unique_lock lock(mutex);
+        if (!reply_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                  [&] { return reply || closed || stopping; }))
+            throw std::runtime_error("Waiting for UDP reply timed out");
+        if (error) std::rethrow_exception(error);
+        if (!reply) throw std::runtime_error("Receiver disconnected");
+        awaiting.reset();
+        auto bytes = std::move(*reply);
+        reply.reset();
+        return bytes;
     }
 
     static void release(ENetPacket* packet, bool keyframe) {
@@ -240,17 +262,19 @@ struct Sender::Impl {
                     break;
                 }
                 if (event.type == ENET_EVENT_TYPE_RECEIVE) {
-                    const auto overhead = session ? secure::record_overhead : 0;
-                    if (!packet || (packet->dataLength != wire::feedback_size + overhead &&
-                                    packet->dataLength != wire::display_reply_size + overhead))
-                        throw std::runtime_error("Invalid UDP receiver reply length");
-                    std::vector<std::uint8_t> bytes(packet->data, packet->data + packet->dataLength);
                     std::lock_guard lock(mutex);
-                    if (session) bytes = session->open(awaiting_display ? secure::Kind::display_reply : secure::Kind::feedback, bytes);
-                    if (awaiting_display) {
-                        display = wire::decode_display_reply(bytes);
-                        awaiting_display = false;
-                        display_ready.notify_one();
+                    const auto kind = awaiting.value_or(secure::Kind::feedback);
+                    auto expected_size = wire::feedback_size;
+                    if (kind == secure::Kind::cursor_reply) expected_size = wire::cursor_reply_size;
+                    if (kind == secure::Kind::display_reply) expected_size = wire::display_reply_size;
+                    if (!packet || packet->dataLength != expected_size + (session ? secure::record_overhead : 0))
+                        throw std::runtime_error("Invalid UDP receiver reply length");
+                    secure::Bytes bytes(packet->data, packet->data + packet->dataLength);
+                    if (session) bytes = session->open(kind, bytes);
+                    if (awaiting) {
+                        if (reply) throw std::runtime_error("Duplicate UDP query reply");
+                        reply = std::move(bytes);
+                        reply_ready.notify_one();
                     } else {
                         wire::unpack_feedback(bytes);
                         feedback = std::move(bytes);
@@ -266,7 +290,7 @@ struct Sender::Impl {
             std::lock_guard lock(mutex);
             closed = true;
         }
-        display_ready.notify_one();
+        reply_ready.notify_one();
         enet_peer_disconnect_now(peer, 0);
         host.reset(); // release packet callbacks while their counters and mutex exist
     }
@@ -275,22 +299,18 @@ struct Sender::Impl {
 Sender::Sender(const std::string& host, std::uint16_t port, const std::string& password)
     : impl_(std::make_unique<Impl>(host, port, password)) {}
 Sender::~Sender() = default;
+net::Endpoint Sender::peer_endpoint() const { return impl_->remote; }
+std::unique_ptr<secure::Datagrams> Sender::datagrams() { return impl_->session ? impl_->session->datagrams() : nullptr; }
+
+wire::CursorOffer Sender::request_cursor(std::uint16_t port) {
+    return wire::decode_cursor_reply(impl_->exchange_query(secure::Kind::cursor_query, wire::encode_cursor_query(port),
+                                                           secure::Kind::cursor_reply, wire::display_query_timeout_ms));
+}
+
 wire::DisplaySize Sender::request_display_size(unsigned timeout_ms) {
     try {
-        {
-            std::lock_guard lock(impl_->mutex);
-            if (impl_->awaiting_display || impl_->display)
-                throw std::logic_error("Display resolution was already requested");
-            impl_->awaiting_display = true;
-        }
-        impl_->enqueue(wire::display_query, Delivery::control, secure::Kind::display_query);
-        std::unique_lock lock(impl_->mutex);
-        if (!impl_->display_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                [&] { return impl_->display || impl_->closed || impl_->stopping; }))
-            throw std::runtime_error("Waiting for UDP reply timed out");
-        if (impl_->error) std::rethrow_exception(impl_->error);
-        if (!impl_->display) throw std::runtime_error("Receiver disconnected");
-        return *impl_->display;
+        return wire::decode_display_reply(impl_->exchange_query(secure::Kind::display_query, wire::display_query,
+                                                                secure::Kind::display_reply, timeout_ms));
     } catch (const std::runtime_error& e) {
         throw std::runtime_error(std::string(wire::display_query_error) + e.what());
     }
@@ -367,6 +387,16 @@ Listener::Listener(const std::string& bind_address, std::uint16_t port, const st
 Listener::~Listener() { disconnect(); }
 std::uint16_t Listener::local_port() const { return impl_->host->address.port; }
 
+net::Endpoint Listener::peer_endpoint() const {
+    if (!impl_->peer) throw std::logic_error("No active UDP session");
+    return net::Endpoint::ipv4(impl_->peer->address.host, impl_->peer->address.port);
+}
+
+std::unique_ptr<secure::Datagrams> Listener::datagrams() {
+    if (!impl_->password.empty() && !impl_->session) throw std::logic_error("UDP session is not authenticated");
+    return impl_->session ? impl_->session->datagrams() : nullptr;
+}
+
 bool Listener::accept(unsigned timeout_ms) {
     if (impl_->peer) throw std::logic_error("UDP session already active");
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -394,30 +424,39 @@ ReadResult Listener::receive(std::vector<std::uint8_t>& message, unsigned timeou
 }
 
 wire::Header Listener::receive_header(const std::function<wire::DisplaySize()>& display_size,
-                                      const std::function<bool()>& stopping) {
+                                      const std::function<bool()>& stopping, const wire::CursorResponder& cursor) {
     const auto deadline = Clock::now() + wire::header_timeout;
     if (!impl_->peer) throw std::logic_error("No active UDP session");
     if (!impl_->password.empty()) impl_->authenticate(deadline, stopping);
     std::vector<std::uint8_t> bytes;
-    bool answered = false;
+    bool cursor_answered = false, display_answered = false;
     while ((!stopping || !stopping()) && Clock::now() < deadline) {
         const auto limit = wire::header_size + (impl_->session ? secure::record_overhead : 0);
         const auto result = impl_->read_packet(bytes, std::min(100u, remaining(deadline)), limit);
         if (result == ReadResult::timeout) continue;
         if (result == ReadResult::disconnected)
             throw std::runtime_error("UDP peer disconnected before sending its stream header");
+        secure::Kind kind = secure::Kind::header;
         if (impl_->session) {
-            // The kind is authenticated by open() before using the plaintext.
-            const auto kind = static_cast<secure::Kind>(bytes.front());
-            if (kind == secure::Kind::header) return wire::decode_header(impl_->session->open(kind, bytes));
-            bytes = impl_->session->open(secure::Kind::display_query, bytes);
-            if (bytes != wire::display_query) throw std::runtime_error("Invalid encrypted display query");
+            kind = static_cast<secure::Kind>(bytes.front());
+            bytes = impl_->session->open(kind, bytes);
+        } else if (bytes.size() == wire::cursor_query_size) {
+            kind = secure::Kind::cursor_query;
+        } else if (bytes == wire::display_query) {
+            kind = secure::Kind::display_query;
         }
-        if (!answered && bytes == wire::display_query && display_size) {
+        if (kind == secure::Kind::cursor_query && !cursor_answered && !display_answered) {
+            const auto port = wire::decode_cursor_query(bytes);
+            impl_->reply(secure::Kind::cursor_reply, wire::encode_cursor_reply(cursor ? cursor(port) : wire::CursorOffer{}),
+                         ENET_PACKET_FLAG_RELIABLE);
+            cursor_answered = true;
+        } else if (kind == secure::Kind::display_query && bytes == wire::display_query && display_size && !display_answered) {
             impl_->reply(secure::Kind::display_reply, wire::encode_display_reply(display_size()), ENET_PACKET_FLAG_RELIABLE);
-            answered = true;
-        } else {
+            display_answered = true;
+        } else if (kind == secure::Kind::header) {
             return wire::decode_header(bytes);
+        } else {
+            throw std::runtime_error("Unexpected UDP setup message");
         }
     }
     throw std::runtime_error("Waiting for UDP stream header timed out or was stopped");

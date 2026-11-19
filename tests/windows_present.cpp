@@ -1,6 +1,7 @@
 // Feed the Mac codec fixture through the real TCP or UDP receiver and sample the window's
 // client rendering. WM_PRINTCLIENT works even when another window obscures the viewer.
 #include "app.hpp"
+#include "cursor_link.hpp"
 #include "net.hpp"
 #include "secure_tcp.hpp"
 #include "udp.hpp"
@@ -17,6 +18,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -132,6 +134,16 @@ public:
             socket_ = net::connect_tcp(options.bind, options.port);
             tcp_.emplace(socket_, options.password, secure::Role::sender);
         }
+        if (query_window && codec == Codec::h264) {
+            cursor_socket_ = net::bind_udp(options.bind);
+            const auto local_port = cursor_socket_.local_port();
+            const auto offer = udp_ ? udp_->request_cursor(local_port) : tcp_->request_cursor(local_port);
+            if (!offer.port || !offer.token) throw std::runtime_error("Receiver did not offer a cursor port");
+            cursor_peer_ = udp_ ? udp_->peer_endpoint() : tcp_->peer_endpoint();
+            cursor_peer_.port = offer.port;
+            cursor_keys_ = udp_ ? udp_->datagrams() : tcp_->datagrams();
+            cursor_.emplace(offer.token);
+        }
         if (query_window) {
             const auto size = udp_ ? udp_->request_display_size() : tcp_->request_display_size();
             MONITORINFO info{};
@@ -171,7 +183,63 @@ public:
         if (ack.sequence != sequence || ack.request_keyframe != expect_request)
             throw std::runtime_error("Unexpected recovery feedback for sequence " + std::to_string(sequence));
     }
+    void check_overlay(HWND window, const Frames& frames) {
+        auto shape = std::make_shared<cursor::Bitmap>();
+        shape->width = shape->height = 16;
+        shape->hot_x = shape->hot_y = 8;
+        for (int i = 0; i < 16 * 16; ++i)
+            shape->pixels.insert(shape->pixels.end(), {128, 0, 128, 128}); // Half-transparent magenta.
+        const auto base = read_colors(window);
+        auto blend = [](COLORREF background) {
+            return RGB(128 + GetRValue(background) / 2, GetGValue(background) / 2, 128 + GetBValue(background) / 2);
+        };
+        auto check_position = [&](bool visible, int y, std::array<COLORREF, 2> expected,
+                                  std::optional<std::uint32_t> video_floor = {}) {
+            const auto previous = cursor_->last_ack();
+            if (!wait_until([&] {
+                const auto now = now_us() / 1000;
+                cursor_->update(now, {visible, 8 * 240, 8 * y, video_floor}, shape, [&](const cursor::Bytes& packet) {
+                    cursor_socket_.send_to(cursor_peer_, cursor_keys_ ? cursor_keys_->seal(packet) : packet);
+                });
+                net::Endpoint from;
+                cursor::Bytes datagram;
+                while (cursor_socket_.receive_from(from, datagram)) {
+                    if (!(from == cursor_peer_) || datagram.empty()) continue;
+                    if (cursor_keys_) {
+                        auto clear = cursor_keys_->open(datagram);
+                        if (clear) cursor_->acknowledge(now, *clear);
+                    } else {
+                        cursor_->acknowledge(now, datagram);
+                    }
+                }
+                auto colors = read_colors(window);
+                return cursor_->last_ack() != previous && near_color(colors[0], expected[0], 4) &&
+                       near_color(colors[1], expected[1], 4);
+            }, 4s)) throw std::runtime_error("Cursor pixels or side-channel feedback did not match");
+        };
+        check_position(true, 45, {blend(base[0]), base[1]});
+        check_position(true, 135, {base[0], blend(base[1])});
+        check_position(false, 135, base);
+        check_position(true, 45, {blend(base[0]), base[1]});
+        // Stop sending cursor datagrams while the last video frame stays on screen.
+        if (!wait_until([&] { return near_color(read_colors(window)[0], base[0], 4); }, 4s))
+            throw std::runtime_error("Stale pointer remained on the last picture");
+        // Video sequence 8 is still displayed. On a mode handoff the overlay must
+        // wait until a cursor-free frame has actually reached the window.
+        check_position(true, 45, base, 10);
+        send(frames, 5, 9);
+        if (!near_color(read_colors(window)[0], base[0], 4))
+            throw std::runtime_error("Overlay covered a video frame from before the cursor handoff");
+        send(frames, 5, 10); // A standalone key also works if the decoder drained during readback.
+        if (!wait_until([&] { return near_color(read_colors(window)[0], blend(base[0]), 4); }, 1500ms))
+            throw std::runtime_error("Presented cursor-free frame did not release the overlay");
+        std::cout << "Verified cursor alpha, absolute movement, hide, UDP ACK, idle expiry and handoff\n";
+    }
 private:
+    net::Socket cursor_socket_;
+    net::Endpoint cursor_peer_{};
+    std::unique_ptr<secure::Datagrams> cursor_keys_;
+    std::optional<cursor::Sender> cursor_;
     net::Socket socket_;
     std::optional<secure::TcpChannel> tcp_;
     std::optional<udp::Sender> udp_;
@@ -230,6 +298,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
                 client->send(frames, i, late ? i - 2 : i + 1);
             if (!wait_until([&] { return sees_pattern(window, true); }, 8s))
                 throw std::runtime_error("The live window never painted the recovered gray level");
+            if (codec == Codec::h264 && !late) client->check_overlay(window, frames);
             client.reset();
             if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
                 throw std::runtime_error("Disconnected window did not clear its last frame");

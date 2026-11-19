@@ -11,6 +11,7 @@ namespace {
 using Word = std::array<std::uint8_t, 4>;
 constexpr Word magic{'M', 'X', 'D', 'S'};
 constexpr Word feedback_magic{'M', 'X', 'F', 'B'};
+constexpr Word cursor_reply_magic{'M', 'X', 'C', 'R'};
 constexpr Word display_magic{'M', 'X', 'D', 'R'};
 constexpr std::uint32_t stream_version = 3;
 constexpr std::size_t prefix_size = 8;
@@ -59,9 +60,73 @@ void validate_display(DisplaySize size) {
         throw std::runtime_error("Invalid receiver display dimensions");
 }
 
+void validate_offer(CursorOffer offer) {
+    if ((offer.port == 0) != (offer.token == 0))
+        throw std::runtime_error("Invalid cursor port or session token");
+}
+
+std::vector<std::uint8_t> exchange_query(net::Socket& socket, const std::vector<std::uint8_t>& query,
+                                         std::size_t reply_size, unsigned timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    std::size_t sent = 0;
+    while (sent < query.size()) {
+        const auto n = socket.write_some_until(query.data() + sent, query.size() - sent, deadline);
+        if (!n) throw std::runtime_error("Sending query timed out");
+        sent += n;
+    }
+    std::vector<std::uint8_t> reply(reply_size);
+    if (!socket.read_exact(reply.data(), reply.size(), [&] { return wait_remaining(deadline); }))
+        throw std::runtime_error("Receiver disconnected");
+    return reply;
+}
+
 } // namespace
 
 const std::vector<std::uint8_t> display_query{'M','X','D','Q', 0,0,0,2};
+
+const std::vector<std::uint8_t> cursor_query_prefix{'M','X','C','Q', 0,0,0,1};
+
+std::vector<std::uint8_t> encode_cursor_query(std::uint16_t port) {
+    if (!port) throw std::invalid_argument("Cursor query requires a UDP port");
+    auto bytes = cursor_query_prefix;
+    append_word(bytes, port);
+    return bytes;
+}
+
+std::uint16_t decode_cursor_query(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() != cursor_query_size || !std::equal(cursor_query_prefix.begin(), cursor_query_prefix.end(), bytes.begin()))
+        throw std::runtime_error("Invalid cursor query");
+    const auto port = from_bytes(bytes.data() + 8);
+    if (!port || port > UINT16_MAX) throw std::runtime_error("Invalid cursor query port");
+    return static_cast<std::uint16_t>(port);
+}
+
+std::vector<std::uint8_t> encode_cursor_reply(CursorOffer offer) {
+    validate_offer(offer);
+    std::vector<std::uint8_t> bytes(cursor_reply_magic.begin(), cursor_reply_magic.end());
+    append_word(bytes, 1);
+    append_word(bytes, offer.port);
+    append_word(bytes, 0); // Reserved.
+    append_word(bytes, static_cast<std::uint32_t>(offer.token >> 32));
+    append_word(bytes, static_cast<std::uint32_t>(offer.token));
+    return bytes;
+}
+
+CursorOffer decode_cursor_reply(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() != cursor_reply_size || !std::equal(cursor_reply_magic.begin(), cursor_reply_magic.end(), bytes.begin()) ||
+        from_bytes(bytes.data() + 4) != 1 || from_bytes(bytes.data() + 12) != 0)
+        throw std::runtime_error("Invalid cursor reply");
+    const auto port = from_bytes(bytes.data() + 8);
+    if (port > UINT16_MAX) throw std::runtime_error("Invalid cursor reply port");
+    CursorOffer offer{static_cast<std::uint16_t>(port),
+                      (std::uint64_t{from_bytes(bytes.data() + 16)} << 32) | from_bytes(bytes.data() + 20)};
+    validate_offer(offer);
+    return offer;
+}
+
+CursorOffer request_cursor(net::Socket& socket, std::uint16_t port) {
+    return decode_cursor_reply(exchange_query(socket, encode_cursor_query(port), cursor_reply_size, display_query_timeout_ms));
+}
 
 std::vector<std::uint8_t> encode_display_reply(DisplaySize size) {
     validate_display(size);
@@ -81,18 +146,8 @@ DisplaySize decode_display_reply(const std::vector<std::uint8_t>& bytes) {
 }
 
 DisplaySize request_display_size(net::Socket& socket, unsigned timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     try {
-        std::size_t sent = 0;
-        while (sent < display_query.size()) {
-            const auto n = socket.write_some_until(display_query.data() + sent, display_query.size() - sent, deadline);
-            if (!n) throw std::runtime_error("Sending query timed out");
-            sent += n;
-        }
-        std::vector<std::uint8_t> bytes(display_reply_size);
-        if (!socket.read_exact(bytes.data(), bytes.size(), [&] { return wait_remaining(deadline); }))
-            throw std::runtime_error("Receiver disconnected");
-        return decode_display_reply(bytes);
+        return decode_display_reply(exchange_query(socket, display_query, display_reply_size, timeout_ms));
     } catch (const std::runtime_error& e) {
         throw std::runtime_error(std::string(display_query_error) + e.what());
     }
@@ -135,17 +190,30 @@ void send_header(net::Socket& socket, Header header) {
     socket.write_all(bytes.data(), bytes.size());
 }
 
-Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size) {
+Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size,
+                      const CursorResponder& cursor) {
     const auto deadline = std::chrono::steady_clock::now() + header_timeout;
     auto poll = [&] { return wait_remaining(deadline); };
-    std::vector<std::uint8_t> bytes(prefix_size);
-    if (!socket.read_exact(bytes.data(), bytes.size(), poll))
-        throw std::runtime_error("Peer disconnected before sending the stream header");
+    std::vector<std::uint8_t> bytes;
+    auto read_prefix = [&] {
+        bytes.resize(prefix_size);
+        if (!socket.read_exact(bytes.data(), bytes.size(), poll))
+            throw std::runtime_error("Peer disconnected before sending the stream header");
+    };
+    read_prefix();
+    if (bytes == cursor_query_prefix) {
+        bytes.resize(cursor_query_size);
+        if (!socket.read_exact(bytes.data() + prefix_size, cursor_query_size - prefix_size, poll))
+            throw std::runtime_error("Incomplete cursor query");
+        const auto port = decode_cursor_query(bytes);
+        const auto reply = encode_cursor_reply(cursor ? cursor(port) : CursorOffer{});
+        socket.write_all(reply.data(), reply.size());
+        read_prefix();
+    }
     if (bytes == display_query && display_size) {
         const auto reply = encode_display_reply(display_size());
         socket.write_all(reply.data(), reply.size());
-        if (!socket.read_exact(bytes.data(), bytes.size(), poll))
-            throw std::runtime_error("Peer disconnected after requesting the display resolution");
+        read_prefix();
     }
     check_header_prefix(bytes.data());
     bytes.resize(header_size);

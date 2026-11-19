@@ -27,6 +27,45 @@ Bytes hex(const std::string& text) {
     return result;
 }
 
+void test_datagrams(Session& sender, Session& receiver) {
+    auto tx = sender.datagrams();
+    auto rx = receiver.datagrams();
+    rejects([&] { sender.datagrams(); }, "Reissued a cursor key with a fresh nonce counter");
+    const auto packet = hex("01020304050607080100ff00aa");
+    const auto first = tx->seal(packet);
+    require(first == hex("01020304050607080000000000000001ebf032aacec28197155effb086fe4a1cded9a613d3"),
+            "Incorrect sender cursor key, nonce or token binding");
+    const auto ack = rx->seal(packet);
+    require(ack == hex("0102030405060708000000000000000100e37b9570583e538f75b3d29db3155cecd87f0c51"),
+            "Incorrect receiver cursor key");
+    require(!tx->open(first) && tx->open(ack) == packet, "Cursor direction keys are not independent");
+    for (std::size_t offset : {0u, 8u, 15u, 16u, 21u}) {
+        auto damaged = first;
+        damaged[offset] ^= 0xff;
+        require(!rx->open(damaged), "Accepted changed token, counter, ciphertext or tag");
+    }
+    require(rx->open(first) == packet && !rx->open(first), "Cursor authentication or replay rejection failed");
+    const auto stale = tx->seal(packet); // 2, exactly 64 positions behind the highest authenticated counter below.
+    const auto oldest = tx->seal(packet);
+    for (int i = 4; i < 66; ++i) tx->seal(packet);
+    require(rx->open(tx->seal(packet)) == packet, "New cursor packet lost after a gap");
+    require(!rx->open(stale) && rx->open(oldest) == packet && !rx->open(oldest), "Incorrect cursor replay window");
+
+    for (int i = 67; i < 4096; ++i) tx->seal(packet);
+    const auto last_epoch = tx->seal(packet);
+    const auto next_epoch = tx->seal(packet);
+    require(next_epoch == hex("01020304050607080000000000001001fdddb258915e8712667512889c565e62220026511c"),
+            "Incorrect rotated cursor key");
+    require(rx->open(next_epoch) == packet && rx->open(last_epoch) == packet && !rx->open(next_epoch),
+            "Cursor reordering across key rotation failed");
+    Bytes largest(net::max_datagram_size - datagram_overhead, 0xaa);
+    require(rx->open(tx->seal(largest)) == largest, "Maximum cursor datagram rejected");
+    largest.push_back(0);
+    rejects([&] { tx->seal(largest); }, "Encrypted oversized cursor packet");
+    rejects([&] { tx->seal(Bytes(8)); }, "Encrypted cursor packet without a body");
+    require(!rx->open(Bytes(net::max_datagram_size + 1)) && !rx->open({}), "Accepted invalid cursor length");
+}
+
 void test_session() {
     const std::string password = "MaxDisplay test password";
     auto client = make_hello(Role::sender);
@@ -46,6 +85,7 @@ void test_session() {
     std::iota(server.begin() + 8, server.end(), 32);
     rejects([&] { Session session("", client, server, Role::sender); }, "Accepted empty encryption password");
     Session tx(password, client, server, Role::sender), rx(password, client, server, Role::receiver);
+    test_datagrams(tx, rx);
     const auto server_proof = rx.seal(Kind::confirm, {});
     const auto client_proof = tx.seal(Kind::confirm, {});
     require(server_proof == hex("01000000000000000147bfba64960fb489209dda88bfebd752"), "Incorrect receiver proof");

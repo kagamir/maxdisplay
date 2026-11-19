@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <utility>
 #include <limits>
 #include <stdexcept>
 
@@ -58,12 +60,12 @@ struct Direction {
     Direction() { mbedtls_gcm_init(&gcm); }
     ~Direction() { mbedtls_gcm_free(&gcm); }
 
-    void select_key(const Secret& master, Role source, std::uint64_t next_sequence) {
+    void select_key(const Secret& master, Role source, std::uint64_t next_sequence, std::uint8_t channel) {
         const auto next_epoch = (next_sequence - 1) / records_per_key;
         if (epoch == next_epoch) return;
         // HKDF-Expand with one SHA-256 block. The public label binds each
-        // AES-128 subkey to its sending endpoint and key epoch.
-        std::array<std::uint8_t, 17> info{'M', 'X', 'D', 'K', 1, static_cast<std::uint8_t>(source)};
+        // AES-128 subkey to its sending endpoint, channel and key epoch.
+        std::array<std::uint8_t, 17> info{'M', 'X', 'D', 'K', 1, static_cast<std::uint8_t>(source), channel};
         store_u64(info.data() + 8, next_epoch);
         info.back() = 1;
         Secret expanded;
@@ -81,17 +83,31 @@ void validate_payload(Kind kind, std::size_t size) {
         throw std::runtime_error("Invalid encrypted record length");
 }
 
+void random_bytes(std::uint8_t* bytes, std::size_t size) {
+    mbedtls_entropy_context entropy;
+    mbedtls_entropy_init(&entropy);
+    const auto status = mbedtls_entropy_func(&entropy, bytes, size);
+    mbedtls_entropy_free(&entropy);
+    if (status != 0) throw std::runtime_error("Could not generate secure random bytes");
+}
+
 } // namespace
+
+std::uint64_t random_token() {
+    std::array<std::uint8_t, 8> bytes;
+    std::uint64_t token;
+    do {
+        random_bytes(bytes.data(), bytes.size());
+        token = load_u64(bytes.data());
+    } while (!token);
+    return token;
+}
 
 Bytes make_hello(Role role) {
     Bytes hello(hello_size);
     const auto prefix = hello_prefix(role);
     std::copy(prefix.begin(), prefix.end(), hello.begin());
-    mbedtls_entropy_context entropy;
-    mbedtls_entropy_init(&entropy);
-    const auto status = mbedtls_entropy_func(&entropy, hello.data() + prefix.size(), hello.size() - prefix.size());
-    mbedtls_entropy_free(&entropy);
-    if (status != 0) throw std::runtime_error("Could not generate a secure handshake challenge");
+    random_bytes(hello.data() + prefix.size(), hello.size() - prefix.size());
     return hello;
 }
 
@@ -106,6 +122,7 @@ struct Session::Impl {
     Role local;
     Secret master;
     Direction tx, rx;
+    std::atomic<bool> cursor_issued{false};
 };
 
 Session::Session(const std::string& password, const Bytes& sender_hello, const Bytes& receiver_hello, Role local)
@@ -136,7 +153,7 @@ Bytes Session::seal(Kind kind, const Bytes& plaintext) {
     record[0] = static_cast<std::uint8_t>(kind);
     store_u64(record.data() + 1, sequence);
     const auto iv = record_iv(sequence);
-    tx.select_key(impl_->master, impl_->local, sequence);
+    tx.select_key(impl_->master, impl_->local, sequence, 0);
     if (mbedtls_gcm_crypt_and_tag(&tx.gcm, MBEDTLS_GCM_ENCRYPT, plaintext.size(), iv.data(), iv.size(),
                                   record.data(), header_size, plaintext.data(), record.data() + header_size,
                                   tag_size, record.data() + header_size + plaintext.size()) != 0)
@@ -152,7 +169,7 @@ Bytes Session::open(Kind expected, const Bytes& record) {
     auto& rx = impl_->rx;
     const auto sequence = load_u64(record.data() + 1);
     if (sequence <= rx.sequence) throw std::runtime_error("Repeated or out-of-order encrypted record");
-    rx.select_key(impl_->master, opposite(impl_->local), sequence);
+    rx.select_key(impl_->master, opposite(impl_->local), sequence, 0);
     Bytes plaintext(length);
     const auto iv = record_iv(sequence);
     if (mbedtls_gcm_auth_decrypt(&rx.gcm, length, iv.data(), iv.size(), record.data(), header_size,
@@ -161,6 +178,81 @@ Bytes Session::open(Kind expected, const Bytes& record) {
         throw std::runtime_error("Encrypted record authentication failed; check password and connection");
     rx.sequence = sequence;
     return plaintext;
+}
+
+struct Datagrams::Impl {
+    Impl(const Secret& key, Role source) : master(key), local(source) {}
+    Secret master;
+    Role local;
+    Direction tx, rx;
+    // Bit n records receipt of (rx.sequence - n). Only authenticated packets
+    // advance this window, including when a key epoch changes.
+    std::uint64_t received = 0;
+};
+
+std::unique_ptr<Datagrams> Session::datagrams() {
+    if (impl_->cursor_issued.exchange(true))
+        throw std::logic_error("Cursor encryption channel already issued for this session");
+    return std::unique_ptr<Datagrams>(new Datagrams(std::make_unique<Datagrams::Impl>(impl_->master, impl_->local)));
+}
+
+Datagrams::Datagrams(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Datagrams::~Datagrams() = default;
+
+namespace {
+constexpr std::size_t token_size = 8, datagram_prefix_size = 16;
+static_assert(datagram_overhead == datagram_prefix_size - token_size + tag_size);
+constexpr std::uint8_t cursor_channel = 1;
+}
+
+Bytes Datagrams::seal(const Bytes& packet) {
+    if (packet.size() <= token_size || packet.size() > net::max_datagram_size - datagram_overhead)
+        throw std::invalid_argument("Invalid cursor datagram length");
+    auto& tx = impl_->tx;
+    if (tx.sequence == std::numeric_limits<std::uint64_t>::max())
+        throw std::runtime_error("Cursor datagram counter exhausted; reconnect");
+    const auto sequence = ++tx.sequence;
+    Bytes record(packet.size() + datagram_overhead);
+    std::copy_n(packet.begin(), token_size, record.begin());
+    store_u64(record.data() + token_size, sequence);
+    tx.select_key(impl_->master, impl_->local, sequence, cursor_channel);
+    const auto iv = record_iv(sequence);
+    const auto length = packet.size() - token_size;
+    if (mbedtls_gcm_crypt_and_tag(&tx.gcm, MBEDTLS_GCM_ENCRYPT, length, iv.data(), iv.size(),
+                                  record.data(), datagram_prefix_size, packet.data() + token_size,
+                                  record.data() + datagram_prefix_size, tag_size,
+                                  record.data() + datagram_prefix_size + length) != 0)
+        throw std::runtime_error("Could not encrypt cursor datagram");
+    return record;
+}
+
+std::optional<Bytes> Datagrams::open(const Bytes& record) {
+    if (record.size() <= datagram_prefix_size + tag_size || record.size() > net::max_datagram_size)
+        return std::nullopt;
+    const auto sequence = load_u64(record.data() + token_size);
+    auto& rx = impl_->rx;
+    if (!sequence) return std::nullopt;
+    if (sequence <= rx.sequence) {
+        const auto age = rx.sequence - sequence;
+        if (age >= 64 || ((impl_->received >> age) & 1)) return std::nullopt;
+    }
+    rx.select_key(impl_->master, opposite(impl_->local), sequence, cursor_channel);
+    const auto iv = record_iv(sequence);
+    const auto length = record.size() - datagram_prefix_size - tag_size;
+    Bytes packet(token_size + length);
+    if (mbedtls_gcm_auth_decrypt(&rx.gcm, length, iv.data(), iv.size(), record.data(), datagram_prefix_size,
+                                 record.data() + datagram_prefix_size + length, tag_size,
+                                 record.data() + datagram_prefix_size, packet.data() + token_size) != 0)
+        return std::nullopt;
+    std::copy_n(record.begin(), token_size, packet.begin());
+    if (sequence > rx.sequence) {
+        const auto advance = sequence - rx.sequence;
+        impl_->received = advance >= 64 ? 1 : (impl_->received << advance) | 1;
+        rx.sequence = sequence;
+    } else {
+        impl_->received |= std::uint64_t{1} << (rx.sequence - sequence);
+    }
+    return packet;
 }
 
 } // namespace secure

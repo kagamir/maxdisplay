@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <system_error>
@@ -126,12 +127,12 @@ void configure_stream(NativeSocket handle) {
 
 using Addresses = std::unique_ptr<addrinfo, decltype(&freeaddrinfo)>;
 
-Addresses resolve(const std::string& host, std::uint16_t port, bool passive) {
+Addresses resolve(const std::string& host, std::uint16_t port, bool passive, int type = SOCK_STREAM) {
     start_network();
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_socktype = type;
+    hints.ai_protocol = type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP;
     hints.ai_flags = passive ? AI_PASSIVE : 0;
     addrinfo* raw = nullptr;
     const int error = getaddrinfo(passive && host.empty() ? nullptr : host.c_str(),
@@ -154,6 +155,21 @@ Socket open_socket(const addrinfo& address) {
     return socket;
 }
 
+Endpoint from_address(const sockaddr_storage& storage) {
+    if (storage.ss_family == AF_INET) {
+        const auto& addr = reinterpret_cast<const sockaddr_in&>(storage);
+        return Endpoint::ipv4(addr.sin_addr.s_addr, ntohs(addr.sin_port));
+    }
+    if (storage.ss_family != AF_INET6) throw std::runtime_error("Unsupported socket address family");
+    const auto& addr = reinterpret_cast<const sockaddr_in6&>(storage);
+    Endpoint endpoint;
+    endpoint.v6 = true;
+    endpoint.scope = addr.sin6_scope_id;
+    endpoint.port = ntohs(addr.sin6_port);
+    std::memcpy(endpoint.address.data(), &addr.sin6_addr, 16);
+    return endpoint;
+}
+
 void complete_connect(NativeSocket handle) {
     const int error = last_error();
     if (!connecting(error)) throw socket_error("connect", error);
@@ -167,6 +183,13 @@ void complete_connect(NativeSocket handle) {
 }
 
 } // namespace
+
+Endpoint Endpoint::ipv4(std::uint32_t network_order_host, std::uint16_t port) {
+    Endpoint endpoint;
+    std::memcpy(endpoint.address.data(), &network_order_host, 4);
+    endpoint.port = port;
+    return endpoint;
+}
 
 Socket::~Socket() {
     if (handle_ != invalid) close_socket(handle_);
@@ -208,9 +231,61 @@ std::uint16_t Socket::local_port() const {
     Length size = sizeof(address);
     if (getsockname(handle_, reinterpret_cast<sockaddr*>(&address), &size) != 0)
         throw socket_error("getsockname");
-    if (address.ss_family == AF_INET6)
-        return ntohs(reinterpret_cast<const sockaddr_in6*>(&address)->sin6_port);
-    return ntohs(reinterpret_cast<const sockaddr_in*>(&address)->sin_port);
+    return from_address(address).port;
+}
+
+Endpoint Socket::peer_endpoint() const {
+    sockaddr_storage address{};
+    Length size = sizeof(address);
+    if (getpeername(handle_, reinterpret_cast<sockaddr*>(&address), &size) != 0)
+        throw socket_error("getpeername");
+    return from_address(address);
+}
+
+bool Socket::send_to(const Endpoint& peer, const std::vector<std::uint8_t>& bytes) const {
+    if (bytes.size() > max_datagram_size || !peer.port) return false;
+    sockaddr_storage storage{};
+    Length length;
+    if (peer.v6) {
+        auto& addr = reinterpret_cast<sockaddr_in6&>(storage);
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons(peer.port);
+        addr.sin6_scope_id = peer.scope;
+        std::memcpy(&addr.sin6_addr, peer.address.data(), 16);
+        length = sizeof(addr);
+    } else {
+        auto& addr = reinterpret_cast<sockaddr_in&>(storage);
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(peer.port);
+        std::memcpy(&addr.sin_addr, peer.address.data(), 4);
+        length = sizeof(addr);
+    }
+    const char* payload = bytes.empty() ? "" : reinterpret_cast<const char*>(bytes.data());
+    for (;;) {
+        const auto count = sendto(handle_, payload, static_cast<int>(bytes.size()), 0,
+                                  reinterpret_cast<const sockaddr*>(&storage), length);
+        if (count >= 0) return static_cast<std::size_t>(count) == bytes.size();
+        if (!interrupted(last_error())) return false;
+    }
+}
+
+bool Socket::receive_from(Endpoint& source, std::vector<std::uint8_t>& bytes) const {
+    // The extra byte catches truncation on platforms returning a short payload
+    // instead of EMSGSIZE. A zero-length firewall punch is a valid datagram.
+    std::array<std::uint8_t, max_datagram_size + 1> buffer;
+    sockaddr_storage storage{};
+    for (;;) {
+        Length length = sizeof(storage);
+        const auto count = recvfrom(handle_, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()),
+                                    0, reinterpret_cast<sockaddr*>(&storage), &length);
+        if (count >= 0) {
+            if (static_cast<std::size_t>(count) > max_datagram_size) return false;
+            source = from_address(storage);
+            bytes.assign(buffer.begin(), buffer.begin() + count);
+            return true;
+        }
+        if (!interrupted(last_error())) return false;
+    }
 }
 
 bool Socket::read_exact(void* destination, std::size_t size, const std::function<unsigned()>& poll_interval) const {
@@ -283,6 +358,22 @@ Socket connect_tcp(const std::string& host, std::uint16_t port) {
         }
     }
     throw std::runtime_error("Connecting to " + host + ":" + std::to_string(port) + ": " + reason);
+}
+
+Socket bind_udp(const std::string& bind_address, std::uint16_t port) {
+    const auto addresses = resolve(bind_address, port, true, SOCK_DGRAM);
+    std::string reason = "No matching address";
+    for (auto* address = addresses.get(); address; address = address->ai_next) {
+        try {
+            auto socket = open_socket(*address);
+            if (bind(socket.native_handle(), address->ai_addr, static_cast<Length>(address->ai_addrlen)) != 0)
+                throw socket_error("bind");
+            return socket;
+        } catch (const std::runtime_error& e) {
+            reason = e.what();
+        }
+    }
+    throw std::runtime_error("Binding UDP on " + bind_address + ":" + std::to_string(port) + ": " + reason);
 }
 
 Socket listen_tcp(const std::string& bind_address, std::uint16_t port) {

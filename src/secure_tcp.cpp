@@ -68,12 +68,23 @@ TcpChannel::TcpChannel(net::Socket& socket, const std::string& password, Role ro
     }
 }
 
+Bytes TcpChannel::exchange_query(Kind query_kind, const Bytes& query, Kind reply_kind, std::size_t reply_size) {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(wire::display_query_timeout_ms);
+    if (!wire::send_frame_before(socket_, session_->seal(query_kind, query), deadline))
+        throw std::runtime_error("Sending encrypted query timed out");
+    return session_->open(reply_kind, read_control(socket_, reply_size, deadline));
+}
+
+wire::CursorOffer TcpChannel::request_cursor(std::uint16_t port) {
+    if (!session_) return wire::request_cursor(socket_, port);
+    return wire::decode_cursor_reply(exchange_query(Kind::cursor_query, wire::encode_cursor_query(port),
+                                                  Kind::cursor_reply, wire::cursor_reply_size));
+}
+
 wire::DisplaySize TcpChannel::request_display_size() {
     if (!session_) return wire::request_display_size(socket_);
-    const auto deadline = Clock::now() + std::chrono::milliseconds(wire::display_query_timeout_ms);
-    wire::send_frame(socket_, session_->seal(Kind::display_query, wire::display_query));
-    const auto reply = read_control(socket_, wire::display_reply_size, deadline);
-    return wire::decode_display_reply(session_->open(Kind::display_reply, reply));
+    return wire::decode_display_reply(exchange_query(Kind::display_query, wire::display_query,
+                                                     Kind::display_reply, wire::display_reply_size));
 }
 
 void TcpChannel::send_header(wire::Header header) {
@@ -81,10 +92,17 @@ void TcpChannel::send_header(wire::Header header) {
     else wire::send_header(socket_, header);
 }
 
-wire::Header TcpChannel::receive_header(const std::function<wire::DisplaySize()>& display_size) {
-    if (!session_) return wire::receive_header(socket_, display_size);
+wire::Header TcpChannel::receive_header(const std::function<wire::DisplaySize()>& display_size,
+                                        const wire::CursorResponder& cursor) {
+    if (!session_) return wire::receive_header(socket_, display_size, cursor);
     const auto deadline = Clock::now() + wire::header_timeout;
     auto record = read_control(socket_, wire::header_size, deadline);
+    if (record.front() == static_cast<std::uint8_t>(Kind::cursor_query)) {
+        const auto port = wire::decode_cursor_query(session_->open(Kind::cursor_query, record));
+        const auto reply = wire::encode_cursor_reply(cursor ? cursor(port) : wire::CursorOffer{});
+        wire::send_frame(socket_, session_->seal(Kind::cursor_reply, reply));
+        record = read_control(socket_, wire::header_size, deadline);
+    }
     if (record.front() == static_cast<std::uint8_t>(Kind::display_query)) {
         const auto query = session_->open(Kind::display_query, record);
         if (query != wire::display_query || !display_size)

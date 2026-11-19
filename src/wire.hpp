@@ -35,6 +35,20 @@ struct DisplaySize {
     std::uint32_t width, height;
 };
 
+struct CursorOffer {
+    std::uint16_t port = 0;
+    std::uint64_t token = 0;
+};
+using CursorResponder = std::function<CursorOffer(std::uint16_t sender_port)>;
+extern const std::vector<std::uint8_t> cursor_query_prefix;
+constexpr std::size_t cursor_query_size = 12;
+constexpr std::size_t cursor_reply_size = 24;
+std::vector<std::uint8_t> encode_cursor_query(std::uint16_t port);
+std::uint16_t decode_cursor_query(const std::vector<std::uint8_t>& bytes);
+std::vector<std::uint8_t> encode_cursor_reply(CursorOffer offer);
+CursorOffer decode_cursor_reply(const std::vector<std::uint8_t>& bytes);
+CursorOffer request_cursor(net::Socket& socket, std::uint16_t port);
+
 // Optional preamble when the sender needs the receiver display dimensions.
 extern const std::vector<std::uint8_t> display_query;
 constexpr std::size_t display_reply_size = 16;
@@ -56,7 +70,8 @@ bool valid_mode(std::uint32_t width, std::uint32_t height, std::uint32_t fps,
 std::vector<std::uint8_t> encode_header(Header header);
 Header decode_header(const std::vector<std::uint8_t>& bytes);
 void send_header(net::Socket& socket, Header header);
-Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size = {});
+Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size = {},
+                      const CursorResponder& cursor = {});
 std::vector<std::uint8_t> pack_frame(const Frame& frame);
 Frame unpack_frame(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> pack_feedback(Feedback feedback);

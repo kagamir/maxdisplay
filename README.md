@@ -5,7 +5,7 @@
 
 **Use a Windows PC as a second display for your Mac.**
 
-MaxDisplay adds a virtual display named **MaxDisplay** to your Mac and streams it to a Windows PC, which shows it full screen. Keep your code on the Mac's built-in screen and drag a browser, or any other window, onto the Windows one. The keyboard and pointer stay on the Mac.
+MaxDisplay adds a virtual display named **MaxDisplay** to your Mac and streams it to a Windows PC, which shows it full screen. Keep your code on the Mac's built-in screen and drag a browser, or any other window, onto the Windows one. The Mac handles keyboard and pointer input.
 
 [Quick start](#quick-start) · [Configuration](#configuration) · [Command reference](#command-reference) · [Troubleshooting](#troubleshooting) · [Building from source](#building-from-source) · [How it works](#how-it-works)
 
@@ -15,6 +15,7 @@ MaxDisplay adds a virtual display named **MaxDisplay** to your Mac and streams i
 - **Fits the Windows screen automatically.** The stream matches the pixel resolution of the monitor the receiver is on. `--size` and `--scale` give you HiDPI rendering or more desktop room.
 - **H.264, H.265 and AV1.** The Mac encodes with VideoToolbox hardware, Windows decodes with hardware when it can, and software fallbacks are built in on both sides.
 - **Adapts to your network.** Bitrate and frame rate adjust on their own, up to 60 fps and 12 Mbps by default.
+- **Local Mac pointer on Windows.** The viewer draws the Mac pointer over the last picture as soon as its position arrives, even while a video frame is in transit.
 - **Sharp when still.** Once the desktop stops changing, the Mac keeps refining the last picture so text and edges clear up.
 - **TCP or UDP.** TCP is the default. UDP keeps latency low on networks that drop packets.
 - **Recovers by itself.** After loss or a timeout the receiver holds the last picture and resumes at the next keyframe. After a disconnect it waits for the Mac to come back.
@@ -168,6 +169,16 @@ Set `--transport udp` on both sides, and allow that UDP port inbound in Windows 
 ./maxdisplay send 192.168.1.50 --codec h265 --transport udp --size 1280x720 --scale 2 --fps 60 --bitrate-mbps 16 --frame-timeout-ms 150
 ```
 
+### Mac pointer on Windows
+
+The Mac samples its pointer every 4 ms. A separate UDP connection carries its position and shape with either video transport. Windows draws the pointer over the video without moving the local Windows mouse. On a still desktop, moving the Mac pointer alone lets the video encoder stay idle after static refinement finishes.
+
+The receiver chooses a temporary UDP port on its bind address and sends outbound probes to the Mac. The Mac keeps the pointer in video if it receives no cursor acknowledgement within one second of startup. During streaming it returns to video after two seconds without an acknowledgement. After acknowledgements resume for one second, Windows waits for a cursor-free video frame before showing the overlay again. To keep the pointer in the video throughout a session, add `--video-cursor` to the Mac command. This also skips the cursor handshake.
+
+If the sender reports a cursor timeout, check whether the firewall allows the MaxDisplay executable to exchange UDP traffic on the private network. A rule for TCP port 49300 alone may only allow video. No fixed second port is required.
+
+Pointer shapes are rasterized at the stream scale, up to 256×256 pixels. When macOS cannot supply the current shape, the viewer may show the standard arrow. Pointers drawn by an application into its own window remain part of the captured picture.
+
 ### Password encryption
 
 Start the Windows receiver and the Mac sender with the same nonempty password. Replace the example value with a long, randomly generated password. These commands use TCP. Add `--transport udp` to both for UDP.
@@ -180,7 +191,7 @@ Start the Windows receiver and the Mac sender with the same nonempty password. R
 ./maxdisplay send 192.168.1.50 --password 'your-shared-password'
 ```
 
-Both peers contribute fresh random values on each connection. PBKDF2-HMAC-SHA256 runs for 600,000 iterations at connection setup. The peers prove they have the same password before exchanging display dimensions, stream settings, video or feedback. AES-128-GCM encrypts and authenticates these messages with separate keys for each direction.
+Both peers contribute fresh random values on each connection. PBKDF2-HMAC-SHA256 runs for 600,000 iterations at connection setup. The peers prove they have the same password before exchanging cursor connection details, display dimensions, stream settings, video or feedback. AES-128-GCM encrypts and authenticates these messages with separate keys for each direction. The UDP cursor channel uses its own directional keys and accepts authenticated, reordered packets within a 64-packet replay window.
 
 Omit `--password` on **both** computers to use plaintext. A password mismatch or a peer configured for a different mode ends the connection. A password passed on the command line can appear in shell history and process listings.
 
@@ -218,8 +229,8 @@ This budget does not guarantee the total delay from capture to the screen lighti
 
 Add `--stats` on either side to print per-second statistics on that device. Use it on both when you are chasing blur or stutter.
 
-- **Mac:** target and actual bitrate and frame rate, round-trip time, estimated queueing delay, encoding time, available quality metrics, and counts of step-downs and keyframes by cause.
-- **Windows:** frames received, decoded and actually drawn, with their timings, the decoder type, and the reasons for keyframe requests.
+- **Mac:** target and actual bitrate and frame rate, round-trip time, estimated queueing delay, encoding time, available quality metrics, counts of step-downs and keyframes by cause, and cursor RTT, datagrams sent, retransmissions and shape transfers.
+- **Windows:** frames received, decoded and actually drawn, with their timings, the decoder type, reasons for keyframe requests, and cursor updates, sequence gaps and repaints.
 
 ## Command reference
 
@@ -237,6 +248,7 @@ Add `--stats` on either side to print per-second statistics on that device. Use 
 | `--frame-timeout-ms MS` | `200` | Real-time frame budget, 1 to 60000 |
 | `--fixed-bitrate` | off | Hold the bitrate at its target |
 | `--fixed-fps` | off | Hold the frame rate at its target |
+| `--video-cursor` | off | Capture the Mac pointer in the video and skip the separate cursor connection |
 | `--require-hardware` | off | Use the hardware encoder only. H.264 and H.265 |
 | `--stats` | off | Print per-second statistics |
 
@@ -321,17 +333,31 @@ Pushing a Git tag makes CI build both platforms, run the cross-platform interope
 
 ## How it works
 
-```
-Mac (sender)                                          Windows (receiver)
-virtual display → capture → encode  ── TCP or UDP ──▶  decode → scale → window
-                                    ◀── feedback ────
+```mermaid
+flowchart LR
+    subgraph Mac
+        encoder["Screen capture and encoder"]
+        cursor["Cursor sampler"]
+    end
+    subgraph Windows
+        decoder["Video decoder"]
+        overlay["Cursor receiver"]
+        viewer["Viewer window"]
+    end
+    encoder -->|TCP or ENet| decoder
+    decoder -.->|Frame feedback| encoder
+    cursor -->|UDP position and shape| overlay
+    overlay -.->|Selective ACK| cursor
+    decoder --> viewer
+    overlay --> viewer
 ```
 
 MaxDisplay is one C++17 codebase and one CMake project that builds a single executable for each operating system. macOS system APIs are called through Objective-C++.
 
-- **Virtual display and capture.** macOS creates the display through CoreGraphics' private `CGVirtualDisplay` interface and captures the picture and pointer with ScreenCaptureKit.
+- **Virtual display and capture.** macOS creates the display through CoreGraphics' private `CGVirtualDisplay` interface and captures its image with ScreenCaptureKit. In local-pointer mode ScreenCaptureKit omits the system pointer.
 - **Encoding.** VideoToolbox runs in real-time mode with frame reordering off. H.264 keyframes carry SPS and PPS, and HEVC Main keyframes carry VPS, SPS and PPS, all sent as Annex B. AV1 uses libaom in a low-latency configuration.
 - **Protocol.** The v3 handshake negotiates codec, picture size, frame rate and timeout. Every access unit carries a sequence number, a sender timestamp and a flag marking real keyframes. The receiver reports its progress and requests keyframes.
+- **Pointer.** The peers negotiate temporary UDP ports and a session token before the v3 video header. Absolute positions are measured in eighths of a video pixel. A later position supersedes earlier ones. The sender repeats the final position until acknowledged, and uses selective acknowledgements to fill missing shape fragments. Windows caches the 64 most recent shapes and repaints only the areas affected by cursor motion. During a handoff, the cursor state can also specify the first video frame without a baked-in pointer.
 - **Transport.** TCP prefixes each frame with a big-endian length. UDP uses ENet: the handshake and keyframes travel reliably, and all other frames go as droppable, sequenced messages.
 - **Display.** Windows builds the picture from the decoded YUV data, scales it proportionally and adds black bars when needed. The D3D11 path reads the actual decoded surface.
 

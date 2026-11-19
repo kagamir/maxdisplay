@@ -21,6 +21,7 @@ struct SenderOptions {
     std::uint32_t timeout_ms = 200;
     bool adaptive = true;
     bool adaptive_fps = true;
+    bool video_cursor = false;
     bool require_hardware = false;
     bool stats = false;
     std::string password;

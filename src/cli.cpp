@@ -20,7 +20,7 @@ void print_help() {
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|h265|av1] [--transport tcp|udp]\n"
                  "                                      [--frame-timeout-ms MS] [--fixed-bitrate] [--fixed-fps]\n"
-                 "                                      [--require-hardware] [--stats] [--password PASSWORD]\n\n"
+                 "                                      [--require-hardware] [--video-cursor] [--stats] [--password PASSWORD]\n\n"
                  "Start Windows first. Defaults: H.264 over TCP 49300, scale 1, up to 60 fps and 12 Mbps.\n"
                  "Use --password PASSWORD on both devices for AES-128-GCM encryption. Omit it on both for plaintext.\n"
                  "Use --password=VALUE for a password beginning with a dash.\n"
@@ -29,6 +29,7 @@ void print_help() {
                  "Omit --size to use the Windows monitor's pixel dimensions divided by --scale for the desktop.\n"
                  "H.264/H.265 prefer hardware and warn on software fallback. --require-hardware disables fallback.\n"
                  "--fps and --bitrate-mbps are adaptive ceilings. Each can be fixed independently.\n"
+                 "The Mac pointer normally travels separately over UDP. Use --video-cursor to capture it in video.\n"
                  "The default frame deadline is 200 ms.\n"
                  "Windows: F11 toggles full screen, Esc exits. Mac: Ctrl+C stops sharing.\n"
                  "Use --licenses to view bundled third-party notices.\n";
@@ -128,6 +129,8 @@ int run_cli(int argc, char** argv) {
             options.bitrate = number(option_value(i, argc, argv), 1, 100, key) * 1'000'000;
         } else if (key == "--frame-timeout-ms") {
             options.timeout_ms = number(option_value(i, argc, argv), 1, 60'000, key);
+        } else if (key == "--video-cursor") {
+            options.video_cursor = true;
         } else if (key == "--fixed-bitrate") {
             options.adaptive = false;
         } else if (key == "--fixed-fps") {

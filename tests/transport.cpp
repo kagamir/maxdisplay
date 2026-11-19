@@ -116,6 +116,52 @@ void display_negotiation() {
     expect_failure([&] { wire::request_display_size(stalled.writer, 40); }, "Partial TCP display reply did not time out");
 }
 
+void cursor_negotiation() {
+    const Bytes query{'M','X','C','Q', 0,0,0,1, 0,0,0x12,0x34};
+    const wire::CursorOffer offer{0xffee, 0x0102030405060708ull};
+    const Bytes reply{'M','X','C','R', 0,0,0,1, 0,0,0xff,0xee, 0,0,0,0, 1,2,3,4,5,6,7,8};
+    require(wire::encode_cursor_query(0x1234) == query && wire::encode_cursor_reply(offer) == reply,
+            "Incorrect cursor negotiation layout");
+    const auto parsed = wire::decode_cursor_reply(reply);
+    require(parsed.port == offer.port && parsed.token == offer.token, "Incorrect cursor offer");
+    auto bad = query;
+    bad[8] = 1;
+    expect_failure([&] { wire::decode_cursor_query(bad); }, "Accepted oversized cursor port");
+    bad = reply;
+    bad[15] = 1;
+    expect_failure([&] { wire::decode_cursor_reply(bad); }, "Accepted unknown cursor reply flags");
+    expect_failure([] { wire::encode_cursor_reply({1024, 0}); }, "Enabled cursor without a token");
+
+    Connection connection;
+    auto server = std::async(std::launch::async, [&] {
+        bool offered = false;
+        auto header = wire::receive_header(connection.reader, [&] {
+            require(offered, "Display queried before cursor");
+            return wire::DisplaySize{2560, 1440};
+        }, [&](std::uint16_t port) {
+            require(port == 0x1234, "Wrong sender cursor port");
+            offered = true;
+            return offer;
+        });
+        require(header.width == mode.width, "Cursor query lost the video header");
+    });
+    require(wire::request_cursor(connection.writer, 0x1234).token == offer.token, "Cursor handshake lost token");
+    require(wire::request_display_size(connection.writer).height == 1440, "Display query after cursor failed");
+    wire::send_header(connection.writer, mode);
+    server.get();
+
+    Connection unavailable;
+    auto no_side = std::async(std::launch::async, [&] { return wire::receive_header(unavailable.reader); });
+    require(!wire::request_cursor(unavailable.writer, 65535).port, "Unavailable cursor response was not disabled");
+    wire::send_header(unavailable.writer, mode);
+    require(no_side.get().codec == mode.codec, "Unavailable cursor interrupted video");
+
+    Connection duplicate;
+    duplicate.writer.write_all(query.data(), query.size());
+    duplicate.writer.write_all(query.data(), query.size());
+    expect_failure([&] { wire::receive_header(duplicate.reader); }, "Duplicate cursor query accepted");
+}
+
 void codec_headers() {
     require(wire::encode_header(mode) == hello, "Incorrect H.264 header byte layout");
     Connection connection;
@@ -313,6 +359,7 @@ int main() {
         round_trip();
         check_layout();
         display_negotiation();
+        cursor_negotiation();
         codec_headers();
         require_current_protocol();
         timed_frames_and_feedback();

@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "cursor_source.hpp"
 #include "display_scale.hpp"
 #include "encoder.hpp"
 #include "net.hpp"
@@ -117,6 +118,40 @@ public:
     }
 
     ~Connection() { close(); }
+
+    std::unique_ptr<CursorSource> request_cursor() {
+        auto peer = udp_ ? udp_->peer_endpoint() : tcp_->peer_endpoint();
+        net::Socket side;
+        try { side = net::bind_udp(peer.v6 ? "::" : "0.0.0.0"); }
+        catch (const std::exception& e) {
+            std::cerr << "Cursor UDP unavailable, using video cursor: " << e.what() << '\n';
+            return {};
+        }
+        // Errors on the authenticated control stream are session failures.
+        const auto offer = udp_ ? udp_->request_cursor(side.local_port()) : tcp_->request_cursor(side.local_port());
+        if (!offer.port) {
+            std::cerr << "Receiver cursor UDP unavailable, using video cursor.\n";
+            return {};
+        }
+        peer.port = offer.port;
+        auto keys = udp_ ? udp_->datagrams() : tcp_->datagrams();
+        try { return std::make_unique<CursorSource>(std::move(side), peer, offer.token, std::move(keys)); }
+        catch (const std::system_error& e) {
+            std::cerr << "Cannot start cursor worker, using video cursor: " << e.what() << '\n';
+            return {};
+        }
+    }
+
+    void await_cursor_free_frame() {
+        std::lock_guard lock(mutex_);
+        cursor_frame_ = next_sequence_;
+        cursor_frame_acked_ = false;
+    }
+
+    std::optional<std::uint32_t> cursor_frame_received() {
+        std::lock_guard lock(mutex_);
+        return cursor_frame_acked_ ? cursor_frame_ : std::nullopt;
+    }
 
     wire::DisplaySize request_display_size() {
         return udp_ ? udp_->request_display_size() : tcp_->request_display_size();
@@ -247,6 +282,8 @@ private:
     void feedback(const std::vector<std::uint8_t>& bytes) {
         const auto ack = wire::unpack_feedback(bytes);
         std::lock_guard lock(mutex_);
+        if (!ack.request_keyframe && cursor_frame_ && ack.sequence - *cursor_frame_ < next_sequence_ - *cursor_frame_)
+            cursor_frame_acked_ = true;
         if (control_->acknowledge(ack.sequence, ack.request_keyframe, now_us())) pending_.clear();
     }
 
@@ -307,6 +344,8 @@ private:
     bool closing_ = false;
     std::exception_ptr error_;
     std::uint32_t next_sequence_ = 1;
+    std::optional<std::uint32_t> cursor_frame_;
+    bool cursor_frame_acked_ = false;
     std::uint64_t capture_us_ = 0, encode_start_us_ = 0;
     std::optional<double> last_psnr_;
     std::optional<int> last_quantizer_;
@@ -318,7 +357,8 @@ void schedule_refresh(dispatch_source_t timer, std::uint64_t us) {
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, ns), ns, ns / 40);
 }
 
-void print_stats(const Connection::Snapshot& current, const StreamControl::Stats& previous, double seconds) {
+void print_stats(const Connection::Snapshot& current, const StreamControl::Stats& previous, double seconds,
+                 const cursor::SenderStats& pointer, const cursor::SenderStats& old_pointer) {
     const auto& s = current.stats;
     std::ostringstream out;
     out << std::fixed << std::setprecision(1)
@@ -340,6 +380,9 @@ void print_stats(const Connection::Snapshot& current, const StreamControl::Stats
     for (std::size_t i = 0; i < std::size(names); ++i)
         out << ' ' << names[i] << '=' << s.cuts[i] - previous.cuts[i] << '/'
             << s.key_requests[i] - previous.key_requests[i];
+    out << " cursor_rtt_ms=" << pointer.rtt_ms << " cursor_sent=" << pointer.sent - old_pointer.sent
+        << " cursor_retransmits=" << pointer.retransmits - old_pointer.retransmits
+        << " cursor_shape_transfers=" << pointer.shape_transfers - old_pointer.shape_transfers;
     std::clog << out.str() << '\n';
 }
 } // namespace
@@ -350,6 +393,8 @@ void print_stats(const Connection::Snapshot& current, const StreamControl::Stats
     std::shared_ptr<Encoder> encoder;
     // Accessed only on the capture queue once capture starts.
     CVPixelBufferRef latest;
+    std::uint64_t discard_before;
+    bool changing_cursor;
     dispatch_source_t refresh_timer;
     std::uint64_t refresh_tick_us;
     bool timer_follows_capture;
@@ -401,16 +446,13 @@ void print_stats(const Connection::Snapshot& current, const StreamControl::Stats
 - (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample
         ofType:(SCStreamOutputType)type {
     @autoreleasepool {
-        if (type != SCStreamOutputTypeScreen || !encoder || !CMSampleBufferIsValid(sample)) return;
+        if (changing_cursor || type != SCStreamOutputTypeScreen || !encoder || !CMSampleBufferIsValid(sample)) return;
         NSArray *attachments = (__bridge NSArray *)CMSampleBufferGetSampleAttachmentsArray(sample, false);
         NSNumber *status = attachments.firstObject[SCStreamFrameInfoStatus];
         if (!status || (status.integerValue != SCFrameStatusComplete && status.integerValue != SCFrameStatusStarted))
             return;
         CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(sample);
         if (!pixels) return;
-        CVPixelBufferRetain(pixels);
-        if (latest) CVPixelBufferRelease(latest);
-        latest = pixels;
         auto capture = now_us();
         // ScreenCaptureKit's display time and the CoreMedia host clock share
         // the mach_absolute_time clock. Account for waiting on the sample queue.
@@ -422,6 +464,10 @@ void print_stats(const Connection::Snapshot& current, const StreamControl::Stats
             if (CMTIME_IS_NUMERIC(age) && age.value > 0)
                 capture -= std::min(capture, static_cast<std::uint64_t>(age.value));
         }
+        if (capture < discard_before) return;
+        CVPixelBufferRetain(pixels);
+        if (latest) CVPixelBufferRelease(latest);
+        latest = pixels;
         [self encodeLatestAt:capture refreshOnly:false];
     }
 }
@@ -442,12 +488,106 @@ void change_capture(SCStream *stream, bool start) {
     if (failure) throw capture_error(operation, failure);
 }
 
+SCStreamConfiguration *capture_config(const DisplayGeometry& mode, bool show_cursor) {
+    SCStreamConfiguration *config = [SCStreamConfiguration new];
+    config.width = mode.stream_width;
+    config.height = mode.stream_height;
+    config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    config.colorSpaceName = kCGColorSpaceITUR_709;
+    config.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
+    config.minimumFrameInterval = CMTimeMake(1, static_cast<int32_t>(mode.fps));
+    config.queueDepth = 3;
+    config.showsCursor = show_cursor;
+    config.capturesAudio = NO;
+
+    return config;
+}
+
+bool update_cursor_capture(SCStream *stream, const DisplayGeometry& mode, bool separate,
+                           MDStreamSink *sink, dispatch_queue_t samples) {
+    // Never let the idle refresh timer re-encode pixels from the previous
+    // cursor mode. Ignore samples captured before this change but delivered late.
+    dispatch_sync(samples, ^{
+        sink->changing_cursor = true;
+        if (sink->latest) CVPixelBufferRelease(sink->latest);
+        sink->latest = nullptr;
+    });
+    __block NSError *failure = nil;
+    auto done = dispatch_semaphore_create(0);
+    [stream updateConfiguration:capture_config(mode, !separate) completionHandler:^(NSError *error) {
+        const auto applied = now_us();
+        dispatch_async(samples, ^{
+            failure = error;
+            sink->discard_before = applied;
+            if (separate && !error) sink->connection->await_cursor_free_frame();
+            sink->changing_cursor = false;
+            dispatch_semaphore_signal(done);
+        });
+    }];
+    wait_for(done, Clock::now() + 3s, "Updating capture cursor");
+    if (failure) std::cerr << capture_error("Updating capture cursor", failure).what() << '\n';
+    return !failure;
+}
+
+SCStream *make_stream(SCContentFilter *filter, SCStreamConfiguration *config,
+                      MDStreamSink *sink, dispatch_queue_t samples) {
+    SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:sink];
+    NSError *error = nil;
+    if (![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:samples error:&error])
+        throw capture_error("Adding capture output", error);
+    return stream;
+}
+
+// A static desktop can deliver the only changed frame during the async
+// configuration update. Supply one fresh sample with the requested cursor
+// mode so that the old baked picture cannot stay on screen indefinitely.
+SCStream *refresh_idle_capture(SCStream *stream, SCContentFilter *filter, SCStreamConfiguration *configuration,
+                               MDStreamSink *sink, dispatch_queue_t samples) {
+    __block bool missing;
+    __block std::uint64_t epoch;
+    dispatch_sync(samples, ^{ missing = !sink->latest; epoch = sink->discard_before; });
+    if (!missing) return stream;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+    if (@available(macOS 14.0, *)) {
+        auto done = dispatch_semaphore_create(0);
+        [SCScreenshotManager captureSampleBufferWithFilter:filter configuration:configuration
+            completionHandler:^(CMSampleBufferRef sample, NSError *error) {
+                auto pixels = !error && sample ? CMSampleBufferGetImageBuffer(sample) : nullptr;
+                if (pixels && CVPixelBufferGetPixelFormatType(pixels) == configuration.pixelFormat &&
+                    CVPixelBufferGetWidth(pixels) == configuration.width &&
+                    CVPixelBufferGetHeight(pixels) == configuration.height) {
+                    dispatch_sync(samples, ^{
+                        if (sink->encoder && !sink->latest && !sink->changing_cursor && sink->discard_before == epoch) {
+                            sink->latest = CVPixelBufferRetain(pixels);
+                            [sink encodeLatestAt:now_us() refreshOnly:false];
+                        }
+                    });
+                }
+                dispatch_semaphore_signal(done);
+            }];
+        try { wait_for(done, Clock::now() + 1s, "Refreshing idle screen"); }
+        catch (const std::runtime_error&) { if (interrupted) throw; }
+        dispatch_sync(samples, ^{ missing = !sink->latest; });
+        if (!missing) return stream;
+    }
+#endif
+    // On macOS 13 request a fresh initial sample using a new SCStream. A
+    // stopped SCStream cannot always be started again. The video connection,
+    // virtual display, encoder and frame sequence stay alive across the change.
+    SCStream *replacement = make_stream(filter, configuration, sink, samples);
+    change_capture(stream, false);
+    [stream removeStreamOutput:sink type:SCStreamOutputTypeScreen error:nullptr];
+    change_capture(replacement, true);
+    return replacement;
+}
+
 int stream_desktop(SenderOptions options) {
     if (!CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess())
         throw std::runtime_error("Allow Screen Recording for MaxDisplay or your terminal in System Settings "
                                  "> Privacy & Security, then quit, reopen and retry.");
 
     auto connection = std::make_shared<Connection>(options);
+    auto cursor = options.video_cursor ? nullptr : connection->request_cursor();
     wire::DisplaySize monitor{};
     if (!options.width && !options.height) monitor = connection->request_display_size();
     const auto mode = resolve_display_geometry(options, monitor.width, monitor.height);
@@ -457,18 +597,11 @@ int stream_desktop(SenderOptions options) {
     options.fps = mode.fps;
     VirtualDisplay display(mode.logical_width, mode.logical_height, mode.fps, options.scale > 1.0);
     CGDirectDisplayID display_id = display.id();
+    if (cursor) cursor->set_display(display_id, mode.stream_width, mode.stream_height);
     SCDisplay *source = find_display(display_id);
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:source excludingWindows:@[]];
-    SCStreamConfiguration *config = [SCStreamConfiguration new];
-    config.width = mode.stream_width;
-    config.height = mode.stream_height;
-    config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    config.colorSpaceName = kCGColorSpaceITUR_709;
-    config.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
-    config.minimumFrameInterval = CMTimeMake(1, static_cast<int32_t>(options.fps));
-    config.queueDepth = 3;
-    config.showsCursor = YES;
-    config.capturesAudio = NO;
+    bool separate = cursor && cursor->ready(false);
+    SCStreamConfiguration *config = capture_config(mode, !separate);
 
     connection->send_header(options, mode);
     auto encoder = std::make_shared<Encoder>(mode.stream_width, mode.stream_height, mode.fps, options.bitrate,
@@ -479,11 +612,8 @@ int stream_desktop(SenderOptions options) {
     sink->bitrate = options.bitrate;
     sink->fps = options.fps;
     sink->connection = connection;
-    SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:sink];
     auto samples = dispatch_queue_create("maxdisplay.capture", DISPATCH_QUEUE_SERIAL);
-    NSError *error = nil;
-    if (![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:samples error:&error])
-        throw capture_error("Adding capture output", error);
+    SCStream *stream = make_stream(filter, config, sink, samples);
 
     // Dispatch timers coalesce on the serial capture queue. Refreshes reuse
     // the latest image for both keyframe recovery and static quality updates.
@@ -496,9 +626,15 @@ int stream_desktop(SenderOptions options) {
     dispatch_resume(refresh);
     std::exception_ptr failure;
     StreamControl::Stats previous_stats{};
+    cursor::SenderStats previous_cursor{};
+    std::optional<Clock::time_point> handoff_deadline, refresh_idle_at;
+    auto retry_cursor = Clock::time_point::min();
+    std::optional<std::uint64_t> idle_handoff;
+    bool warned = false;
     auto last_report = Clock::now();
     try {
         change_capture(stream, true);
+        if (cursor) cursor->show_overlay(separate);
         std::cout << "Streaming MaxDisplay " << mode.logical_width << 'x' << mode.logical_height
                   << " desktop points as " << mode.stream_width << 'x' << mode.stream_height << " pixels to "
                   << options.host << ':' << options.port << " using "
@@ -514,9 +650,62 @@ int stream_desktop(SenderOptions options) {
         while (!interrupted) {
             connection->check();
             const auto now = Clock::now();
+            if (cursor) {
+                if (refresh_idle_at && now >= *refresh_idle_at) {
+                    refresh_idle_at.reset();
+                    stream = refresh_idle_capture(stream, filter, capture_config(mode, !separate), sink, samples);
+                }
+                const bool lost = !cursor->ready(separate);
+                const bool handoff_expired = handoff_deadline && now >= *handoff_deadline;
+                if (separate && (lost || handoff_expired) && now >= retry_cursor) {
+                    cursor->show_overlay(false);
+                    if (update_cursor_capture(stream, mode, false, sink, samples)) {
+                        separate = false;
+                        refresh_idle_at = Clock::now() + 150ms;
+                        handoff_deadline.reset();
+                        if (handoff_expired && !lost) {
+                            // A static screen may yield no sample after the
+                            // configuration change. Keep the last visible
+                            // cursor and retry when it next moves.
+                            idle_handoff = cursor->movement();
+                            std::clog << "Waiting for fresh cursor-free video, keeping video cursor.\n";
+                        } else {
+                            std::clog << "Cursor UDP unavailable, using video cursor. Check the UDP firewall.\n";
+                        }
+                    } else {
+                        cursor->show_overlay(!handoff_deadline);
+                    }
+                    retry_cursor = Clock::now() + 1s;
+                } else if (!separate && !lost && now >= retry_cursor &&
+                           (!idle_handoff || *idle_handoff != cursor->movement())) {
+                    idle_handoff.reset();
+                    if (update_cursor_capture(stream, mode, true, sink, samples)) {
+                        separate = true;
+                        refresh_idle_at = Clock::now() + 150ms;
+                        handoff_deadline = Clock::now() + 2s;
+                    } else {
+                        retry_cursor = Clock::now() + 1s;
+                    }
+                } else if (handoff_deadline && !lost) {
+                    if (auto floor = connection->cursor_frame_received()) {
+                        // A decoder may ACK before it paints. The receiver also
+                        // waits until it presents a frame at or beyond this floor.
+                        cursor->show_overlay(true, *floor);
+                        handoff_deadline.reset();
+                        std::clog << "Cursor UDP active.\n";
+                    }
+                }
+                if (!warned && cursor->initial_timeout()) {
+                    warned = true;
+                    std::clog << "No cursor UDP ACK within 1 s, using video cursor. Check the UDP firewall.\n";
+                }
+            }
             if (options.stats && now - last_report >= 1s) {
                 const auto snapshot = connection->snapshot();
-                print_stats(snapshot, previous_stats, std::chrono::duration<double>(now - last_report).count());
+                const auto pointer = cursor ? cursor->stats() : cursor::SenderStats{};
+                print_stats(snapshot, previous_stats, std::chrono::duration<double>(now - last_report).count(),
+                            pointer, previous_cursor);
+                previous_cursor = pointer;
                 previous_stats = snapshot.stats;
                 last_report = now;
             }
@@ -526,6 +715,7 @@ int stream_desktop(SenderOptions options) {
         }
     } catch (...) { failure = std::current_exception(); }
 
+    cursor.reset();
     dispatch_source_cancel(refresh);
     connection->close();
     try { change_capture(stream, false); }
