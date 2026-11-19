@@ -35,7 +35,7 @@ NSBitmapImageRep* representation(unsigned width, unsigned height, uint8_t green)
     return rep;
 }
 
-void raster_and_position() {
+void rasterize_cursor() {
     NSImage* image = [[NSImage alloc] initWithSize:NSMakeSize(4, 8)];
     [image addRepresentation:representation(4, 8, 0)];
     [image addRepresentation:representation(8, 16, 255)];
@@ -55,25 +55,70 @@ void raster_and_position() {
     require(capped && capped->width == 128 && capped->height == 256 && capped->hot_x == 32 &&
             capped->hot_y == 64, "Large cursor did not preserve its aspect ratio and hotspot");
     require(!mac_cursor::rasterize(nil, 1), "Missing system cursor returned a bitmap");
+}
 
-    auto shape = mac_cursor::rasterize(source, 2);
+void display_boundary() {
     const auto bounds = CGRectMake(-1000, 40, 320, 200);
     auto state = [&](double x, double y, bool visible = true) {
-        return mac_cursor::position(CGPointMake(x, y), bounds, 640, 400, *shape, visible);
+        return mac_cursor::position(CGPointMake(x, y), bounds, 640, 400, visible);
     };
-    auto partially_visible = state(-1000.25, 41.5);
-    require(partially_visible.visible && partially_visible.x == -4 && partially_visible.y == 24,
-            "Lost fractional or negative hotspot at the left edge");
-    require(state(-680, 41.5).visible && !state(-679, 41.5).visible, "Incorrect right-edge clipping");
-    require(!state(-1000, 41.5, false).visible && !state(-1004, 41.5).visible,
-            "Hidden or offscreen cursor visible");
+    require(cursor::same(state(-1000, 40), {true, 0, 0}) &&
+            cursor::same(state(-680.25, 239.5), {true, 5116, 3192}) &&
+            cursor::same(state(-680.001, 239.999), {true, 5119, 3199}),
+            "On-display hotspots were hidden or mapped to the wrong video pixel");
+    for (const auto point : {CGPointMake(-1000.25, 41.5), CGPointMake(-680, 41.5),
+                             CGPointMake(-990, 39.75), CGPointMake(-990, 240), CGPointMake(0, 0)})
+        require(cursor::same(state(point.x, point.y), {}), "Off-display hotspot revealed its position");
+    require(cursor::same(state(-999, 41.5, false), {}), "Invisible on-display hotspot revealed its position");
+
+    cursor::Sender sender(123);
+    cursor::Receiver receiver(123);
+    auto image = std::make_shared<cursor::Bitmap>();
+    image->width = image->height = 8;
+    image->hot_x = image->hot_y = 4;
+    image->pixels.resize(8 * 8 * 4, 255);
+    auto tick = [&](std::uint64_t now, double x, double y) {
+        const auto sample = state(x, y);
+        std::vector<cursor::Bytes> packets;
+        sender.update(now, sample, sample.visible ? image : nullptr,
+                      [&](const cursor::Bytes& bytes) { packets.push_back(bytes); });
+        return packets;
+    };
+    auto deliver = [&](std::uint64_t now, const std::vector<cursor::Bytes>& packets) {
+        for (const auto& packet : packets) {
+            auto ack = receiver.receive(now, packet);
+            require(ack.has_value(), "Receiver rejected a cursor packet");
+            sender.acknowledge(now, *ack);
+        }
+    };
+    auto hidden_packet = [](const std::vector<cursor::Bytes>& packets) {
+        return packets.size() == 1 && packets.front().size() == 30 &&
+               packets.front()[8] == cursor::detail::state_type && packets.front()[9] == 0 &&
+               cursor::detail::get(packets.front(), 14, 8) == 0 && // x and y on the wire.
+               cursor::detail::get(packets.front(), 22, 8) == 0;   // shape ID.
+    };
+    deliver(0, tick(0, -999, 45));
+    require(receiver.view().state.visible, "Missing pointer before display exit");
+    const auto hide = tick(4, -1000.25, 45); // Drop the first hide while the bitmap still overlaps the edge.
+    require(hidden_packet(hide), "Display exit transmitted coordinates or failed to hide");
+    const auto retry = tick(8, -1001, 48);
+    require(retry == hide, "Outside movement changed the retransmitted hide");
+    deliver(8, retry);
+    require(!receiver.view().state.visible, "Receiver failed to hide after retry");
+    require(tick(12, -1002, 60).empty(), "Outside movement triggered a cursor update");
+    const auto heartbeat = tick(260, -1003, 75);
+    require(hidden_packet(heartbeat), "Hidden heartbeat transmitted coordinates");
+    deliver(260, heartbeat);
+    deliver(264, tick(264, -999.5, 47));
+    require(cursor::same(receiver.view().state, {true, 8, 112}), "Reentry did not restore the mapped hotspot");
 }
 }
 
 int main() {
     @autoreleasepool {
         try {
-            raster_and_position();
+            rasterize_cursor();
+            display_boundary();
         } catch (const std::exception& ex) {
             std::cerr << ex.what() << '\n';
             return 1;
