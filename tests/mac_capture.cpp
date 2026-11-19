@@ -13,15 +13,16 @@
 #include <iostream>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 using namespace std::chrono_literals;
 
-void check_av1(const std::vector<uint8_t>& frame) {
-    Av1Decoder decoder(1280, 720);
+void check_av1(const std::vector<uint8_t>& frame, uint32_t width, uint32_t height) {
+    Av1Decoder decoder(width, height);
     bool decoded = false;
     decoder.decode(frame, [&](VideoFrame&& image) {
-        if (image.width != 1280 || image.height != 720 || image.bgra.size() != 1280 * 720 * 4)
+        if (image.width != width || image.height != height || image.bgra.size() != width * height * 4)
             throw std::runtime_error("Incorrect scaled AV1 desktop dimensions");
         decoded = true;
     });
@@ -34,8 +35,10 @@ void capture(Codec codec, Transport transport) {
     options.transport = transport;
     options.host = "127.0.0.1";
     options.fps = 30;
-    if (codec == Codec::av1) set_display_size(options, 640, 360, 2.0);
-    else set_display_size(options, 1280, 720, 1.0);
+    const bool scaled = codec == Codec::av1;
+    set_display_size(options, 1280, 720, scaled ? 2.0 : 1.0);
+    const uint32_t expected_width = scaled ? 2560 : 1280;
+    const uint32_t expected_height = scaled ? 1440 : 720;
 
     net::Socket tcp;
     std::optional<udp::Listener> datagrams;
@@ -68,9 +71,9 @@ void capture(Codec codec, Transport transport) {
             mode = wire::receive_header(peer);
             if (!wire::receive_frame(peer, frame)) throw std::runtime_error("No TCP video frame");
         }
-        if (mode.width != 1280 || mode.height != 720 || mode.fps != options.fps || mode.codec != codec)
+        if (mode.width != expected_width || mode.height != expected_height || mode.fps != options.fps || mode.codec != codec)
             throw std::runtime_error("Unexpected captured desktop mode");
-        if (codec == Codec::av1) check_av1(frame);
+        if (codec == Codec::av1) check_av1(frame, expected_width, expected_height);
         else if (frame.size() < 5 || frame[0] || frame[1] || frame[2] ||
                  frame[3] != 1 || (frame[4] & 31) != 7)
             throw std::runtime_error("Expected an H.264 access unit beginning with SPS");
@@ -84,16 +87,23 @@ void capture(Codec codec, Transport transport) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
+    const std::string_view profile = argv[1];
+    if (profile != "h264-tcp" && profile != "av1-udp") return 2;
     if (!CGPreflightScreenCaptureAccess()) {
         std::cout << "Skipping live desktop capture: Screen Recording permission is required\n";
         return 77;
     }
 
     try {
-        capture(Codec::h264, Transport::tcp);
-        capture(Codec::av1, Transport::udp);
-        std::cout << "Captured H.264/TCP and a scaled 1280x720 AV1/UDP desktop\n";
+        if (profile == "av1-udp") {
+            capture(Codec::av1, Transport::udp);
+            std::cout << "Captured and decoded a 2560x1440 AV1/UDP desktop at scale 2\n";
+        } else {
+            capture(Codec::h264, Transport::tcp);
+            std::cout << "Captured a 1280x720 H.264/TCP desktop at scale 1\n";
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

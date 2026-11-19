@@ -35,6 +35,7 @@ struct Receiver {
     HWND window = nullptr;
     win_info::Binding binding{};
     std::uint16_t port = 0;
+    Transport transport = Transport::tcp;
     std::wstring address_text;
     bool fullscreen = false;
     WINDOWPLACEMENT windowed_placement{};
@@ -204,7 +205,9 @@ void paint_client(Receiver& receiver, HDC dc) {
         std::wstring details = status;
         if (pixels.cx > 0 && pixels.cy > 0)
             details += L"\nDisplay: " + std::to_wstring(pixels.cx) + L" × " + std::to_wstring(pixels.cy) + L" px";
-        details += L"\n\nLocal IP addresses (port " + std::to_wstring(receiver.port) + L")\n" + receiver.address_text;
+        details += L"\n\nLocal IP addresses (";
+        details += receiver.transport == Transport::udp ? L"UDP " : L"TCP ";
+        details += std::to_wstring(receiver.port) + L")\n" + receiver.address_text;
         const auto dpi = GetDpiForWindow(receiver.window);
         HFONT font = CreateFontW(-MulDiv(13, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -345,6 +348,7 @@ int run_receiver(const ReceiverOptions& options) {
     Receiver receiver;
     receiver.binding = win_info::resolve_binding(options.bind, options.transport == Transport::udp);
     receiver.port = options.port;
+    receiver.transport = options.transport;
     receiver.refresh_addresses();
     HWND window = CreateWindowExW(0, window_class, L"MaxDisplay", WS_OVERLAPPEDWINDOW,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1000, 620,

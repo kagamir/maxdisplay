@@ -36,11 +36,11 @@ MaxDisplay 使用一套 C++17 代码和一个 CMake 项目，按操作系统生�
 ./maxdisplay send 192.168.1.50 --port 49301 --size 2560x1440 --fps 60 --bitrate-mbps 24
 ```
 
-Mac 使用 `--scale` 分别乘以 `--size` 的宽和高，乘积决定虚拟屏、采集、编码和接收画面的实际像素数。比例默认是 1，允许小数，两个乘积都必须是偶数整数。例如 `--size 1280x720 --scale 1.5` 得到 1920×1080。指定 `--scale 2` 会启用 macOS 的 2× HiDPI 模式，此时基础尺寸也是逻辑桌面尺寸。其他比例使用相乘后的原生像素模式。H.264 按最终像素数检查 Level 5.1 限制，例如 3840×2160 可选 30 fps。实际帧率取决于画面变化、编码速度、带宽和 Windows 解码速度。如果提示接收端过慢，可先试 `--size 1920x1080 --fps 30 --bitrate-mbps 8`。两端可用 `--help` 查看参数。
+Mac 使用 `--scale` 分别乘以 `--size` 的宽和高，乘积决定虚拟屏、采集、编码和接收画面的实际像素数。比例默认是 1，允许小数，两个乘积都必须是偶数整数。例如 `--size 1280x720 --scale 1.5` 得到 1920×1080。指定 `--scale 2` 会优先请求 macOS 的 2× HiDPI 模式，此时基础尺寸也是逻辑桌面尺寸。如果系统无法提供该模式，程序会使用相同像素分辨率的标准模式。其他比例使用相乘后的原生像素模式。H.264 按最终像素数检查 Level 5.1 限制，例如 3840×2160 可选 30 fps。实际帧率取决于画面变化、编码速度、带宽和 Windows 解码速度。如果提示接收端过慢，可先试 `--size 1920x1080 --fps 30 --bitrate-mbps 8`。两端可用 `--help` 查看参数。
 
 ### AV1 和 UDP
 
-`--codec av1` 在 Mac 端选择 AV1，Windows 根据连接头自动选择解码器。H.264 和 AV1 均可搭配 TCP 或 UDP。UDP 使用 IPv4，双方都要指定 `--transport udp`，且 Windows 防火墙要允许相应 UDP 端口入站。下面的例子使用 UDP，将 1280×720 的逻辑桌面以 2560×1440 像素传输。
+`--codec av1` 在 Mac 端选择 AV1，Windows 根据连接头自动选择解码器。H.264 和 AV1 均可搭配 TCP 或 UDP。UDP 使用 IPv4，双方都要指定 `--transport udp`，且 Windows 防火墙要允许相应 UDP 端口入站。下面的例子使用 UDP，以 1280×720 为基础尺寸，传输 2560×1440 像素。
 
 ```powershell
 .\maxdisplay-windows-x64.exe receive --transport udp

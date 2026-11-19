@@ -19,7 +19,7 @@ void print_help() {
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|av1] [--transport tcp|udp]\n\n"
                  "Start Windows first. Defaults: H.264 over TCP 49300, 1920x1080, scale 1, 60 fps, 12 Mbps.\n"
-                 "The pixel resolution is --size times --scale. Scale 2 enables macOS HiDPI.\n"
+                 "The pixel resolution is --size times --scale. Scale 2 requests macOS HiDPI.\n"
                  "Windows: F11 toggles full screen, Esc exits. Mac: Ctrl+C stops sharing.\n"
                  "Use --licenses to view bundled third-party notices.\n";
 }

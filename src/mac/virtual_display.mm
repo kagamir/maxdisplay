@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <initializer_list>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -67,10 +68,12 @@ MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps, bool hi_d
     descriptor.name = @"MaxDisplay";
     descriptor.queue = dispatch_get_main_queue();
     descriptor.vendorID = 0xF0F0;
-    descriptor.productID = 1;
-    // A stable identity lets macOS remember the user's display arrangement.
-    descriptor.serialNum = 1;
-    if ([descriptor respondsToSelector:@selector(setSerialNumber:)]) descriptor.serialNumber = 1;
+    // WindowServer restores a saved display mode by EDID identity. Keep the
+    // identity stable for reconnects at the same geometry and density.
+    descriptor.productID = hi_dpi ? 2 : 1;
+    const auto serial = (width << 16) | height;
+    descriptor.serialNum = serial;
+    if ([descriptor respondsToSelector:@selector(setSerialNumber:)]) descriptor.serialNumber = serial;
     descriptor.maxPixelsWide = width;
     descriptor.maxPixelsHigh = height;
     const double pixels_per_inch = hi_dpi ? 220 : 110;
@@ -87,13 +90,13 @@ MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps, bool hi_d
     MDDisplayMode *mode = [(MDDisplayMode *)[mode_class alloc] initWithWidth:mode_width
                                                                       height:mode_height
                                                                  refreshRate:fps];
-    if (!mode) throw std::runtime_error("macOS rejected the virtual display mode");
+    if (!mode) return nil;
     MDDisplaySettings *settings = [settings_class new];
     settings.hiDPI = hi_dpi ? 1 : 0;
     settings.modes = @[mode];
     MDDisplay *display = [(MDDisplay *)[display_class alloc] initWithDescriptor:descriptor];
     if (!display || ![display applySettings:settings] || display.displayID == kCGNullDirectDisplay)
-        throw std::runtime_error("macOS could not register MaxDisplay with the requested display mode");
+        return nil;
     return display;
 }
 
@@ -110,29 +113,56 @@ void extend_display(CGDirectDisplayID display_id) {
         throw std::runtime_error("Could not apply extended display configuration");
 }
 
-} // namespace
-
-VirtualDisplay::VirtualDisplay(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi)
-    : display_(make_display(width, height, fps, hi_dpi)) {
+void pump_display_events() {
     using namespace std::chrono_literals;
-    auto deadline = std::chrono::steady_clock::now() + 8s;
+    if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.025, false) == kCFRunLoopRunFinished)
+        std::this_thread::sleep_for(25ms);
+}
+
+bool matches_pixel_size(CGDirectDisplayID id, uint32_t width, uint32_t height) {
+    if (auto mode = CGDisplayCopyDisplayMode(id)) {
+        const bool matches = CGDisplayModeGetPixelWidth(mode) == width && CGDisplayModeGetPixelHeight(mode) == height;
+        CGDisplayModeRelease(mode);
+        return matches;
+    }
+    // Some macOS versions do not expose the mode object to the process
+    // that created the display. Quartz still reports its drawable size.
+    return CGDisplayPixelsWide(id) == width && CGDisplayPixelsHigh(id) == height;
+}
+
+bool wait_until_ready(CGDirectDisplayID id, uint32_t width, uint32_t height, std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     bool requested_extension = false;
     while (std::chrono::steady_clock::now() < deadline) {
-        const auto display_id = id();
-        if (CGDisplayIsOnline(display_id)) {
-            if (CGDisplayIsInMirrorSet(display_id)) {
+        if (CGDisplayIsOnline(id)) {
+            if (CGDisplayIsInMirrorSet(id)) {
                 if (!requested_extension) {
-                    extend_display(display_id);
+                    extend_display(id);
                     requested_extension = true;
                 }
-            } else if (CGDisplayIsActive(display_id)) {
-                return;
+            } else if (CGDisplayIsActive(id) && matches_pixel_size(id, width, height)) {
+                return true;
             }
         }
-        if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.025, false) == kCFRunLoopRunFinished)
-            std::this_thread::sleep_for(25ms);
+        pump_display_events();
     }
-    throw std::runtime_error("MaxDisplay did not become an active extended display. Check System Settings > Displays.");
+    return false;
+}
+} // namespace
+
+VirtualDisplay::VirtualDisplay(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi) {
+    using namespace std::chrono_literals;
+    if (hi_dpi) {
+        @autoreleasepool { display_ = make_display(width, height, fps, true); }
+        if (display_ && wait_until_ready(id(), width, height, 3s)) return;
+        display_ = nil;
+        std::cerr << "MaxDisplay: macOS did not activate the requested HiDPI mode. "
+                  << "Using a " << width << 'x' << height << " standard-density display.\n";
+    }
+    @autoreleasepool { display_ = make_display(width, height, fps, false); }
+    if (!display_ || !wait_until_ready(id(), width, height, 8s))
+        throw std::runtime_error("MaxDisplay did not become an independent " + std::to_string(width) +
+                                 "x" + std::to_string(height) + " display. Check System Settings > Displays.");
 }
 
 CGDirectDisplayID VirtualDisplay::id() const { return display_.displayID; }
