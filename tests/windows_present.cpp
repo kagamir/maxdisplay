@@ -21,11 +21,12 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
 using namespace std::chrono_literals;
-using Frames = std::array<std::vector<std::uint8_t>, 6>;
+using Frames = std::array<std::vector<std::uint8_t>, 8>;
 constexpr unsigned width = 320, height = 180, fps = 30;
 
 Frames read_frames(const char* path) {
@@ -113,8 +114,8 @@ bool near_color(COLORREF value, COLORREF expected, int tolerance) {
 bool sees_pattern(HWND window, bool final) {
     auto colors = read_colors(window);
     if (!near_color(colors[0], RGB(20, 220, 20), 18)) return false;
-    if (final) return near_color(colors[1], RGB(210, 210, 210), 15);
-    for (int shade : {30, 66, 102}) {
+    if (final) return near_color(colors[1], RGB(205, 205, 205), 10);
+    for (int shade : {30, 55, 80}) {
         if (near_color(colors[1], RGB(shade, shade, shade), 15)) return true;
     }
     return false;
@@ -122,27 +123,57 @@ bool sees_pattern(HWND window, bool final) {
 
 class TestSender {
 public:
-    TestSender(const ReceiverOptions& options, Codec codec) {
+    TestSender(const ReceiverOptions& options, Codec codec, uint32_t timeout_ms)
+        : timed_(timeout_ms != 0) {
         if (options.transport == Transport::udp) {
             udp_.emplace(options.bind, options.port);
-            udp_->send(wire::encode_header({width, height, fps, codec}));
+            udp_->send(wire::encode_header({width, height, fps, codec, timeout_ms}));
         } else {
             tcp_ = net::connect_tcp(options.bind, options.port);
-            wire::send_header(tcp_, width, height, fps, codec);
+            wire::send_header(tcp_, width, height, fps, codec, timeout_ms);
         }
     }
 
-    void send(const std::vector<uint8_t>& frame) {
-        if (udp_) udp_->send(frame);
-        else wire::send_frame(tcp_, frame);
+    static uint64_t now_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void send(const Frames& frames, unsigned index, uint32_t sequence,
+              bool expect_request = false, uint64_t stamp = now_us()) {
+        if (!timed_) {
+            if (udp_) udp_->send(frames[index]);
+            else wire::send_frame(tcp_, frames[index]);
+            return;
+        }
+        auto bytes = wire::pack_frame({sequence, stamp, index == 0 || index == 5, frames[index]});
+        std::vector<uint8_t> reply;
+        if (udp_) {
+            if (!udp_->send_frame(bytes)) throw std::runtime_error("UDP loopback queue is full");
+            if (!wait_until([&] {
+                auto received = udp_->take_feedback();
+                if (!received) return false;
+                reply = std::move(*received);
+                return true;
+            }, 8s)) throw std::runtime_error("Timed out waiting for UDP receiver feedback");
+        } else {
+            wire::send_frame(tcp_, bytes);
+            reply.resize(wire::feedback_size);
+            if (!net::wait_readable(tcp_, 8000) || !tcp_.read_exact(reply.data(), reply.size()))
+                throw std::runtime_error("Missing TCP receiver feedback");
+        }
+        auto ack = wire::unpack_feedback(reply);
+        if (ack.sequence != sequence || ack.request_keyframe != expect_request)
+            throw std::runtime_error("Unexpected recovery feedback for sequence " + std::to_string(sequence));
     }
 private:
     net::Socket tcp_;
     std::optional<udp::Sender> udp_;
+    bool timed_;
 };
 
 void send_initial_frames(TestSender& sender, const Frames& frames, HWND window) {
-    for (int i = 0; i < 3; ++i) sender.send(frames[i]);
+    for (unsigned i = 0; i < 3; ++i) sender.send(frames, i, i + 1);
     if (!wait_until([&] { return sees_pattern(window, false); }, 8s))
         throw std::runtime_error("The live window did not paint the initial green and gray pattern");
 }
@@ -172,15 +203,29 @@ void check(const Frames& frames, Codec codec, Transport transport) {
             return window || ui.wait_for(0s) == std::future_status::ready;
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
-        client.emplace(options, codec);
-        send_initial_frames(*client, frames, window);
-        for (unsigned i = 3; i < frames.size(); ++i) client->send(frames[i]);
-        if (!wait_until([&] { return sees_pattern(window, true); }, 8s))
-            throw std::runtime_error("The live window never painted the final gray level");
-        client.reset();
-        if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
-            throw std::runtime_error("Disconnected window did not clear its last frame");
-        client.emplace(options, codec);
+        constexpr uint32_t timeout_ms = 1000;
+        for (bool late : {false, true}) {
+            client.emplace(options, codec, timeout_ms);
+            send_initial_frames(*client, frames, window);
+            if (late) {
+                // Sequence 4 arrives in order, but its timestamp is older than the deadline.
+                const auto stamp = TestSender::now_us();
+                std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms) + 150ms);
+                client->send(frames, 3, 4, true, stamp);
+            } else {
+                // Sequence 4 (a reference picture) was lost. Deliver the following delta.
+                client->send(frames, 4, 5, true);
+            }
+            for (unsigned i = 5; i < frames.size(); ++i)
+                client->send(frames, i, late ? i : i + 1);
+            if (!wait_until([&] { return sees_pattern(window, true); }, 8s))
+                throw std::runtime_error("The live window never painted the recovered gray level");
+            client.reset();
+            if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
+                throw std::runtime_error("Disconnected window did not clear its last frame");
+        }
+        // Use the legacy wire format for the codecs it supports, and keep the socket open during Escape.
+        client.emplace(options, codec, codec == Codec::h265 ? timeout_ms : 0);
         send_initial_frames(*client, frames, window);
     } catch (...) {
         failure = std::current_exception();
@@ -200,7 +245,7 @@ int main(int argc, char** argv) {
     if (argc < 2 || argc > 4) return 2;
     const std::string codec = argc > 2 ? argv[2] : "h264";
     const std::string transport = argc > 3 ? argv[3] : "tcp";
-    if ((codec != "av1" && codec != "h264") || (transport != "tcp" && transport != "udp")) return 2;
+    if ((codec != "av1" && codec != "h264" && codec != "h265") || (transport != "tcp" && transport != "udp")) return 2;
     try {
         const auto frames = read_frames(argv[1]);
         // Probe desktop access with a system window class. Lack of monitor visibility
@@ -217,9 +262,9 @@ int main(int argc, char** argv) {
             throw std::system_error(error, std::system_category(), "Create GUI capability probe");
         }
         DestroyWindow(probe);
-        check(frames, codec == "av1" ? Codec::av1 : Codec::h264,
+        check(frames, codec == "h265" ? Codec::h265 : codec == "av1" ? Codec::av1 : Codec::h264,
               transport == "udp" ? Transport::udp : Transport::tcp);
-        std::cout << codec << "/" << transport << ": verified live window pixels, receiver reconnect and Escape shutdown\n";
+        std::cout << codec << "/" << transport << ": verified missing and late frame recovery, window pixels, reconnect and Escape shutdown\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

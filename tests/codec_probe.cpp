@@ -18,7 +18,7 @@
 
 namespace {
 constexpr uint32_t width = 320, height = 180, fps = 30;
-constexpr unsigned frame_count = 6;
+constexpr unsigned frame_count = 8, recovery_frame = 5;
 using Color = std::array<uint8_t, 4>;
 
 Color color_at(unsigned x, unsigned y, unsigned index) {
@@ -27,22 +27,30 @@ Color color_at(unsigned x, unsigned y, unsigned index) {
         return {20, 220, 20, 255};                      // green
     }
     if (x < width / 2) return {220, 20, 20, 255};       // blue
-    auto shade = static_cast<uint8_t>(30 + index * 36);
+    auto shade = static_cast<uint8_t>(30 + index * 25);
     return {shade, shade, shade, 255};                 // changing grayscale
 }
 
 #ifdef __APPLE__
-void probe(const char* path, Codec codec) {
+bool probe(const char* path, Codec codec, bool strict) {
     std::ofstream stream(path, std::ios::binary);
     stream.exceptions(std::ios::badbit | std::ios::failbit);
     unsigned packets = 0;
-    Encoder encoder(width, height, fps, 2'000'000, [&](std::vector<uint8_t> au) {
+    Encoder encoder(width, height, fps, 2'000'000, [&](std::vector<uint8_t> au, bool keyframe) {
+        if ((packets == 0 || packets == recovery_frame) && !keyframe)
+            throw std::runtime_error("Missing requested random access frame at " + std::to_string(packets));
+        // The receiver loss test skips index 3 and then delivers this dependent picture.
+        if (packets == recovery_frame - 1 && keyframe)
+            throw std::runtime_error("Expected a predicted picture immediately before recovery");
         const auto n = static_cast<uint32_t>(au.size());
         const uint8_t length[] = {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
         stream.write(reinterpret_cast<const char*>(length), sizeof(length));
         stream.write(reinterpret_cast<const char*>(au.data()), n);
         ++packets;
-    }, codec);
+    }, codec, strict);
+    const bool hardware = encoder.hardware_accelerated();
+    if (strict && !hardware) throw std::runtime_error("Required hardware encoder was not selected");
+    std::cout << "Encoder: " << (hardware ? "hardware" : "software") << '\n';
     for (unsigned i = 0; i < frame_count; ++i) {
         CVPixelBufferRef pixel = nullptr;
         if (CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nullptr, &pixel) != kCVReturnSuccess)
@@ -70,18 +78,21 @@ void probe(const char* path, Codec codec) {
             }
         }
         CVPixelBufferUnlockBaseAddress(pixel, 0);
-        encoder.encode(pixel, CMTimeMake(i, fps));
+        if (i == 2) encoder.set_bitrate(950'000);
+        if (i == recovery_frame) encoder.set_bitrate(1'500'000);
+        encoder.encode(pixel, CMTimeMake(i, fps), i == recovery_frame);
     }
     encoder.finish();
     if (packets != frame_count) throw std::runtime_error("Encoder did not return all pattern frames");
     stream.close();
+    return hardware;
 }
 #else
-void probe(const char* path, Codec codec) {
+bool probe(const char* path, Codec codec, bool strict, unsigned start = 0) {
     std::ifstream stream(path, std::ios::binary);
     stream.exceptions(std::ios::badbit | std::ios::failbit);
-    Decoder decoder(width, height, fps, codec);
-    unsigned decoded = 0;
+    Decoder decoder(width, height, fps, codec, strict);
+    unsigned decoded = start;
     auto check = [&](VideoFrame&& frame) {
         if (frame.width != width || frame.height != height || frame.bgra.size() != width * height * 4)
             throw std::runtime_error("Unexpected decoded geometry");
@@ -109,12 +120,17 @@ void probe(const char* path, Codec codec) {
         if (n == 0 || n > wire::max_frame_bytes) throw std::runtime_error("Invalid test access unit");
         std::vector<uint8_t> access_unit(n);
         stream.read(reinterpret_cast<char*>(access_unit.data()), n);
+        if (i < start) continue;
         decoder.decode(access_unit, check);
         std::cout << "After access unit " << i + 1 << ", displayed " << decoded << " frame(s)\n";
-        if (i == 2 && !decoded) throw std::runtime_error("Decoder did not present a live startup frame");
+        if (i == start + 2 && decoded == start) throw std::runtime_error("Decoder did not present a live startup frame");
     }
     decoder.finish(check);
     if (decoded != frame_count) throw std::runtime_error("Did not decode all pattern frames");
+    const bool hardware = decoder.hardware_accelerated();
+    if (strict && !hardware) throw std::runtime_error("Required hardware decoder did not produce hardware output");
+    std::cout << "Decoder: " << (hardware ? "hardware" : "software") << '\n';
+    return hardware;
 }
 #endif
 } // namespace
@@ -122,10 +138,22 @@ void probe(const char* path, Codec codec) {
 int main(int argc, char** argv) {
     if (argc < 2 || argc > 3) return 2;
     const std::string name = argc == 3 ? argv[2] : "h264";
-    if (name != "av1" && name != "h264") return 2;
+    if (name != "av1" && name != "h264" && name != "h265") return 2;
+    const Codec codec = name == "h265" ? Codec::h265 : name == "av1" ? Codec::av1 : Codec::h264;
     try {
-        probe(argv[1], name == "av1" ? Codec::av1 : Codec::h264);
+        const bool hardware = probe(argv[1], codec, false);
+#ifdef __APPLE__
+        if (hardware) probe(argv[1], codec, true);
+#else
+        // A fresh decoder must recover using only the requested keyframe and its successors.
+        probe(argv[1], codec, hardware, recovery_frame);
+#endif
         std::cout << "Checked " << frame_count << " " << name << " pattern frames\n";
+#ifdef _WIN32
+    } catch (const HevcDecoderUnavailable& error) {
+        std::cerr << error.what() << '\n';
+        return 78;
+#endif
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

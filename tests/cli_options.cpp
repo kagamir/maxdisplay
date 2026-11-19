@@ -39,12 +39,24 @@ int main() {
     try {
 #ifdef __APPLE__
         expect(invoke({"send", "example"}) == 0 && sender.width == 1920 && sender.height == 1080 &&
-               sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp,
+               sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp &&
+               sender.timeout_ms == 200 && sender.adaptive && !sender.require_hardware && !sender.legacy,
                "Unexpected Mac defaults");
         expect(invoke({"send", "example", "--codec", "av1", "--transport", "udp", "--size", "640x360",
                        "--scale", "1.5"}) == 0 && sender.width == 960 && sender.height == 540 &&
                sender.scale == 1.5 && sender.codec == Codec::av1 && sender.transport == Transport::udp,
                "Fractional scale or media selections lost");
+        expect(invoke({"send", "example", "--codec", "h265", "--require-hardware", "--frame-timeout-ms", "150",
+                       "--bitrate-mbps", "16", "--fixed-bitrate"}) == 0 && sender.codec == Codec::h265 &&
+               sender.require_hardware && sender.timeout_ms == 150 && sender.bitrate == 16'000'000 &&
+               !sender.adaptive && !sender.legacy, "HEVC streaming options lost");
+        expect(invoke({"send", "example", "--legacy"}) == 0 && sender.legacy && !sender.adaptive,
+               "Legacy protocol selected adaptive feedback");
+        invalid({"send", "example", "--legacy", "--codec", "hevc"});
+        invalid({"send", "example", "--legacy", "--frame-timeout-ms", "300"});
+        invalid({"send", "example", "--require-hardware", "--codec", "av1"});
+        invalid({"send", "example", "--frame-timeout-ms", "0"});
+        invalid({"send", "example", "--frame-timeout-ms", "60001"});
         expect(invoke({"send", "example", "--scale", "2", "--size", "641x361"}) == 0 &&
                sender.width == 1282 && sender.height == 722 && sender.scale == 2,
                "2x mode or option order mismatch");
@@ -59,9 +71,10 @@ int main() {
         invalid({"send", "example", "--codec", "unknown"});
         invalid({"send", "example", "--transport", "sctp"});
 #elif defined(_WIN32)
-        expect(invoke({}) == 0 && receiver.transport == Transport::tcp, "Unexpected Windows defaults");
-        expect(invoke({"receive", "--transport", "udp", "--port", "12345", "--windowed"}) == 0 &&
-               receiver.transport == Transport::udp && receiver.port == 12345 && receiver.windowed,
+        expect(invoke({}) == 0 && receiver.transport == Transport::tcp && !receiver.require_hardware,
+               "Unexpected Windows defaults");
+        expect(invoke({"receive", "--transport", "udp", "--port", "12345", "--windowed", "--require-hardware"}) == 0 &&
+               receiver.transport == Transport::udp && receiver.port == 12345 && receiver.windowed && receiver.require_hardware,
                "Windows UDP options lost");
         invalid({"receive", "--transport", "invalid"});
 #endif

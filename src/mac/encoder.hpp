@@ -12,14 +12,19 @@
 
 class Encoder {
 public:
-    using Output = std::function<void(std::vector<uint8_t>)>;
+    using Output = std::function<void(std::vector<uint8_t>, bool keyframe)>;
 
     Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output,
-            Codec codec = Codec::h264);
+            Codec codec = Codec::h264, bool require_hardware = false);
+    Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate,
+            std::function<void(std::vector<uint8_t>)> output, Codec codec = Codec::h264,
+            bool require_hardware = false);
     ~Encoder();
 
     // Call from the serial capture queue. Output can run on a VideoToolbox thread.
-    void encode(CVPixelBufferRef pixels, CMTime pts);
+    void encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe = false);
+    void set_bitrate(uint32_t bps);
+    bool hardware_accelerated() const;
     // May be polled from another thread, including while the desktop is idle.
     void check_error() const;
     // Call after capture has stopped and its queue is drained.

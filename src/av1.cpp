@@ -33,11 +33,11 @@ struct Context {
 
 struct Av1Encoder::Impl : Context {
     uint32_t width, height;
+    aom_codec_enc_cfg_t cfg{};
 
     Impl(uint32_t w, uint32_t h, uint32_t fps, uint32_t bitrate) : width(w), height(h) {
         if (!wire::valid_mode(w, h, fps, Codec::av1) || !bitrate)
             throw std::invalid_argument("Invalid AV1 encoder dimensions, frame rate or bitrate");
-        aom_codec_enc_cfg_t cfg{};
         check(aom_codec_enc_config_default(aom_codec_av1_cx(), &cfg, AOM_USAGE_REALTIME), "encoder defaults");
         cfg.g_w = w;
         cfg.g_h = h;
@@ -61,15 +61,16 @@ struct Av1Encoder::Impl : Context {
         check(aom_codec_control(&codec, AV1E_SET_COLOR_RANGE, AOM_CR_STUDIO_RANGE), "color range");
     }
 
-    void submit(aom_image_t* image, int64_t pts, const Output& output) {
-        check(aom_codec_encode(&codec, image, pts, image ? 1 : 0, 0), "encode frame");
+    void submit(aom_image_t* image, int64_t pts, const Output& output, bool force_keyframe = false) {
+        check(aom_codec_encode(&codec, image, pts, image ? 1 : 0, force_keyframe ? AOM_EFLAG_FORCE_KF : 0),
+              "encode frame");
         aom_codec_iter_t iter = nullptr;
         while (const auto* packet = aom_codec_get_cx_data(&codec, &iter)) {
             if (packet->kind != AOM_CODEC_CX_FRAME_PKT) continue;
             const auto& frame = packet->data.frame;
             if (!frame.sz || frame.sz > wire::max_frame_bytes) throw std::runtime_error("Invalid AV1 packet size");
             const auto* data = static_cast<const uint8_t*>(frame.buf);
-            output(std::vector<uint8_t>(data, data + frame.sz));
+            output(std::vector<uint8_t>(data, data + frame.sz), (frame.flags & AOM_FRAME_IS_KEY) != 0);
         }
     }
 };
@@ -79,7 +80,7 @@ Av1Encoder::Av1Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t b
 Av1Encoder::~Av1Encoder() = default;
 
 void Av1Encoder::encode_nv12(uint8_t* y, size_t y_stride, uint8_t* uv, size_t uv_stride,
-                             int64_t pts, const Output& output) {
+                             int64_t pts, const Output& output, bool force_keyframe) {
     if (!y || !uv || y_stride < impl_->width || uv_stride < impl_->width ||
         y_stride > std::numeric_limits<int>::max() || uv_stride > std::numeric_limits<int>::max())
         throw std::runtime_error("Invalid NV12 planes for AV1");
@@ -94,7 +95,16 @@ void Av1Encoder::encode_nv12(uint8_t* y, size_t y_stride, uint8_t* uv, size_t uv
     image.stride[AOM_PLANE_Y] = static_cast<int>(y_stride);
     image.stride[AOM_PLANE_U] = static_cast<int>(uv_stride);
     image.stride[AOM_PLANE_V] = 0;
-    impl_->submit(&image, pts, output);
+    impl_->submit(&image, pts, output, force_keyframe);
+}
+
+void Av1Encoder::set_bitrate(uint32_t bps) {
+    if (!bps) throw std::invalid_argument("AV1 bitrate must be positive");
+    auto next = impl_->cfg;
+    next.rc_target_bitrate = std::max(1u, bps / 1000);
+    if (next.rc_target_bitrate == impl_->cfg.rc_target_bitrate) return;
+    impl_->check(aom_codec_enc_config_set(&impl_->codec, &next), "update bitrate");
+    impl_->cfg = next;
 }
 
 void Av1Encoder::finish(const Output& output) { impl_->submit(nullptr, 0, output); }
@@ -147,3 +157,5 @@ void Av1Decoder::decode(const std::vector<uint8_t>& access_unit, const Output& o
 }
 
 void Av1Decoder::finish(const Output& output) { impl_->submit(nullptr, 0, output); }
+
+void Av1Decoder::reset() { impl_ = std::make_unique<Impl>(impl_->width, impl_->height); }

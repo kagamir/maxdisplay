@@ -192,11 +192,24 @@ void Socket::shutdown() const noexcept {
 bool Socket::peer_closed() const {
     if (handle_ == invalid || stopped_.load()) return true;
     char byte;
-    // A reverse-direction byte also invalidates this one-way connection.
     const auto result = recv(handle_, &byte, 1, MSG_PEEK);
-    if (result >= 0) return true;
+    if (result >= 0) return result == 0;
     const int error = last_error();
     return !would_block(error) && !interrupted(error);
+}
+
+std::size_t Socket::try_read(void* destination, std::size_t size) const {
+    if (!size) return 0;
+    const int chunk = static_cast<int>(std::min<std::size_t>(size, INT_MAX));
+    for (;;) {
+        if (stopped_.load()) throw std::runtime_error("Socket was shut down");
+        const auto count = recv(handle_, static_cast<char*>(destination), chunk, 0);
+        if (count > 0) return static_cast<std::size_t>(count);
+        if (count == 0) throw std::runtime_error("Peer disconnected");
+        const int error = last_error();
+        if (would_block(error)) return 0;
+        if (!interrupted(error)) throw socket_error("recv", error);
+    }
 }
 
 std::uint16_t Socket::local_port() const {

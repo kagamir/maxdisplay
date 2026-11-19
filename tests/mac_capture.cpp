@@ -11,7 +11,8 @@
 #include <csignal>
 #include <future>
 #include <iostream>
-#include <optional>
+#include <memory>
+#include <utility>
 #include <stdexcept>
 #include <string_view>
 
@@ -35,16 +36,18 @@ void capture(Codec codec, Transport transport) {
     options.transport = transport;
     options.host = "127.0.0.1";
     options.fps = 30;
+    // Leave time to decode the scaled AV1 keyframe on a shared runner.
+    options.timeout_ms = 1000;
     const bool scaled = codec == Codec::av1;
     set_display_size(options, 1280, 720, scaled ? 2.0 : 1.0);
     const uint32_t expected_width = scaled ? 2560 : 1280;
     const uint32_t expected_height = scaled ? 1440 : 720;
 
     net::Socket tcp;
-    std::optional<udp::Listener> datagrams;
+    std::unique_ptr<udp::Listener> incoming_udp;
     if (transport == Transport::udp) {
-        datagrams.emplace(options.host, 0);
-        options.port = datagrams->local_port();
+        incoming_udp = std::make_unique<udp::Listener>(options.host, 0);
+        options.port = incoming_udp->local_port();
     } else {
         tcp = net::listen_tcp(options.host, 0);
         options.port = tcp.local_port();
@@ -53,8 +56,9 @@ void capture(Codec codec, Transport transport) {
     std::promise<void> stopped;
     auto stopped_future = stopped.get_future();
     auto receive = std::async(std::launch::async, [&] {
+        // Release the listener if validation fails, so the sender observes disconnect.
+        auto datagrams = std::move(incoming_udp);
         wire::Header mode{};
-        std::vector<uint8_t> frame;
         net::Socket peer;
         if (datagrams) {
             if (!datagrams->accept(8000)) throw std::runtime_error("UDP sender did not connect");
@@ -62,21 +66,62 @@ void capture(Codec codec, Transport transport) {
             if (datagrams->receive(header, 15000) != udp::ReadResult::message)
                 throw std::runtime_error("No UDP stream header");
             mode = wire::decode_header(header);
-            if (datagrams->receive(frame, 15000) != udp::ReadResult::message)
-                throw std::runtime_error("No UDP video frame");
         } else {
             if (!net::wait_readable(tcp, 8000)) throw std::runtime_error("TCP sender did not connect");
             peer = net::accept_tcp(tcp);
             if (!peer) throw std::runtime_error("TCP connection withdrawn");
             mode = wire::receive_header(peer);
-            if (!wire::receive_frame(peer, frame)) throw std::runtime_error("No TCP video frame");
         }
-        if (mode.width != expected_width || mode.height != expected_height || mode.fps != options.fps || mode.codec != codec)
+        if (mode.width != expected_width || mode.height != expected_height || mode.fps != options.fps ||
+            mode.codec != codec || mode.timeout_ms != options.timeout_ms)
             throw std::runtime_error("Unexpected captured desktop mode");
-        if (codec == Codec::av1) check_av1(frame, expected_width, expected_height);
-        else if (frame.size() < 5 || frame[0] || frame[1] || frame[2] ||
-                 frame[3] != 1 || (frame[4] & 31) != 7)
-            throw std::runtime_error("Expected an H.264 access unit beginning with SPS");
+        auto receive_frame = [&] {
+            std::vector<uint8_t> message;
+            if (datagrams) {
+                if (datagrams->receive(message, 8000) != udp::ReadResult::message)
+                    throw std::runtime_error("No UDP video frame");
+            } else if (!net::wait_readable(peer, 8000) || !wire::receive_frame(peer, message)) {
+                throw std::runtime_error("No TCP video frame");
+            }
+            return wire::unpack_frame(message);
+        };
+        auto feedback = [&](uint32_t sequence, bool request_keyframe) {
+            auto bytes = wire::pack_feedback({sequence, request_keyframe});
+            if (datagrams) datagrams->send_feedback(bytes);
+            else peer.write_all(bytes.data(), bytes.size());
+        };
+        auto check_keyframe = [&](const wire::Frame& key) {
+            if (!key.keyframe) throw std::runtime_error("Missing keyframe flag");
+            if (codec == Codec::av1) {
+                check_av1(key.data, expected_width, expected_height);
+                return;
+            }
+            const auto& au = key.data;
+            if (au.size() < 6 || au[0] || au[1] || au[2] || au[3] != 1)
+                throw std::runtime_error("Expected an Annex B keyframe");
+            if (codec == Codec::h264 ? (au[4] & 31) != 7 : ((au[4] >> 1) & 63) != 32)
+                throw std::runtime_error("Recovery frame did not begin with codec parameter sets");
+        };
+        auto first = receive_frame();
+        check_keyframe(first);
+        feedback(first.sequence, true);
+        // Request a standalone picture even when no application is updating the desktop.
+        auto wait_key = [&](uint32_t previous, bool acknowledge_deltas) {
+            const auto deadline = std::chrono::steady_clock::now() + 8s;
+            do {
+                auto next = receive_frame();
+                if (next.keyframe && next.sequence > previous) {
+                    check_keyframe(next);
+                    return next.sequence;
+                }
+                if (acknowledge_deltas) feedback(next.sequence, false);
+            } while (std::chrono::steady_clock::now() < deadline);
+            throw std::runtime_error("Mac did not send a recovery keyframe");
+        };
+        auto recovery = wait_key(first.sequence, true);
+        // Simulate the last picture going missing: send no feedback or further request.
+        auto retry = wait_key(recovery, false);
+        feedback(retry, false);
         std::raise(SIGINT);
         stopped_future.wait_for(4s);
     });
@@ -90,7 +135,7 @@ void capture(Codec codec, Transport transport) {
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
     const std::string_view profile = argv[1];
-    if (profile != "h264-tcp" && profile != "av1-udp") return 2;
+    if (profile != "h264-tcp" && profile != "h265-udp" && profile != "av1-udp") return 2;
     if (!CGPreflightScreenCaptureAccess()) {
         std::cout << "Skipping live desktop capture: Screen Recording permission is required\n";
         return 77;
@@ -100,6 +145,9 @@ int main(int argc, char** argv) {
         if (profile == "av1-udp") {
             capture(Codec::av1, Transport::udp);
             std::cout << "Captured and decoded a 2560x1440 AV1/UDP desktop at scale 2\n";
+        } else if (profile == "h265-udp") {
+            capture(Codec::h265, Transport::udp);
+            std::cout << "Captured H.265/UDP desktop and requested a fresh keyframe\n";
         } else {
             capture(Codec::h264, Transport::tcp);
             std::cout << "Captured a 1280x720 H.264/TCP desktop at scale 1\n";

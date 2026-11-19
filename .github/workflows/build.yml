@@ -100,11 +100,23 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      - name: Encode H.264 and AV1 test patterns on Mac
+      - name: Encode H.264, H.265 and AV1 test patterns on Mac
         if: runner.os == 'macOS'
         run: |
           ./build/Release/codec_probe h264.frames h264
+          ./build/Release/codec_probe h265.frames h265
           ./build/Release/codec_probe av1.frames av1
+
+      - name: Independently decode VideoToolbox streams and restart at the forced keyframe
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+          python3 tests/check_bitstream.py h264 h264.frames
+          python3 tests/check_bitstream.py hevc h265.frames
 
       - name: Store encoded test fixture
         if: runner.os == 'macOS'
@@ -113,6 +125,7 @@ jobs:
           name: mac-encoded-fixture
           path: |
             h264.frames
+            h265.frames
             av1.frames
           retention-days: 1
           if-no-files-found: error
@@ -132,15 +145,26 @@ jobs:
           name: windows-video-tests
           path: tools
       - *media-foundation
-      - name: Check H.264 and AV1 decoded pixels and frame order
+      - name: Decode all formats from a cold start and recover at a forced keyframe
+        id: decode
         run: |
-          foreach ($codec in 'h264', 'av1') {
+          $available = @()
+          foreach ($codec in 'h264', 'h265', 'av1') {
             .\tools\codec_probe.exe "fixture/$codec.frames" $codec
+            if ($codec -eq 'h265' -and $LASTEXITCODE -eq 78) {
+              Write-Warning "No Media Foundation HEVC decoder is registered on this runner. Windows H.265 decode and display tests skipped."
+              continue
+            }
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $available += $codec
           }
-      - name: Check live Windows presentation over TCP and UDP
+          "codecs=$($available -join ',')" >> $env:GITHUB_OUTPUT
+          exit 0
+      - name: Check loss, deadline recovery and live Windows presentation over TCP and UDP
+        env:
+          CODECS: ${{ steps.decode.outputs.codecs }}
         run: |
-          foreach ($codec in 'h264', 'av1') {
+          foreach ($codec in $env:CODECS.Split(',')) {
             foreach ($transport in 'tcp', 'udp') {
               .\tools\windows_present_tests.exe "fixture/$codec.frames" $codec $transport
               if ($LASTEXITCODE -eq 77) {

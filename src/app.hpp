@@ -17,6 +17,10 @@ struct SenderOptions {
     Codec codec = Codec::h264;
     Transport transport = Transport::tcp;
     double scale = 1.0;
+    std::uint32_t timeout_ms = 200;
+    bool adaptive = true;
+    bool require_hardware = false;
+    bool legacy = false;
 };
 
 struct ReceiverOptions {
@@ -24,6 +28,7 @@ struct ReceiverOptions {
     std::uint16_t port = default_port;
     bool windowed = false;
     Transport transport = Transport::tcp;
+    bool require_hardware = false;
 };
 
 int run_cli(int argc, char** argv);

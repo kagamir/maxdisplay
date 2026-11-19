@@ -23,6 +23,7 @@ using namespace std::chrono_literals;
 constexpr enet_uint32 protocol_id = 0x4d584455; // MXDU, ENet connect handshake
 constexpr std::size_t backlog_bytes = 2 * wire::max_frame_bytes;
 constexpr std::size_t backlog_messages = 32;
+constexpr std::size_t live_backlog_messages = 3;
 
 struct Runtime {
     Runtime() {
@@ -72,7 +73,12 @@ struct Sender::Impl {
     Host host{nullptr, enet_host_destroy};
     ENetPeer* peer = nullptr;
     std::mutex mutex;
-    std::deque<std::vector<std::uint8_t>> queue;
+    struct Message {
+        std::vector<std::uint8_t> bytes;
+        enet_uint32 flags;
+    };
+    std::deque<Message> queue;
+    std::optional<std::vector<std::uint8_t>> feedback;
     std::size_t outstanding_bytes = 0;
     std::size_t outstanding_messages = 0;
     std::exception_ptr error;
@@ -103,22 +109,26 @@ struct Sender::Impl {
         if (worker.joinable()) worker.join();
     }
 
-    void enqueue(const std::vector<std::uint8_t>& bytes) {
+    bool enqueue(const std::vector<std::uint8_t>& bytes, enet_uint32 flags) {
         if (bytes.empty() || bytes.size() > wire::max_frame_bytes)
             throw std::runtime_error("UDP message is outside protocol size limits");
         std::lock_guard lock(mutex);
         if (error) std::rethrow_exception(error);
         if (stopping || closed) throw std::runtime_error("UDP connection closed");
-        if (outstanding_messages >= backlog_messages || bytes.size() > backlog_bytes - outstanding_bytes)
-            throw std::runtime_error("UDP receiver is too slow. Try a lower bitrate or frame rate.");
-        queue.push_back(bytes);
+        const bool reliable = flags == ENET_PACKET_FLAG_RELIABLE;
+        if (outstanding_messages >= (reliable ? backlog_messages : live_backlog_messages) ||
+            bytes.size() > backlog_bytes - outstanding_bytes) {
+            if (reliable) throw std::runtime_error("UDP receiver is too slow. Try a lower bitrate or frame rate.");
+            return false;
+        }
+        queue.push_back({bytes, flags});
         ++outstanding_messages;
         outstanding_bytes += bytes.size();
+        return true;
     }
 
-    static void ENET_CALLBACK acknowledged(ENetPacket* packet) {
-        // ENet calls this on acknowledgment or teardown. Count retained messages
-        // as well as queued ones to bound memory if connectivity deteriorates.
+    static void ENET_CALLBACK released(ENetPacket* packet) {
+        // Count queued and in-flight packets until ENet releases them.
         auto* self = static_cast<Impl*>(packet->userData);
         std::lock_guard lock(self->mutex);
         --self->outstanding_messages;
@@ -126,20 +136,21 @@ struct Sender::Impl {
     }
 
     void submit_pending() {
-        std::deque<std::vector<std::uint8_t>> pending;
+        std::deque<Message> pending;
         {
             std::lock_guard lock(mutex);
             pending.swap(queue);
         }
-        for (const auto& bytes : pending) {
-            Packet packet(enet_packet_create(bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE),
+        for (const auto& message : pending) {
+            Packet packet(enet_packet_create(message.bytes.data(), message.bytes.size(), message.flags),
                           enet_packet_destroy);
             if (!packet) throw std::runtime_error("Cannot allocate UDP video packet");
             packet->userData = this;
-            packet->freeCallback = acknowledged;
+            packet->freeCallback = released;
+            // The reliable header precedes timed frames on the same ENet channel.
             if (enet_peer_send(peer, 0, packet.get()) != 0)
                 throw std::runtime_error("Could not send UDP video packet");
-            packet.release(); // ENet owns the packet until all fragments are acknowledged.
+            packet.release();
         }
     }
 
@@ -156,10 +167,16 @@ struct Sender::Impl {
                     close_deadline = Clock::now() + 2s;
                 }
                 const auto event = poll(host.get(), 2);
-                Packet unexpected(event.packet, enet_packet_destroy);
+                Packet packet(event.packet, enet_packet_destroy);
                 if (event.type == ENET_EVENT_TYPE_DISCONNECT) break;
-                if (event.type == ENET_EVENT_TYPE_RECEIVE)
-                    throw std::runtime_error("Unexpected data from UDP receiver");
+                if (event.type == ENET_EVENT_TYPE_RECEIVE) {
+                    if (!packet || packet->dataLength != wire::feedback_size)
+                        throw std::runtime_error("Invalid UDP feedback length");
+                    std::vector<std::uint8_t> bytes(packet->data, packet->data + packet->dataLength);
+                    wire::unpack_feedback(bytes);
+                    std::lock_guard lock(mutex);
+                    feedback = std::move(bytes);
+                }
                 if (Clock::now() >= close_deadline) break;
             }
         } catch (...) {
@@ -174,7 +191,17 @@ struct Sender::Impl {
 
 Sender::Sender(const std::string& host, std::uint16_t port) : impl_(std::make_unique<Impl>(host, port)) {}
 Sender::~Sender() = default;
-void Sender::send(const std::vector<std::uint8_t>& message) { impl_->enqueue(message); }
+void Sender::send(const std::vector<std::uint8_t>& message) {
+    impl_->enqueue(message, ENET_PACKET_FLAG_RELIABLE);
+}
+bool Sender::send_frame(const std::vector<std::uint8_t>& message) {
+    return impl_->enqueue(message, ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
+}
+std::optional<std::vector<std::uint8_t>> Sender::take_feedback() {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->error) std::rethrow_exception(impl_->error);
+    return std::exchange(impl_->feedback, std::nullopt);
+}
 bool Sender::peer_closed() const { return impl_->closed || impl_->stopping; }
 void Sender::shutdown() noexcept { impl_->stopping = true; }
 
@@ -234,6 +261,16 @@ void Listener::disconnect() noexcept {
         enet_peer_disconnect_now(impl_->peer, 0);
         impl_->peer = nullptr;
     }
+}
+
+void Listener::send_feedback(const std::vector<std::uint8_t>& message) {
+    if (!impl_->peer) throw std::logic_error("No active UDP session");
+    wire::unpack_feedback(message);
+    Packet packet(enet_packet_create(message.data(), message.size(), 0), enet_packet_destroy);
+    if (!packet || enet_peer_send(impl_->peer, 0, packet.get()) != 0)
+        throw std::runtime_error("Could not send UDP receiver feedback");
+    packet.release();
+    enet_host_flush(impl_->host.get());
 }
 
 } // namespace udp

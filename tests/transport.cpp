@@ -102,6 +102,56 @@ void large_frame() {
     sending.get();
 }
 
+void timed_frames_and_feedback() {
+    Connection connection;
+    wire::send_header(connection.writer, 3840, 2160, 60, Codec::h265, 125);
+    const auto header = wire::receive_header(connection.reader);
+    require(header.codec == Codec::h265 && header.timeout_ms == 125, "Timed header lost codec or deadline");
+    const auto bytes = wire::pack_frame({0xffffffff, 0x0102030405060708ull, true, {0x65}});
+    require(bytes == Bytes{255,255,255,255, 1,2,3,4,5,6,7,8, 0,0,0,1, 0x65}, "Timed frame byte layout changed");
+    wire::send_frame(connection.writer, bytes);
+    Bytes payload;
+    require(wire::receive_frame(connection.reader, payload), "Expected frame envelope");
+    const auto frame = wire::unpack_frame(payload);
+    require(frame.sequence == 0xffffffff && frame.timestamp_us == 0x0102030405060708ull &&
+            frame.keyframe && frame.data == Bytes{0x65}, "Timed frame mismatch");
+    require(wire::unpack_frame(wire::pack_frame({0, 0, false, {1}})).sequence == 0, "Cannot wrap sequence");
+
+    auto request = wire::pack_feedback({0x01020304, true});
+    require(request == Bytes{'M','X','F','B', 1,2,3,4, 0,0,0,1}, "Feedback layout changed");
+    Bytes record(wire::feedback_size);
+    require(connection.writer.try_read(record.data(), record.size()) == 0, "No feedback expected yet");
+    connection.reader.write_all(request.data(), 1);
+    require(net::wait_readable(connection.writer, 1000) && !connection.writer.peer_closed(),
+            "Feedback mistaken for disconnect");
+    require(connection.writer.try_read(record.data(), record.size()) == 1, "Split feedback lost");
+    connection.reader.write_all(request.data() + 1, request.size() - 1);
+    require(connection.writer.read_exact(record.data() + 1, record.size() - 1), "Feedback truncated");
+    const auto feedback = wire::unpack_feedback(record);
+    require(feedback.sequence == 0x01020304 && feedback.request_keyframe, "Keyframe request lost");
+    connection.reader = {};
+    require(net::wait_readable(connection.writer, 1000), "Missing EOF");
+    expect_failure([&] { connection.writer.try_read(record.data(), record.size()); }, "EOF mistaken for would-block");
+
+    auto bad = wire::encode_header(header);
+    bad.back() = 0;
+    expect_failure([&] { wire::decode_header(bad); }, "v3 accepted zero deadline");
+    bad[24] = 1;
+    expect_failure([&] { wire::decode_header(bad); }, "v3 accepted excessive deadline");
+    bad.pop_back();
+    expect_failure([&] { wire::decode_header(bad); }, "v3 accepted truncated header");
+    payload[15] = 2;
+    expect_failure([&] { wire::unpack_frame(payload); }, "Invalid frame flags accepted");
+    payload.resize(16);
+    expect_failure([&] { wire::unpack_frame(payload); }, "Empty timed access unit accepted");
+    expect_failure([&] { wire::unpack_feedback({}); }, "Empty feedback accepted");
+    request.back() = 2;
+    expect_failure([&] { wire::unpack_feedback(request); }, "Unknown feedback flags accepted");
+    request.back() = 1;
+    request.front() = 0;
+    expect_failure([&] { wire::unpack_feedback(request); }, "Invalid feedback magic accepted");
+}
+
 void malformed_header(Bytes bytes) {
     Connection connection;
     connection.writer.write_all(bytes.data(), bytes.size());
@@ -147,6 +197,7 @@ int main() {
         round_trip();
         check_layout();
         codec_headers();
+        timed_frames_and_feedback();
         large_frame();
         auto header = hello;
         header[0] = 0;

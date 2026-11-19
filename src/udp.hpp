@@ -2,18 +2,21 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace udp {
 
-// Each message is one reliable, ordered ENet packet. ENet fragments messages
-// into MTU-sized UDP datagrams; caller-supplied message boundaries survive.
+// ENet preserves message boundaries, including messages larger than the MTU.
 class Sender {
 public:
     Sender(const std::string& host, std::uint16_t port);
     ~Sender();
     void send(const std::vector<std::uint8_t>& message);
+    // Timed frames use sequenced unreliable delivery. False means the local queue is full.
+    bool send_frame(const std::vector<std::uint8_t>& message);
+    std::optional<std::vector<std::uint8_t>> take_feedback();
     bool peer_closed() const;
     void shutdown() noexcept;
 
@@ -33,6 +36,7 @@ public:
     std::uint16_t local_port() const;
     bool accept(unsigned timeout_ms);
     ReadResult receive(std::vector<std::uint8_t>& message, unsigned timeout_ms);
+    void send_feedback(const std::vector<std::uint8_t>& message);
     void disconnect() noexcept;
 
 private:

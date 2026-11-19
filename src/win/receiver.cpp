@@ -1,6 +1,7 @@
 #include "app.hpp"
 #include "decoder.hpp"
 #include "display_info.hpp"
+#include "frame_recovery.hpp"
 #include "net.hpp"
 #include "udp.hpp"
 #include "wire.hpp"
@@ -12,6 +13,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <deque>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -37,6 +40,7 @@ struct Receiver {
     std::uint16_t port = 0;
     Transport transport = Transport::tcp;
     std::wstring address_text;
+    bool require_hardware = false;
     bool fullscreen = false;
     WINDOWPLACEMENT windowed_placement{};
     std::exception_ptr listener_error; // Read after joining the worker.
@@ -87,19 +91,68 @@ struct Receiver {
         InvalidateRect(window, nullptr, FALSE);
     }
 
-    template<class ReadHeader, class ReadFrame>
-    void receive_stream(ReadHeader read_header, ReadFrame read_frame) {
+    template<class ReadFrame, class SendFeedback>
+    void receive_live(wire::Header header, Decoder& decoder, ReadFrame& read_frame, SendFeedback& feedback) {
+        using Clock = std::chrono::steady_clock;
+        FrameRecovery recovery(header.timeout_ms);
+        std::deque<Clock::time_point> deadlines;
+        bool used_decoder = false;
+        auto display = [&](VideoFrame&& decoded) {
+            if (deadlines.empty()) return;
+            const auto deadline = deadlines.front();
+            deadlines.pop_front();
+            if (Clock::now() <= deadline && !recovery.waiting_for_keyframe())
+                present(std::move(decoded));
+            else
+                recovery.recover();
+        };
+
+        std::vector<std::uint8_t> bytes;
+        while (!stopping && read_frame(bytes)) {
+            const auto now = Clock::now();
+            const auto arrival = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch());
+            const auto packet = wire::unpack_frame(bytes);
+            if (!deadlines.empty() && now > deadlines.front()) recovery.recover();
+            const bool keyframe = packet.keyframe && has_recovery_picture(header.codec, packet.data);
+            const auto action = recovery.inspect(packet.sequence, packet.timestamp_us, keyframe, arrival.count());
+            if (action != FrameRecovery::Action::drop) {
+                if (action == FrameRecovery::Action::restart) {
+                    deadlines.clear();
+                    if (used_decoder) decoder.reset();
+                }
+                used_decoder = true;
+                deadlines.push_back(now + std::chrono::microseconds(recovery.remaining_us()));
+                try {
+                    decoder.decode(packet.data, display);
+                } catch (const HardwareDecodeUnavailable&) {
+                    throw;
+                } catch (const std::runtime_error& e) {
+                    std::cerr << "Discarding damaged " << codec_name(header.codec)
+                              << " frame " << packet.sequence << ": " << e.what() << '\n';
+                    recovery.recover();
+                }
+            }
+            const auto ack = wire::pack_feedback({recovery.sequence(), recovery.waiting_for_keyframe()});
+            feedback(ack);
+        }
+        if (!stopping && used_decoder && !recovery.waiting_for_keyframe()) decoder.finish(display);
+    }
+
+    template<class ReadHeader, class ReadFrame, class SendFeedback>
+    void receive_stream(ReadHeader read_header, ReadFrame read_frame, SendFeedback feedback) {
         show_status(L"Mac connected. Waiting for video");
         const wchar_t* next_status = L"Stream ended. Waiting for the Mac to reconnect";
         try {
             const auto header = read_header();
-            Decoder decoder(header.width, header.height, header.fps, header.codec);
-            auto display = [this](VideoFrame&& decoded) { present(std::move(decoded)); };
-            std::vector<std::uint8_t> bytes;
-            while (!stopping && read_frame(bytes)) {
-                decoder.decode(bytes, display);
+            Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
+            if (header.timeout_ms) {
+                receive_live(header, decoder, read_frame, feedback);
+            } else {
+                auto display = [this](VideoFrame&& decoded) { present(std::move(decoded)); };
+                std::vector<std::uint8_t> bytes;
+                while (!stopping && read_frame(bytes)) decoder.decode(bytes, display);
+                if (!stopping) decoder.finish(display);
             }
-            if (!stopping) decoder.finish(display);
         } catch (const std::exception& e) {
             if (!stopping) std::cerr << "Stream error: " << e.what() << '\n';
             next_status = L"Stream error. See the console for details. Waiting for a connection";
@@ -119,7 +172,8 @@ struct Receiver {
                 active = client;
             }
             receive_stream([&] { return wire::receive_header(*client); },
-                           [&](auto& bytes) { return wire::receive_frame(*client, bytes); });
+                           [&](auto& bytes) { return wire::receive_frame(*client, bytes); },
+                           [&](const auto& ack) { client->write_all(ack.data(), ack.size()); });
             std::lock_guard lock(mutex);
             active.reset();
         }
@@ -142,7 +196,7 @@ struct Receiver {
                 std::vector<std::uint8_t> bytes;
                 if (!read(bytes)) throw std::runtime_error("UDP stream ended before its header");
                 return wire::decode_header(bytes);
-            }, read);
+            }, read, [&](const auto& ack) { listener.send_feedback(ack); });
             listener.disconnect();
         }
     }
@@ -351,6 +405,7 @@ int run_receiver(const ReceiverOptions& options) {
     receiver.binding = win_info::resolve_binding(options.bind, options.transport == Transport::udp);
     receiver.port = options.port;
     receiver.transport = options.transport;
+    receiver.require_hardware = options.require_hardware;
     receiver.refresh_addresses();
     HWND window = CreateWindowExW(0, window_class, L"MaxDisplay", WS_OVERLAPPEDWINDOW,
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1000, 620,

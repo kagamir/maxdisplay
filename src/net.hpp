@@ -27,11 +27,13 @@ public:
 
     // Safe alongside reads/writes. Keep the Socket alive until those calls return.
     void shutdown() const noexcept;
-    // Sender-side probe for the one-way protocol. The peer never sends data.
+    // Probe without consuming incoming feedback.
     bool peer_closed() const;
 
     // Returns false on EOF before the first byte. A partial read at EOF throws.
     bool read_exact(void* destination, std::size_t size) const;
+    // Returns zero if no data is ready. EOF and connection failures throw.
+    std::size_t try_read(void* destination, std::size_t size) const;
     void write_all(const void* source, std::size_t size) const;
 
     NativeSocket native_handle() const noexcept { return handle_; }
