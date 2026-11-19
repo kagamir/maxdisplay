@@ -1,0 +1,123 @@
+name: Build MaxDisplay
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-15
+            artifact: maxdisplay-macos-arm64
+            path: maxdisplay-macos-arm64.tar.gz
+          - name: Windows x64
+            runner: windows-2022
+            artifact: maxdisplay-windows-x64
+            path: build/Release/maxdisplay.exe
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure macOS
+        if: runner.os == 'macOS'
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DBUILD_TESTING=ON
+
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+
+      - &media-foundation
+        name: Enable Media Foundation on Windows Server
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (-not (Get-WindowsFeature Server-Media-Foundation).Installed) {
+            $result = Install-WindowsFeature Server-Media-Foundation -ErrorAction Stop
+            if (-not $result.Success) { throw "Media Foundation installation failed" }
+          }
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+
+      - name: Check macOS executable and preserve its file mode
+        if: runner.os == 'macOS'
+        run: |
+          ./build/Release/maxdisplay --help
+          tar -C build/Release -czf maxdisplay-macos-arm64.tar.gz maxdisplay
+
+      - name: Check Windows executable
+        if: runner.os == 'Windows'
+        run: .\build\Release\maxdisplay.exe --help
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+      - name: Store Windows test executables
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-video-tests
+          path: |
+            build/Release/codec_probe.exe
+            build/Release/windows_present_tests.exe
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Encode Mac test pattern
+        if: runner.os == 'macOS'
+        run: ./build/Release/codec_probe test-pattern.frames
+
+      - name: Store encoded test fixture
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-encoded-fixture
+          path: test-pattern.frames
+          retention-days: 1
+          if-no-files-found: error
+
+  codec-interop:
+    name: Decode and display Mac test pattern on Windows
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mac-encoded-fixture
+          path: fixture
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-video-tests
+          path: tools
+      - *media-foundation
+      - name: Check decoded frames
+        run: .\tools\codec_probe.exe fixture\test-pattern.frames
+      - name: Check live Windows presentation
+        run: |
+          .\tools\windows_present_tests.exe fixture\test-pattern.frames
+          if ($LASTEXITCODE -eq 77) {
+            Write-Warning "Window readback skipped in this desktop session."
+            exit 0
+          }
+          exit $LASTEXITCODE
