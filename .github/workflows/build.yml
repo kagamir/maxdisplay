@@ -3,6 +3,7 @@ name: Build MaxDisplay
 on:
   push:
     branches: [main]
+    tags: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -11,6 +12,7 @@ permissions:
 
 jobs:
   build:
+    if: github.event.deleted != true
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -66,10 +68,13 @@ jobs:
         if: runner.os == 'Windows'
         run: .\build\Release\maxdisplay.exe --help
 
-      - uses: actions/upload-artifact@v7
+      - name: Stage binary for the tagged release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
+          retention-days: 1
           if-no-files-found: error
 
       - name: Store Windows test executables
@@ -121,3 +126,44 @@ jobs:
             exit 0
           }
           exit $LASTEXITCODE
+
+  release:
+    name: Publish binaries to GitHub Releases
+    needs: codec-interop
+    if: github.event_name == 'push' && github.ref_type == 'tag' && !github.event.deleted
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: maxdisplay-macos-arm64
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: maxdisplay-windows-x64
+          path: dist
+      - name: Publish assets for the pushed tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          mv dist/maxdisplay.exe dist/maxdisplay-windows-x64.exe
+          assets=(dist/maxdisplay-macos-arm64.tar.gz dist/maxdisplay-windows-x64.exe)
+          for file in "${assets[@]}"; do test -s "$file"; done
+
+          if release=$(gh release view --json isDraft,assets -- "$TAG"); then
+            for file in "${assets[@]}"; do
+              if ! jq -e --arg name "${file##*/}" 'any(.assets[]; .name == $name and .size > 0)' <<<"$release" >/dev/null; then
+                gh release upload --clobber -- "$TAG" "$file"
+              fi
+            done
+            if jq -e '.isDraft' <<<"$release" >/dev/null; then
+              gh release edit --draft=false -- "$TAG"
+            fi
+          else
+            gh release create --verify-tag --generate-notes --title "$TAG" -- "$TAG" "${assets[@]}"
+          fi

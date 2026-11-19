@@ -6,13 +6,13 @@ MaxDisplay 使用一套 C++17 代码和一个 CMake 项目，按操作系统生�
 
 ## 开始使用
 
-在 [GitHub Actions](https://github.com/kagamir/maxdisplay/actions) 中打开一次成功的构建，在页面底部的 **Artifacts** 下载对应平台的程序。Windows x64 下载 `maxdisplay-windows-x64` 并解压。Apple Silicon Mac 下载 `maxdisplay-macos-arm64`，先解压 ZIP，再运行 `tar -xzf maxdisplay-macos-arm64.tar.gz` 取出可执行文件。也可以按照下文从源码构建。
+从 [GitHub Releases](https://github.com/kagamir/maxdisplay/releases) 打开所需版本，在 **Assets** 下载对应平台的程序。Windows x64 下载并运行 `maxdisplay-windows-x64.exe`。Apple Silicon Mac 下载 `maxdisplay-macos-arm64.tar.gz`，运行 `tar -xzf maxdisplay-macos-arm64.tar.gz` 即可取出 `maxdisplay`。推送 Git 标签后，CI 会在双平台构建及互通测试通过后，将这两个文件发布到同名 Release。
 
 1. 将两台电脑接入同一个可信局域网。在 Windows 上运行 `ipconfig` 找到当前网卡的 IPv4 地址。下文用 `192.168.1.50` 举例。
-2. 在 Windows PowerShell 中启动接收端。直接双击 `maxdisplay.exe` 也会进入接收模式。防火墙若询问网络访问，请允许专用网络上的入站连接。
+2. 在 Windows PowerShell 中启动接收端。直接双击下载的程序也会进入接收模式。防火墙若询问网络访问，请允许专用网络上的入站连接。
 
    ```powershell
-   .\maxdisplay.exe receive
+   .\maxdisplay-windows-x64.exe receive
    ```
 
 3. 在 Mac 终端启动发送端，把地址换成 Windows 的实际地址。
@@ -29,7 +29,7 @@ MaxDisplay 使用一套 C++17 代码和一个 CMake 项目，按操作系统生�
 ## 调整画质和监听地址
 
 ```powershell
-.\maxdisplay.exe receive --bind 192.168.1.50 --port 49301 --windowed
+.\maxdisplay-windows-x64.exe receive --bind 192.168.1.50 --port 49301 --windowed
 ```
 
 ```bash
