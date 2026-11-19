@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 
 namespace {
@@ -26,7 +27,11 @@ extern "C" OSStatus TestVTEncodeFrame(VTCompressionSessionRef session, CVImageBu
     return VTCompressionSessionEncodeFrame(session, image, pts, duration, properties, refcon, flags);
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 2) return 2;
+    const std::string_view name = argv[1];
+    if (name != "h264" && name != "h265") return 2;
+    const Codec codec = name == "h265" ? Codec::h265 : Codec::h264;
     try {
         constexpr unsigned width = 320, height = 180;
         CVPixelBufferRef pixel = nullptr;
@@ -44,10 +49,10 @@ int main() {
 
         unsigned pictures = 0;
         Encoder encoder(width, height, 30, 1'000'000, [&](std::vector<uint8_t> au, bool key) {
-            if (pictures < 2 && (!key || !has_recovery_picture(Codec::h264, au)))
+            if (pictures < 2 && (!key || !has_recovery_picture(codec, au)))
                 throw std::runtime_error("Backend started with a dependent picture");
             ++pictures;
-        });
+        }, codec);
         if (!encoder.hardware_accelerated()) {
             std::cout << "Hardware encoder unavailable for runtime failure injection\n";
             return 77;
@@ -59,7 +64,7 @@ int main() {
         if (reject_next || encoder.hardware_accelerated() || pictures != 3)
             throw std::runtime_error("Failed hardware input was not recovered exactly once in software");
         encoder.finish();
-        std::cout << "Recovered hardware submission failure with a software H.264 sync picture\n";
+        std::cout << "Recovered hardware submission failure with a software " << codec_name(codec) << " sync picture\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

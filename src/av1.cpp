@@ -142,15 +142,19 @@ struct Av1Decoder::Impl : Context {
 Av1Decoder::Av1Decoder(uint32_t width, uint32_t height) : impl_(std::make_unique<Impl>(width, height)) {}
 Av1Decoder::~Av1Decoder() = default;
 
+bool Av1Decoder::can_start_with(const std::vector<uint8_t>& unit) const {
+    aom_codec_stream_info_t info{};
+    return !unit.empty() && unit.size() <= wire::max_frame_bytes &&
+           aom_codec_peek_stream_info(aom_codec_av1_dx(), unit.data(), unit.size(), &info) == AOM_CODEC_OK &&
+           info.is_kf && info.w == impl_->width && info.h == impl_->height;
+}
+
 void Av1Decoder::decode(const std::vector<uint8_t>& access_unit, const Output& output) {
     if (access_unit.empty() || access_unit.size() > wire::max_frame_bytes)
         throw std::runtime_error("Invalid AV1 access unit length");
     if (impl_->first) {
-        aom_codec_stream_info_t info{};
-        impl_->check(aom_codec_peek_stream_info(aom_codec_av1_dx(), access_unit.data(), access_unit.size(), &info),
-                     "read initial sequence header");
-        if (!info.is_kf || info.w != impl_->width || info.h != impl_->height)
-            throw std::runtime_error("AV1 sequence header conflicts with the negotiated dimensions");
+        if (!can_start_with(access_unit))
+            throw std::runtime_error("Expected an AV1 keyframe at the negotiated dimensions");
         impl_->first = false;
     }
     impl_->submit(access_unit.data(), access_unit.size(), output);

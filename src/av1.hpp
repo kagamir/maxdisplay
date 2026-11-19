@@ -27,6 +27,7 @@ public:
     Av1Decoder(uint32_t width, uint32_t height);
     ~Av1Decoder();
 
+    bool can_start_with(const std::vector<uint8_t>& access_unit) const;
     void decode(const std::vector<uint8_t>& access_unit, const Output& output);
     void reset();
     void finish(const Output& output);

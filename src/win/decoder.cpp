@@ -470,12 +470,22 @@ Decoder::~Decoder() = default;
 
 void Decoder::fallback(const std::exception& error) {
     if (require_hardware_) throw HardwareDecodeUnavailable(error.what());
-    impl_.reset();
     std::cerr << "Warning: " << codec_name(codec_) << " hardware decoding failed (" << error.what()
               << "). Switching to software decoding.\n";
-    if (codec_ == Codec::av1) av1_ = std::make_unique<Av1Decoder>(width_, height_);
-    else if (codec_ == Codec::h265) hevc_ = std::make_unique<HevcSoftwareDecoder>(width_, height_);
-    else impl_ = std::make_unique<Impl>(width_, height_, fps_, codec_, false);
+    // Build the replacement before releasing the previous backend. A permanent
+    // failure must end this session instead of leaving a half-initialized decoder.
+    try {
+        if (codec_ == Codec::h264) {
+            impl_ = std::make_unique<Impl>(width_, height_, fps_, codec_, false);
+        } else {
+            if (codec_ == Codec::av1) av1_ = std::make_unique<Av1Decoder>(width_, height_);
+            else hevc_ = std::make_unique<HevcSoftwareDecoder>(width_, height_);
+            impl_.reset();
+        }
+    } catch (const std::exception& software_error) {
+        throw HardwareDecodeUnavailable(std::string("Could not initialize software fallback after ") +
+                                        error.what() + ": " + software_error.what());
+    }
 }
 
 bool Decoder::hardware_accelerated() const { return impl_ && impl_->hardware; }
@@ -496,7 +506,10 @@ bool Decoder::decode(const std::vector<uint8_t>& unit, const Output& output) {
             if (!fresh_) return false;
         }
     }
-    if (waiting_for_sync_ && !has_recovery_picture(codec_, unit)) return false;
+    if (waiting_for_sync_) {
+        const bool key = av1_ ? av1_->can_start_with(unit) : has_recovery_picture(codec_, unit);
+        if (!key) return false;
+    }
     if (av1_) av1_->decode(unit, output);
     else if (hevc_) hevc_->decode(unit, output);
     else impl_->decode(unit, output);
