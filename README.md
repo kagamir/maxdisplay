@@ -56,7 +56,7 @@ Double-click `maxdisplay-windows-x64.exe`, or run it from PowerShell:
 .\maxdisplay-windows-x64.exe receive
 ```
 
-If Windows Firewall asks about network access, allow inbound connections on private networks.
+If Windows Firewall asks about network access, allow inbound TCP and UDP on the receiver port on private networks.
 
 The waiting screen lists the addresses the receiver is listening on and the pixel resolution of the monitor it is on. Addresses on the adapter with the default route come first. The examples below use `192.168.1.50`.
 
@@ -91,7 +91,7 @@ On the Mac, open **System Settings → Displays → Arrange** and drag **MaxDisp
 | Setting | Default |
 | --- | --- |
 | Codec | H.264 |
-| Transport | TCP, port 49300 |
+| Video transport | TCP. Windows listens on TCP and UDP at port 49300 |
 | Encryption | Off |
 | Stream resolution | The pixel resolution of the monitor the receiver window is on |
 | Frame rate | Up to 60 fps |
@@ -159,10 +159,10 @@ TCP is the default. It delivers everything in order, so data already written to 
 
 UDP splits each picture into fragments. Missing keyframe fragments are retransmitted individually, and a regular frame that loses a fragment is skipped. Choose UDP when low latency matters more than every frame on a network that drops packets, such as Wi-Fi.
 
-Set `--transport udp` on both sides, and allow that UDP port inbound in Windows Firewall. For example, this sends a 2560×1440 H.265 stream at up to 60 fps over Wi-Fi:
+Select `--transport udp` on the Mac. The same Windows receiver accepts TCP or UDP video on its configured port, one stream at a time. For example, this sends a 2560×1440 H.265 stream at up to 60 fps over Wi-Fi:
 
 ```powershell
-.\maxdisplay-windows-x64.exe receive --transport udp
+.\maxdisplay-windows-x64.exe receive
 ```
 
 ```bash
@@ -171,17 +171,17 @@ Set `--transport udp` on both sides, and allow that UDP port inbound in Windows 
 
 ### Mac pointer on Windows
 
-The Mac samples its pointer every 4 ms. A separate UDP connection carries its position and shape with either video transport. Windows draws the pointer over the video without moving the local Windows mouse. On a still desktop, moving the Mac pointer alone lets the video encoder stay idle after static refinement finishes.
+The Mac samples its pointer every 4 ms. With either video transport, the Mac sends pointer positions and shapes directly to the video receiver’s UDP port. Windows handles those packets independently of video decoding. Windows draws the pointer over the video without moving the local Windows mouse. On a still desktop, moving the Mac pointer alone lets the video encoder stay idle after static refinement finishes.
 
-The receiver chooses a temporary UDP port on its bind address and sends outbound probes to the Mac. The Mac keeps the pointer in video if it receives no cursor acknowledgement within one second of startup. During streaming it returns to video after two seconds without an acknowledgement. After acknowledgements resume for one second, Windows waits for a cursor-free video frame before showing the overlay again. To keep the pointer in the video throughout a session, add `--video-cursor` to the Mac command. This also skips the cursor handshake.
+Windows replies from the listening port when it receives a valid cursor packet from the Mac. The Mac keeps the pointer in video if it receives no cursor acknowledgement within one second of startup. During streaming it returns to video after two seconds without an acknowledgement. After acknowledgements resume for one second, Windows waits for a cursor-free video frame before showing the overlay again. To keep the pointer in the video throughout a session, add `--video-cursor` to the Mac command. This also skips the cursor handshake.
 
-If the sender reports a cursor timeout, check whether the firewall allows the MaxDisplay executable to exchange UDP traffic on the private network. A rule for TCP port 49300 alone may only allow video. No fixed second port is required.
+If the sender reports a cursor timeout, allow inbound UDP on the Windows receiver port (49300 by default). A TCP-only firewall rule can carry TCP video while the pointer falls back to the video.
 
 Pointer shapes are rasterized at the stream scale, up to 256×256 pixels. When macOS cannot supply the current shape, the viewer may show the standard arrow. Pointers drawn by an application into its own window remain part of the captured picture.
 
 ### Password encryption
 
-Start the Windows receiver and the Mac sender with the same nonempty password. Replace the example value with a long, randomly generated password. These commands use TCP. Add `--transport udp` to both for UDP.
+Start the Windows receiver and the Mac sender with the same nonempty password. Replace the example value with a long, randomly generated password. These commands use TCP. Add `--transport udp` on the Mac for UDP video.
 
 ```powershell
 .\maxdisplay-windows-x64.exe receive --password 'your-shared-password'
@@ -242,7 +242,7 @@ Add `--stats` on either side to print per-second statistics on that device. Use 
 | `--size WIDTHxHEIGHT` | Windows monitor ÷ scale | Logical size of the virtual desktop |
 | `--scale FACTOR` | `1` | Stream pixels per logical point. Any positive number, such as `1.5` or `2` |
 | `--codec NAME` | `h264` | `h264`, `h265` (or `hevc`) or `av1` |
-| `--transport NAME` | `tcp` | `tcp` or `udp`. Must match the receiver |
+| `--transport NAME` | `tcp` | Video transport (`tcp` or `udp`) |
 | `--fps FPS` | `60` | Frame rate ceiling, 1 to 120 |
 | `--bitrate-mbps MBPS` | `12` | Bitrate ceiling, 1 to 100 |
 | `--frame-timeout-ms MS` | `200` | Real-time frame budget, 1 to 60000 |
@@ -256,9 +256,8 @@ Add `--stats` on either side to print per-second statistics on that device. Use 
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--bind IP` | `0.0.0.0` | IPv4 address to listen on |
-| `--port PORT` | `49300` | Port to listen on |
-| `--transport NAME` | `tcp` | `tcp` or `udp`. Must match the sender |
+| `--bind IP` | `0.0.0.0` | Local address to listen on. IPv4 supports both video transports. An IPv6 address supports TCP video and the UDP pointer |
+| `--port PORT` | `49300` | Shared TCP and UDP listening port |
 | `--windowed` | off | Start in a window instead of full screen |
 | `--require-hardware` | off | Use a hardware decoder only |
 | `--stats` | off | Print per-second statistics |
@@ -274,13 +273,13 @@ Add `--stats` on either side to print per-second statistics on that device. Use 
 ## Troubleshooting
 
 **The Mac cannot connect.**
-Start the Windows receiver first. Use an address from its waiting screen, and make sure `--port` and `--transport` match on both sides. In Windows Firewall, allow inbound connections for MaxDisplay on private networks. That is TCP 49300 by default, or the UDP port when you use `--transport udp`.
+Start the Windows receiver first. Use an address from its waiting screen, and use the same `--port` on both sides. In Windows Firewall, allow inbound TCP and UDP for that port on private networks (49300 by default).
 
 **The sender stops and asks for Screen Recording.**
 Allow the terminal or app under **System Settings → Privacy & Security → Screen Recording**, quit it completely, reopen it, and run the command again.
 
 **The picture is soft or it stutters.**
-Add `--stats` on both sides to see where frames are lost or delayed. Raise `--bitrate-mbps` if the network has room. On Wi-Fi or any network that drops packets, try `--transport udp` on both sides.
+Add `--stats` on both sides to see where frames are lost or delayed. Raise `--bitrate-mbps` if the network has room. On Wi-Fi or any network that drops packets, try `--transport udp` on the Mac.
 
 **The sender rejects the size.**
 The stream cannot exceed 4096×2304, and with an explicit `--size` the width and height multiplied by `--scale` must be even integers. Pass a smaller or different `--size` and `--scale`.
@@ -357,7 +356,7 @@ MaxDisplay is one C++17 codebase and one CMake project that builds a single exec
 - **Virtual display and capture.** macOS creates the display through CoreGraphics' private `CGVirtualDisplay` interface and captures its image with ScreenCaptureKit. In local-pointer mode ScreenCaptureKit omits the system pointer.
 - **Encoding.** VideoToolbox runs in real-time mode with frame reordering off. H.264 keyframes carry SPS and PPS, and HEVC Main keyframes carry VPS, SPS and PPS, all sent as Annex B. AV1 uses libaom in a low-latency configuration.
 - **Protocol.** The v3 handshake negotiates codec, picture size, frame rate and timeout. Every access unit carries a sequence number, a sender timestamp and a flag marking real keyframes. The receiver reports its progress and requests keyframes.
-- **Pointer.** The peers negotiate temporary UDP ports and a session token before the v3 video header. Absolute positions are measured in eighths of a video pixel. A later position supersedes earlier ones. The sender repeats the final position until acknowledged, and uses selective acknowledgements to fill missing shape fragments. Windows caches the 64 most recent shapes and repaints only the areas affected by cursor motion. During a handoff, the cursor state can also specify the first video frame without a baked-in pointer.
+- **Pointer.** The receiver provides a session token before the v3 video header. For IPv4, one Windows UDP socket handles both ENet video and cursor datagrams. Absolute positions are measured in eighths of a video pixel. A later position supersedes earlier ones. The sender repeats the final position until acknowledged, and uses selective acknowledgements to fill missing shape fragments. Windows caches the 64 most recent shapes and repaints only the areas affected by cursor motion. During a handoff, the cursor state can also specify the first video frame without a baked-in pointer.
 - **Transport.** TCP prefixes each frame with a big-endian length. UDP uses ENet: the handshake and keyframes travel reliably, and all other frames go as droppable, sequenced messages.
 - **Display.** Windows builds the picture from the decoded YUV data, scales it proportionally and adds black bars when needed. The D3D11 path reads the actual decoded surface.
 

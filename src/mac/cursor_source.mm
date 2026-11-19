@@ -1,5 +1,6 @@
 #include "cursor_source.hpp"
 #include "cursor_image.hpp"
+#include "cursor_packet.hpp"
 
 #import <Foundation/Foundation.h>
 #include <pthread/qos.h>
@@ -69,7 +70,7 @@ struct CursorSource::Impl {
                 // Bound work per tick so a stream of unrelated UDP traffic
                 // cannot indefinitely postpone sampling or shutdown.
                 for (unsigned n = 0; n < 128 && socket.receive_from(from, packet); ++n) {
-                    if (from != peer || packet.empty()) continue;
+                    if (from != peer || !cursor::packet::unwrap(packet)) continue;
                     if (cipher) {
                         auto plain = cipher->open(packet);
                         if (plain) sender.acknowledge(now, *plain);
@@ -87,8 +88,7 @@ struct CursorSource::Impl {
                     }
                 }
                 sender.update(now, outgoing, source ? source->image() : cursor::Image{}, [&](const cursor::Bytes& bytes) {
-                    if (cipher) socket.send_to(peer, cipher->seal(bytes));
-                    else socket.send_to(peer, bytes);
+                    socket.send_to(peer, cursor::packet::wrap(cipher ? cipher->seal(bytes) : bytes));
                 });
                 std::lock_guard lock(mutex);
                 if (sender.last_ack() != previous_ack) route.ack(now);

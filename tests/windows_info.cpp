@@ -1,4 +1,5 @@
 #include "win/display_info.hpp"
+#include "net.hpp"
 
 #include <array>
 #include <iostream>
@@ -44,10 +45,12 @@ void check_addresses() {
                                                 L"192.0.2.7", L"192.0.2.2", L"192.0.2.1"};
     if (ranked != expected) throw std::runtime_error("Incorrect address ordering by route and interface metric");
 
-    auto binding = win_info::resolve_binding("127.0.0.1", false);
+    auto socket = net::listen_tcp("127.0.0.1", 0);
+    auto binding = win_info::socket_binding(socket.native_handle());
     if (win_info::listening_addresses(binding) != std::vector<std::wstring>{L"127.0.0.1"})
         throw std::runtime_error("Receiver advertised an address outside its binding");
-    auto all = win_info::listening_addresses(win_info::resolve_binding("0.0.0.0", true));
+    auto wildcard = net::listen_tcp("0.0.0.0", 0);
+    auto all = win_info::listening_addresses(win_info::socket_binding(wildcard.native_handle()));
     if (all.empty()) throw std::runtime_error("No IPv4 address returned from the Windows adapter list");
 }
 

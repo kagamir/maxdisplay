@@ -75,9 +75,9 @@ Bytes TcpChannel::exchange_query(Kind query_kind, const Bytes& query, Kind reply
     return session_->open(reply_kind, read_control(socket_, reply_size, deadline));
 }
 
-wire::CursorOffer TcpChannel::request_cursor(std::uint16_t port) {
-    if (!session_) return wire::request_cursor(socket_, port);
-    return wire::decode_cursor_reply(exchange_query(Kind::cursor_query, wire::encode_cursor_query(port),
+wire::CursorOffer TcpChannel::request_cursor() {
+    if (!session_) return wire::request_cursor(socket_);
+    return wire::decode_cursor_reply(exchange_query(Kind::cursor_query, wire::cursor_query,
                                                   Kind::cursor_reply, wire::cursor_reply_size));
 }
 
@@ -98,8 +98,9 @@ wire::Header TcpChannel::receive_header(const std::function<wire::DisplaySize()>
     const auto deadline = Clock::now() + wire::header_timeout;
     auto record = read_control(socket_, wire::header_size, deadline);
     if (record.front() == static_cast<std::uint8_t>(Kind::cursor_query)) {
-        const auto port = wire::decode_cursor_query(session_->open(Kind::cursor_query, record));
-        const auto reply = wire::encode_cursor_reply(cursor ? cursor(port) : wire::CursorOffer{});
+        if (session_->open(Kind::cursor_query, record) != wire::cursor_query)
+            throw std::runtime_error("Invalid encrypted cursor query");
+        const auto reply = wire::encode_cursor_reply(cursor ? cursor() : 0);
         wire::send_frame(socket_, session_->seal(Kind::cursor_reply, reply));
         record = read_control(socket_, wire::header_size, deadline);
     }

@@ -120,7 +120,7 @@ public:
     ~Connection() { close(); }
 
     std::unique_ptr<CursorSource> request_cursor() {
-        auto peer = udp_ ? udp_->peer_endpoint() : tcp_->peer_endpoint();
+        const auto peer = udp_ ? udp_->peer_endpoint() : tcp_->peer_endpoint();
         net::Socket side;
         try { side = net::bind_udp(peer.v6 ? "::" : "0.0.0.0"); }
         catch (const std::exception& e) {
@@ -128,14 +128,13 @@ public:
             return {};
         }
         // Errors on the authenticated control stream are session failures.
-        const auto offer = udp_ ? udp_->request_cursor(side.local_port()) : tcp_->request_cursor(side.local_port());
-        if (!offer.port) {
+        const auto token = udp_ ? udp_->request_cursor() : tcp_->request_cursor();
+        if (!token) {
             std::cerr << "Receiver cursor UDP unavailable, using video cursor.\n";
             return {};
         }
-        peer.port = offer.port;
         auto keys = udp_ ? udp_->datagrams() : tcp_->datagrams();
-        try { return std::make_unique<CursorSource>(std::move(side), peer, offer.token, std::move(keys)); }
+        try { return std::make_unique<CursorSource>(std::move(side), peer, token, std::move(keys)); }
         catch (const std::system_error& e) {
             std::cerr << "Cannot start cursor worker, using video cursor: " << e.what() << '\n';
             return {};
@@ -670,7 +669,8 @@ int stream_desktop(SenderOptions options) {
                             idle_handoff = cursor->movement();
                             std::clog << "Waiting for fresh cursor-free video, keeping video cursor.\n";
                         } else {
-                            std::clog << "Cursor UDP unavailable, using video cursor. Check the UDP firewall.\n";
+                            std::clog << "Cursor UDP unavailable, using video cursor. Check inbound UDP on Windows port "
+                                      << options.port << ".\n";
                         }
                     } else {
                         cursor->show_overlay(!handoff_deadline);
@@ -697,7 +697,8 @@ int stream_desktop(SenderOptions options) {
                 }
                 if (!warned && cursor->initial_timeout()) {
                     warned = true;
-                    std::clog << "No cursor UDP ACK within 1 s, using video cursor. Check the UDP firewall.\n";
+                    std::clog << "No cursor UDP ACK within 1 s, using video cursor. Check inbound UDP on Windows port "
+                              << options.port << ".\n";
                 }
             }
             if (options.stats && now - last_report >= 1s) {

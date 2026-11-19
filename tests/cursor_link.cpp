@@ -1,4 +1,6 @@
 #include "cursor_link.hpp"
+#include "cursor_packet.hpp"
+#include "secure.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -251,7 +253,8 @@ void lossy_saturated_window() {
     auto image = bitmap(256);
     auto initial = tick(sender, 0, visible, image);
     require(initial.size() == 33, "Initial window was not 32 fragments");
-    for (const auto& p : initial) require(p.size() + 24 <= 1200, "Protected datagram exceeds MTU budget");
+    for (const auto& p : initial)
+        require(p.size() + secure::datagram_overhead <= packet::max_payload, "Protected datagram exceeds MTU budget");
     std::size_t packet_number = 0;
     Bytes stale_state = initial[0];
     State state = visible;

@@ -31,7 +31,6 @@ struct ReceiverOptions {
     std::string bind = "0.0.0.0";
     std::uint16_t port = default_port;
     bool windowed = false;
-    Transport transport = Transport::tcp;
     bool require_hardware = false;
     bool stats = false;
     std::string password;

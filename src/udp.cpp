@@ -1,4 +1,5 @@
 #include "udp.hpp"
+#include "cursor_packet.hpp"
 #include "secure.hpp"
 #include "wire.hpp"
 
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -88,9 +90,8 @@ void send_packet(ENetPeer* peer, const secure::Bytes& bytes, enet_uint32 flags) 
     enet_host_flush(peer->host);
 }
 
-secure::Bytes receive_handshake(ENetHost* host, std::size_t size, Clock::time_point deadline,
-                                const std::function<bool()>& stopping = {}) {
-    while ((!stopping || !stopping()) && Clock::now() < deadline) {
+secure::Bytes receive_handshake(ENetHost* host, std::size_t size, Clock::time_point deadline) {
+    while (Clock::now() < deadline) {
         const auto event = poll(host, std::min(100u, remaining(deadline)));
         Packet packet(event.packet, enet_packet_destroy);
         if (event.type == ENET_EVENT_TYPE_DISCONNECT)
@@ -302,8 +303,8 @@ Sender::~Sender() = default;
 net::Endpoint Sender::peer_endpoint() const { return impl_->remote; }
 std::unique_ptr<secure::Datagrams> Sender::datagrams() { return impl_->session ? impl_->session->datagrams() : nullptr; }
 
-wire::CursorOffer Sender::request_cursor(std::uint16_t port) {
-    return wire::decode_cursor_reply(impl_->exchange_query(secure::Kind::cursor_query, wire::encode_cursor_query(port),
+wire::CursorOffer Sender::request_cursor() {
+    return wire::decode_cursor_reply(impl_->exchange_query(secure::Kind::cursor_query, wire::cursor_query,
                                                            secure::Kind::cursor_reply, wire::display_query_timeout_ms));
 }
 
@@ -335,61 +336,252 @@ bool Sender::peer_closed() const {
 void Sender::shutdown() noexcept { impl_->stopping = true; }
 
 struct Listener::Impl {
+    enum class Video { idle, pending, accepted };
     Host host{nullptr, enet_host_destroy};
     ENetPeer* peer = nullptr;
+    Video video = Video::idle;
+    bool header_read = false;
+    net::Endpoint video_peer;
+    std::deque<Packet> inbox;
+    std::size_t queued_bytes = 0;
     std::string password;
-    std::unique_ptr<secure::Session> session;
+    std::unique_ptr<secure::Session> session; // Owned by the video consumer.
+
+    struct CursorPacket { net::Endpoint from; secure::Bytes payload; };
+    std::deque<CursorPacket> cursor_queue;
+    net::Endpoint cursor_peer;
+    std::array<std::uint8_t, 8> cursor_token{};
+    std::optional<net::Endpoint> reply_to;
+    bool cursor_open = false;
+
+    std::mutex mutex;
+    std::condition_variable video_ready, cursor_ready;
+    std::exception_ptr error;
+    std::atomic<bool> stopping{false};
+    std::thread worker;
+    // ENet's intercept callback has no user data. Only our worker calls service.
+    inline static thread_local Impl* servicing = nullptr;
 
     Impl(const std::string& name, std::uint16_t port, const std::string& shared_password)
         : password(shared_password) {
         initialize();
         const auto bind = address_for(name, port);
         host = make_host(&bind, !password.empty());
+        host->intercept = intercept;
+        worker = std::thread([this] { run(); });
     }
-    void authenticate(Clock::time_point deadline, const std::function<bool()>& stopping) {
-        const auto sender_hello = receive_handshake(host.get(), secure::hello_size, deadline, stopping);
-        secure::validate_hello(sender_hello, secure::Role::sender);
-        const auto receiver_hello = secure::make_hello(secure::Role::receiver);
-        send_packet(peer, receiver_hello, ENET_PACKET_FLAG_RELIABLE);
-        auto candidate = std::make_unique<secure::Session>(password, sender_hello, receiver_hello, secure::Role::receiver);
-        send_packet(peer, candidate->seal(secure::Kind::confirm, {}), ENET_PACKET_FLAG_RELIABLE);
-        candidate->open(secure::Kind::confirm, receive_handshake(host.get(), secure::record_overhead, deadline, stopping));
-        session = std::move(candidate);
+
+    ~Impl() {
+        stopping = true;
+        worker.join();
+        if (peer) enet_peer_disconnect_now(peer, 0);
+    }
+
+    static int ENET_CALLBACK intercept(ENetHost* host, ENetEvent*) {
+        const auto* data = host->receivedData;
+        const auto size = host->receivedDataLength;
+        if (!cursor::packet::matches(data, size)) return 0;
+        auto& self = *servicing;
+        const auto prefix = cursor::packet::prefix_size;
+        const auto from = net::Endpoint::ipv4(host->receivedAddress.host, host->receivedAddress.port);
+        if (!self.cursor_open || !from.same_address(self.cursor_peer) ||
+            size < prefix + self.cursor_token.size() || size > net::max_datagram_size ||
+            !std::equal(self.cursor_token.begin(), self.cursor_token.end(), data + prefix)) return 1;
+        // Raw coordinates supersede older ones. Shape fragments are retransmitted.
+        if (self.cursor_queue.size() == 64) self.cursor_queue.pop_front();
+        self.cursor_queue.push_back({from, {data + prefix, data + size}});
+        self.cursor_ready.notify_one();
+        return 1;
+    }
+
+    void handle_event(ENetEvent event) {
+        Packet packet(event.packet, enet_packet_destroy);
+        switch (event.type) {
+        case ENET_EVENT_TYPE_CONNECT:
+            if (event.data != (password.empty() ? protocol_id : encrypted_protocol_id)) {
+                enet_peer_disconnect_now(event.peer, password_mode_mismatch);
+            } else if (video != Video::idle) {
+                enet_peer_disconnect_now(event.peer, 0);
+            } else {
+                peer = event.peer;
+                configure_peer(peer);
+                video_peer = net::Endpoint::ipv4(peer->address.host, peer->address.port);
+                video = Video::pending;
+                header_read = false;
+            }
+            break;
+        case ENET_EVENT_TYPE_RECEIVE:
+            if (peer != event.peer) break;
+            // Bound assembled packets while the video consumer is stalled. A dropped
+            // delta is recovered via the normal sequence gap / keyframe feedback.
+            if (inbox.size() >= 128 || packet->dataLength > backlog_bytes - queued_bytes) {
+                if (!(packet->flags & ENET_PACKET_FLAG_RELIABLE)) break;
+                if (!header_read) {
+                    enet_peer_disconnect_now(peer, 0);
+                    peer = nullptr;
+                    break;
+                }
+                // Make room for a new reliable picture (normally a keyframe).
+                inbox.clear();
+                queued_bytes = 0;
+            }
+            queued_bytes += packet->dataLength;
+            inbox.push_back(std::move(packet));
+            break;
+        case ENET_EVENT_TYPE_DISCONNECT:
+            if (event.peer == peer) peer = nullptr;
+            break;
+        default:
+            return;
+        }
+        video_ready.notify_one();
+    }
+
+    void run() noexcept {
+        servicing = this;
+        try {
+            while (!stopping) {
+                {
+                    std::lock_guard lock(mutex);
+                    const auto event = poll(host.get(), 0);
+                    if (event.type != ENET_EVENT_TYPE_NONE) {
+                        handle_event(event);
+                        continue;
+                    }
+                }
+                // Wake on ingress, and service ENet's retransmission timers during silence.
+                enet_uint32 wait = ENET_SOCKET_WAIT_RECEIVE | ENET_SOCKET_WAIT_INTERRUPT;
+                if (enet_socket_wait(host->socket, &wait, 10) < 0)
+                    throw std::runtime_error("Waiting for the UDP socket failed");
+            }
+        } catch (...) {
+            std::lock_guard lock(mutex);
+            error = std::current_exception();
+            video_ready.notify_all();
+            cursor_ready.notify_all();
+        }
+        servicing = nullptr;
     }
 
     ReadResult read_packet(secure::Bytes& bytes, unsigned timeout_ms, std::size_t limit) {
-        if (!peer) throw std::logic_error("No active UDP session");
-        const auto event = poll(host.get(), timeout_ms);
-        Packet packet(event.packet, enet_packet_destroy);
-        switch (event.type) {
-        case ENET_EVENT_TYPE_RECEIVE:
-            if (!packet || packet->dataLength == 0 || packet->dataLength > limit)
-                throw std::runtime_error("UDP message is outside protocol size limits");
-            bytes.assign(packet->data, packet->data + packet->dataLength);
-            return ReadResult::message;
-        case ENET_EVENT_TYPE_DISCONNECT:
-            peer = nullptr;
-            session.reset();
-            return ReadResult::disconnected;
-        default:
-            return ReadResult::timeout;
+        Packet packet(nullptr, enet_packet_destroy);
+        {
+            std::unique_lock lock(mutex);
+            if (video != Video::accepted) throw std::logic_error("No active UDP session");
+            video_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [&] { return !inbox.empty() || !peer || error; });
+            if (error) std::rethrow_exception(error);
+            if (inbox.empty()) {
+                if (peer) return ReadResult::timeout;
+                video = Video::idle;
+                session.reset();
+                return ReadResult::disconnected;
+            }
+            packet = std::move(inbox.front());
+            inbox.pop_front();
+            queued_bytes -= packet->dataLength;
         }
+        if (!packet->dataLength || packet->dataLength > limit)
+            throw std::runtime_error("UDP message is outside protocol size limits");
+        bytes.assign(packet->data, packet->data + packet->dataLength);
+        return ReadResult::message;
     }
+
+    void send(const secure::Bytes& bytes, enet_uint32 flags, bool feedback = false) {
+        std::lock_guard lock(mutex);
+        if (error) std::rethrow_exception(error);
+        // A graceful disconnect can arrive while the decoder drains the last queued pictures.
+        if (feedback && !peer && video == Video::accepted) return;
+        if (!peer || video != Video::accepted) throw std::runtime_error("UDP peer disconnected");
+        send_packet(peer, bytes, flags);
+    }
+
+    void authenticate(Clock::time_point deadline, const std::function<bool()>& stop) {
+        auto handshake = [&](std::size_t size) {
+            secure::Bytes bytes;
+            while ((!stop || !stop()) && Clock::now() < deadline) {
+                const auto result = read_packet(bytes, std::min(100u, remaining(deadline)), size);
+                if (result == ReadResult::timeout) continue;
+                if (result == ReadResult::disconnected || bytes.size() != size)
+                    throw std::runtime_error("UDP authentication failed. Check --password on both devices.");
+                return bytes;
+            }
+            throw std::runtime_error("UDP authentication timed out or was stopped");
+        };
+        const auto sender_hello = handshake(secure::hello_size);
+        secure::validate_hello(sender_hello, secure::Role::sender);
+        const auto receiver_hello = secure::make_hello(secure::Role::receiver);
+        send(receiver_hello, ENET_PACKET_FLAG_RELIABLE);
+        auto candidate = std::make_unique<secure::Session>(password, sender_hello, receiver_hello, secure::Role::receiver);
+        send(candidate->seal(secure::Kind::confirm, {}), ENET_PACKET_FLAG_RELIABLE);
+        candidate->open(secure::Kind::confirm, handshake(secure::record_overhead));
+        session = std::move(candidate);
+    }
+
     void reply(secure::Kind kind, const secure::Bytes& bytes, enet_uint32 flags) {
-        if (!peer || (!password.empty() && !session)) throw std::logic_error("No active UDP session");
-        if (session) send_packet(peer, session->seal(kind, bytes), flags);
-        else send_packet(peer, bytes, flags);
+        if (!password.empty() && !session) throw std::logic_error("UDP session is not authenticated");
+        if (session) send(session->seal(kind, bytes), flags, kind == secure::Kind::feedback);
+        else send(bytes, flags, kind == secure::Kind::feedback);
     }
 };
 
 Listener::Listener(const std::string& bind_address, std::uint16_t port, const std::string& password)
     : impl_(std::make_unique<Impl>(bind_address, port, password)) {}
-Listener::~Listener() { disconnect(); }
+Listener::~Listener() = default;
 std::uint16_t Listener::local_port() const { return impl_->host->address.port; }
 
+void Listener::open_cursor(net::Endpoint video_peer, std::uint64_t token) {
+    if (video_peer.v6 || !token) throw std::invalid_argument("Invalid IPv4 cursor session");
+    std::lock_guard lock(impl_->mutex);
+    impl_->cursor_peer = video_peer;
+    for (auto i = impl_->cursor_token.size(); i > 0; --i) {
+        impl_->cursor_token[i - 1] = static_cast<std::uint8_t>(token);
+        token >>= 8;
+    }
+    impl_->cursor_queue.clear();
+    impl_->reply_to.reset();
+    impl_->cursor_open = true;
+}
+
+void Listener::close_cursor() noexcept {
+    std::lock_guard lock(impl_->mutex);
+    impl_->cursor_open = false;
+    impl_->cursor_queue.clear();
+    impl_->reply_to.reset();
+    impl_->cursor_ready.notify_all();
+}
+
+bool Listener::receive_cursor(secure::Bytes& inner, net::Endpoint& from, unsigned timeout_ms) {
+    std::unique_lock lock(impl_->mutex);
+    impl_->cursor_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [&] { return !impl_->cursor_queue.empty() || !impl_->cursor_open || impl_->error; });
+    if (impl_->error) std::rethrow_exception(impl_->error);
+    if (impl_->cursor_queue.empty()) return false;
+    auto item = std::move(impl_->cursor_queue.front());
+    impl_->cursor_queue.pop_front();
+    impl_->reply_to = from = item.from;
+    inner = std::move(item.payload);
+    return true;
+}
+
+bool Listener::send_cursor(const secure::Bytes& inner, net::Endpoint to) {
+    std::lock_guard lock(impl_->mutex);
+    if (!impl_->reply_to || *impl_->reply_to != to || inner.size() < impl_->cursor_token.size() ||
+        !std::equal(impl_->cursor_token.begin(), impl_->cursor_token.end(), inner.begin())) return false;
+    auto bytes = cursor::packet::wrap(inner);
+    ENetAddress address{};
+    std::memcpy(&address.host, to.address.data(), sizeof(address.host));
+    address.port = to.port;
+    ENetBuffer buffer{};
+    buffer.data = bytes.data();
+    buffer.dataLength = bytes.size();
+    return enet_socket_send(impl_->host->socket, &address, &buffer, 1) == static_cast<int>(bytes.size());
+}
+
 net::Endpoint Listener::peer_endpoint() const {
-    if (!impl_->peer) throw std::logic_error("No active UDP session");
-    return net::Endpoint::ipv4(impl_->peer->address.host, impl_->peer->address.port);
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->video != Impl::Video::accepted) throw std::logic_error("No active UDP session");
+    return impl_->video_peer;
 }
 
 std::unique_ptr<secure::Datagrams> Listener::datagrams() {
@@ -398,21 +590,14 @@ std::unique_ptr<secure::Datagrams> Listener::datagrams() {
 }
 
 bool Listener::accept(unsigned timeout_ms) {
-    if (impl_->peer) throw std::logic_error("UDP session already active");
-    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-    do {
-        const auto event = poll(impl_->host.get(), remaining(deadline));
-        Packet unexpected(event.packet, enet_packet_destroy);
-        if (event.type == ENET_EVENT_TYPE_CONNECT) {
-            if (event.data == (impl_->password.empty() ? protocol_id : encrypted_protocol_id)) {
-                impl_->peer = event.peer;
-                configure_peer(event.peer);
-                return true;
-            }
-            enet_peer_disconnect_now(event.peer, password_mode_mismatch);
-        }
-    } while (Clock::now() < deadline);
-    return false;
+    std::unique_lock lock(impl_->mutex);
+    if (impl_->video == Impl::Video::accepted) throw std::logic_error("UDP session already active");
+    impl_->video_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                [&] { return impl_->video == Impl::Video::pending || impl_->error; });
+    if (impl_->error) std::rethrow_exception(impl_->error);
+    if (impl_->video != Impl::Video::pending) return false;
+    impl_->video = Impl::Video::accepted;
+    return true;
 }
 
 ReadResult Listener::receive(std::vector<std::uint8_t>& message, unsigned timeout_ms) {
@@ -426,7 +611,6 @@ ReadResult Listener::receive(std::vector<std::uint8_t>& message, unsigned timeou
 wire::Header Listener::receive_header(const std::function<wire::DisplaySize()>& display_size,
                                       const std::function<bool()>& stopping, const wire::CursorResponder& cursor) {
     const auto deadline = Clock::now() + wire::header_timeout;
-    if (!impl_->peer) throw std::logic_error("No active UDP session");
     if (!impl_->password.empty()) impl_->authenticate(deadline, stopping);
     std::vector<std::uint8_t> bytes;
     bool cursor_answered = false, display_answered = false;
@@ -440,21 +624,23 @@ wire::Header Listener::receive_header(const std::function<wire::DisplaySize()>& 
         if (impl_->session) {
             kind = static_cast<secure::Kind>(bytes.front());
             bytes = impl_->session->open(kind, bytes);
-        } else if (bytes.size() == wire::cursor_query_size) {
+        } else if (bytes == wire::cursor_query) {
             kind = secure::Kind::cursor_query;
         } else if (bytes == wire::display_query) {
             kind = secure::Kind::display_query;
         }
-        if (kind == secure::Kind::cursor_query && !cursor_answered && !display_answered) {
-            const auto port = wire::decode_cursor_query(bytes);
-            impl_->reply(secure::Kind::cursor_reply, wire::encode_cursor_reply(cursor ? cursor(port) : wire::CursorOffer{}),
+        if (kind == secure::Kind::cursor_query && bytes == wire::cursor_query && !cursor_answered && !display_answered) {
+            impl_->reply(secure::Kind::cursor_reply, wire::encode_cursor_reply(cursor ? cursor() : wire::CursorOffer{}),
                          ENET_PACKET_FLAG_RELIABLE);
             cursor_answered = true;
         } else if (kind == secure::Kind::display_query && bytes == wire::display_query && display_size && !display_answered) {
             impl_->reply(secure::Kind::display_reply, wire::encode_display_reply(display_size()), ENET_PACKET_FLAG_RELIABLE);
             display_answered = true;
         } else if (kind == secure::Kind::header) {
-            return wire::decode_header(bytes);
+            auto header = wire::decode_header(bytes);
+            std::lock_guard lock(impl_->mutex);
+            impl_->header_read = true;
+            return header;
         } else {
             throw std::runtime_error("Unexpected UDP setup message");
         }
@@ -464,10 +650,13 @@ wire::Header Listener::receive_header(const std::function<wire::DisplaySize()>& 
 
 void Listener::disconnect() noexcept {
     impl_->session.reset();
-    if (impl_->peer) {
-        enet_peer_disconnect_now(impl_->peer, 0);
-        impl_->peer = nullptr;
-    }
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->video != Impl::Video::accepted) return;
+    if (impl_->peer) enet_peer_disconnect_now(impl_->peer, 0);
+    impl_->peer = nullptr;
+    impl_->video = Impl::Video::idle;
+    impl_->inbox.clear();
+    impl_->queued_bytes = 0;
 }
 
 void Listener::send_feedback(const std::vector<std::uint8_t>& message) {

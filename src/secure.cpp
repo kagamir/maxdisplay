@@ -1,4 +1,5 @@
 #include "secure.hpp"
+#include "cursor_packet.hpp"
 #include "wire.hpp"
 
 #include <mbedtls/entropy.h>
@@ -206,7 +207,7 @@ constexpr std::uint8_t cursor_channel = 1;
 }
 
 Bytes Datagrams::seal(const Bytes& packet) {
-    if (packet.size() <= token_size || packet.size() > net::max_datagram_size - datagram_overhead)
+    if (packet.size() <= token_size || packet.size() > cursor::packet::max_payload - datagram_overhead)
         throw std::invalid_argument("Invalid cursor datagram length");
     auto& tx = impl_->tx;
     if (tx.sequence == std::numeric_limits<std::uint64_t>::max())
@@ -227,7 +228,7 @@ Bytes Datagrams::seal(const Bytes& packet) {
 }
 
 std::optional<Bytes> Datagrams::open(const Bytes& record) {
-    if (record.size() <= datagram_prefix_size + tag_size || record.size() > net::max_datagram_size)
+    if (record.size() <= datagram_prefix_size + tag_size || record.size() > cursor::packet::max_payload)
         return std::nullopt;
     const auto sequence = load_u64(record.data() + token_size);
     auto& rx = impl_->rx;

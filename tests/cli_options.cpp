@@ -82,13 +82,13 @@ int main() {
         invalid({"send", "example", "--codec", "unknown"});
         invalid({"send", "example", "--transport", "sctp"});
 #elif defined(_WIN32)
-        expect(invoke({}) == 0 && receiver.transport == Transport::tcp && !receiver.require_hardware &&
+        expect(invoke({}) == 0 && receiver.port == default_port && !receiver.require_hardware &&
                !receiver.stats && receiver.password.empty(),
                "Unexpected Windows defaults");
-        expect(invoke({"receive", "--transport", "udp", "--port", "12345", "--windowed", "--require-hardware", "--stats"}) == 0 &&
-               receiver.transport == Transport::udp && receiver.port == 12345 && receiver.windowed && receiver.require_hardware && receiver.stats,
-               "Windows UDP options lost");
-        expect(invoke({"receive", "--password", u8"共享 密碼", "--transport", "udp"}) == 0 &&
+        expect(invoke({"receive", "--port", "12345", "--windowed", "--require-hardware", "--stats"}) == 0 &&
+               receiver.port == 12345 && receiver.windowed && receiver.require_hardware && receiver.stats,
+               "Windows receiver options lost");
+        expect(invoke({"receive", "--password", u8"共享 密碼"}) == 0 &&
                receiver.password == u8"共享 密碼", "Receiver lost its UTF-8 password");
         expect(invoke({"--password=-leading-dash"}) == 0 && receiver.password == "-leading-dash",
                "Default receive mode lost its password");
@@ -96,7 +96,7 @@ int main() {
         invalid({"receive", "--password", ""});
         invalid({"receive", "--password="});
         invalid({"receive", "--password", "--licenses"});
-        invalid({"receive", "--transport", "invalid"});
+        invalid({"receive", "--transport", "udp"});
 #endif
         std::cout << "CLI option checks passed\n";
     } catch (const std::exception& e) {

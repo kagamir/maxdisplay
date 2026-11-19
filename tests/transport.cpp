@@ -117,20 +117,24 @@ void display_negotiation() {
 }
 
 void cursor_negotiation() {
-    const Bytes query{'M','X','C','Q', 0,0,0,1, 0,0,0x12,0x34};
-    const wire::CursorOffer offer{0xffee, 0x0102030405060708ull};
-    const Bytes reply{'M','X','C','R', 0,0,0,1, 0,0,0xff,0xee, 0,0,0,0, 1,2,3,4,5,6,7,8};
-    require(wire::encode_cursor_query(0x1234) == query && wire::encode_cursor_reply(offer) == reply,
+    const Bytes query{'M','X','C','Q', 0,0,0,2};
+    constexpr wire::CursorOffer token = 0x0102030405060708ull;
+    const Bytes reply{'M','X','C','R', 0,0,0,2, 1,2,3,4,5,6,7,8};
+    require(wire::cursor_query == query && wire::encode_cursor_reply(token) == reply,
             "Incorrect cursor negotiation layout");
-    const auto parsed = wire::decode_cursor_reply(reply);
-    require(parsed.port == offer.port && parsed.token == offer.token, "Incorrect cursor offer");
-    auto bad = query;
-    bad[8] = 1;
-    expect_failure([&] { wire::decode_cursor_query(bad); }, "Accepted oversized cursor port");
+    require(wire::decode_cursor_reply(reply) == token, "Incorrect cursor token");
+    auto bad = reply;
+    bad[7] = 1;
+    expect_failure([&] { wire::decode_cursor_reply(bad); }, "Accepted obsolete cursor reply");
     bad = reply;
-    bad[15] = 1;
-    expect_failure([&] { wire::decode_cursor_reply(bad); }, "Accepted unknown cursor reply flags");
-    expect_failure([] { wire::encode_cursor_reply({1024, 0}); }, "Enabled cursor without a token");
+    bad.resize(24);
+    expect_failure([&] { wire::decode_cursor_reply(bad); }, "Accepted oversized cursor reply");
+
+    Connection obsolete;
+    const Bytes old_query{'M','X','C','Q', 0,0,0,1, 0,0,0x12,0x34};
+    obsolete.writer.write_all(old_query.data(), old_query.size());
+    expect_failure([&] { wire::receive_header(obsolete.reader); }, "Accepted obsolete cursor query");
+    require(!net::wait_readable(obsolete.writer, 0), "Replied to obsolete cursor query");
 
     Connection connection;
     auto server = std::async(std::launch::async, [&] {
@@ -138,21 +142,20 @@ void cursor_negotiation() {
         auto header = wire::receive_header(connection.reader, [&] {
             require(offered, "Display queried before cursor");
             return wire::DisplaySize{2560, 1440};
-        }, [&](std::uint16_t port) {
-            require(port == 0x1234, "Wrong sender cursor port");
+        }, [&] {
             offered = true;
-            return offer;
+            return token;
         });
         require(header.width == mode.width, "Cursor query lost the video header");
     });
-    require(wire::request_cursor(connection.writer, 0x1234).token == offer.token, "Cursor handshake lost token");
+    require(wire::request_cursor(connection.writer) == token, "Cursor handshake lost token");
     require(wire::request_display_size(connection.writer).height == 1440, "Display query after cursor failed");
     wire::send_header(connection.writer, mode);
     server.get();
 
     Connection unavailable;
     auto no_side = std::async(std::launch::async, [&] { return wire::receive_header(unavailable.reader); });
-    require(!wire::request_cursor(unavailable.writer, 65535).port, "Unavailable cursor response was not disabled");
+    require(!wire::request_cursor(unavailable.writer), "Unavailable cursor response was not disabled");
     wire::send_header(unavailable.writer, mode);
     require(no_side.get().codec == mode.codec, "Unavailable cursor interrupted video");
 

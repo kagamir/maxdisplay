@@ -16,7 +16,7 @@ struct Binding {
     std::wstring address;
 };
 
-Binding resolve_binding(const std::string& host, bool ipv4_only);
+Binding socket_binding(SOCKET listener);
 std::vector<std::wstring> listening_addresses(const Binding& binding);
 std::vector<std::wstring> rank_addresses(const IP_ADAPTER_ADDRESSES* adapters,
                                          const MIB_IPFORWARD_ROW2* routes, ULONG count);

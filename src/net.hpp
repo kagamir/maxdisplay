@@ -24,9 +24,10 @@ struct Endpoint {
     bool v6 = false;
 
     static Endpoint ipv4(std::uint32_t network_order_host, std::uint16_t port);
-    bool operator==(const Endpoint& other) const {
-        return v6 == other.v6 && address == other.address && scope == other.scope && port == other.port;
+    bool same_address(const Endpoint& other) const {
+        return v6 == other.v6 && address == other.address && scope == other.scope;
     }
+    bool operator==(const Endpoint& other) const { return same_address(other) && port == other.port; }
     bool operator!=(const Endpoint& other) const { return !(*this == other); }
 };
 

@@ -18,23 +18,22 @@ void exchange(const std::string& loopback, net::Socket listener) {
     auto sender_endpoint = video_receiver.peer_endpoint();
     require(receiver_endpoint.port == listener.local_port() && sender_endpoint.port == video_sender.local_port(),
             "Incorrect video peer endpoint");
+    auto receiver = net::bind_udp(loopback, listener.local_port());
     auto sender = net::bind_udp(loopback);
-    auto receiver = net::bind_udp(loopback);
     sender_endpoint.port = sender.local_port();
-    receiver_endpoint.port = receiver.local_port();
-    require(sender_endpoint.port && receiver_endpoint.port && sender_endpoint != receiver_endpoint,
-            "Side sockets were not assigned separate ephemeral ports");
+    require(receiver.local_port() == receiver_endpoint.port, "TCP and UDP use different display ports");
 
     std::vector<std::uint8_t> bytes;
     net::Endpoint source;
     require(!sender.receive_from(source, bytes), "Unexpected datagram on idle socket");
-    require(receiver.send_to(sender_endpoint, {}) && net::wait_readable(sender, 1000) &&
-            sender.receive_from(source, bytes) && source == receiver_endpoint && bytes.empty(),
-            "UDP firewall punch lost its source or datagram boundary");
     std::vector<std::uint8_t> full(net::max_datagram_size, 0xa5);
-    require(sender.send_to(source, full) && net::wait_readable(receiver, 1000) &&
+    require(sender.send_to(receiver_endpoint, full) && net::wait_readable(receiver, 1000) &&
             receiver.receive_from(source, bytes) && bytes == full && source == sender_endpoint,
-            "Maximum-size UDP return datagram failed");
+            "Maximum-size UDP datagram did not reach the display port");
+    const std::vector<std::uint8_t> reply{0x42};
+    require(receiver.send_to(source, reply) && net::wait_readable(sender, 1000) &&
+            sender.receive_from(source, bytes) && source == receiver_endpoint && bytes == reply,
+            "UDP reply did not come from the display port");
     full.push_back(0);
     require(!sender.send_to(receiver_endpoint, full), "Sent oversized UDP datagram");
 }

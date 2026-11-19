@@ -4,6 +4,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <system_error>
 #include <utility>
 
 namespace win_info {
@@ -56,19 +57,16 @@ Priority route_priority(const IP_ADAPTER_ADDRESSES& adapter, int family, const M
 
 } // namespace
 
-Binding resolve_binding(const std::string& host, bool ipv4_only) {
-    addrinfo hints{};
-    hints.ai_family = ipv4_only ? AF_INET : AF_UNSPEC;
-    hints.ai_socktype = ipv4_only ? SOCK_DGRAM : SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-    addrinfo* raw = nullptr;
-    if (getaddrinfo(host.empty() ? nullptr : host.c_str(), nullptr, &hints, &raw) != 0)
-        return {AF_UNSPEC, std::wstring(host.begin(), host.end())};
-    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, freeaddrinfo);
-    const auto family = raw->ai_family;
-    auto address = numeric_address(raw->ai_addr);
-    if (address == L"0.0.0.0" || address == L"::") address.clear();
-    return {family, std::move(address)};
+Binding socket_binding(SOCKET listener) {
+    sockaddr_storage bound{};
+    int length = sizeof(bound);
+    auto* address = reinterpret_cast<sockaddr*>(&bound);
+    if (getsockname(listener, address, &length) == SOCKET_ERROR)
+        throw std::system_error(WSAGetLastError(), std::system_category(), "getsockname");
+    auto text = numeric_address(address);
+    if (text.empty()) throw std::runtime_error("Cannot read the TCP listening address");
+    if (text == L"0.0.0.0" || text == L"::") text.clear();
+    return {address->sa_family, std::move(text)};
 }
 
 std::vector<std::wstring> listening_addresses(const Binding& binding) {

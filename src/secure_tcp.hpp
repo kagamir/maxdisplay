@@ -13,7 +13,7 @@ public:
     TcpChannel(net::Socket& socket, const std::string& password, Role role);
     net::Endpoint peer_endpoint() const { return socket_.peer_endpoint(); }
     std::unique_ptr<Datagrams> datagrams() { return session_ ? session_->datagrams() : nullptr; }
-    wire::CursorOffer request_cursor(std::uint16_t port);
+    wire::CursorOffer request_cursor();
     wire::DisplaySize request_display_size();
     void send_header(wire::Header header);
     wire::Header receive_header(const std::function<wire::DisplaySize()>& display_size = {},

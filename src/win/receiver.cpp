@@ -2,6 +2,7 @@
 #include "decoder.hpp"
 #include "display_info.hpp"
 #include "cursor_overlay.hpp"
+#include "cursor_packet.hpp"
 #include "frame_recovery.hpp"
 #include "net.hpp"
 #include "secure_tcp.hpp"
@@ -20,6 +21,7 @@
 #include <deque>
 #include <cstdint>
 #include <exception>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -31,7 +33,6 @@
 #include <system_error>
 #include <thread>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace {
@@ -40,7 +41,6 @@ constexpr wchar_t window_class[] = L"MaxDisplayReceiver";
 constexpr UINT listener_failed = WM_APP + 1;
 constexpr UINT cursor_changed = WM_APP + 2;
 constexpr UINT_PTR address_timer = 1;
-using Listener = std::variant<net::Socket, udp::Listener>;
 
 using Clock = std::chrono::steady_clock;
 using Reason = FrameRecovery::Reason;
@@ -79,7 +79,6 @@ struct Receiver {
     HWND window = nullptr;
     win_info::Binding binding{};
     std::uint16_t port = 0;
-    Transport transport = Transport::tcp;
     std::wstring address_text;
     bool require_hardware = false;
     bool stats_enabled = false;
@@ -95,7 +94,8 @@ struct Receiver {
     PaintStats paint_stats; // Updated by WM_PAINT and exchanged by the worker under mutex.
     std::weak_ptr<const VideoFrame> last_painted; // UI thread only.
     const wchar_t* status = L"Waiting for the Mac to connect";
-    std::optional<net::Socket> cursor_socket;
+    std::optional<udp::Listener> udp_listener;
+    net::Socket ipv6_cursor; // ENet uses IPv4. IPv6 TCP video still supports a same-port UDP cursor.
     std::thread cursor_worker;
     std::atomic<bool> cursor_stopping{false};
     struct SessionCursor {
@@ -148,7 +148,18 @@ struct Receiver {
         }
     }
 
-    void cursor_loop(net::Endpoint peer, std::uint64_t token, std::unique_ptr<secure::Datagrams> crypto) {
+    bool read_cursor(cursor::Bytes& bytes, net::Endpoint& from) {
+        if (udp_listener) return udp_listener->receive_cursor(bytes, from, 25);
+        return net::wait_readable(ipv6_cursor, 25) && ipv6_cursor.receive_from(from, bytes) &&
+               cursor::packet::unwrap(bytes);
+    }
+
+    void reply_cursor(const cursor::Bytes& bytes, const net::Endpoint& to) {
+        if (udp_listener) udp_listener->send_cursor(bytes, to);
+        else ipv6_cursor.send_to(to, cursor::packet::wrap(bytes));
+    }
+
+    void cursor_loop(net::Endpoint video_peer, std::uint64_t token, std::unique_ptr<secure::Datagrams> crypto) {
         try {
             cursor::Receiver link(token);
             const auto start = Clock::now();
@@ -157,26 +168,22 @@ struct Receiver {
             };
             std::uint64_t revision = link.revision();
             cursor::ReceiverStats previous{};
-            unsigned punches = 0;
+            std::optional<net::Endpoint> cursor_peer;
             while (!stopping && !cursor_stopping) {
-                // Send from the negotiated port to establish a return path through a stateful firewall.
-                if (punches < 3 && elapsed_ms() >= punches * 12) {
-                    cursor_socket->send_to(peer, {});
-                    ++punches;
-                }
-                const bool ready = net::wait_readable(*cursor_socket, punches < 3 ? 4 : 25);
+                net::Endpoint source{};
+                cursor::Bytes bytes;
+                const bool received = read_cursor(bytes, source);
                 const auto now = elapsed_ms();
-                if (ready) {
-                    net::Endpoint source{};
-                    cursor::Bytes bytes;
-                    if (cursor_socket->receive_from(source, bytes) && source == peer) {
-                        if (crypto) {
-                            auto packet = crypto->open(bytes);
-                            if (packet) bytes = std::move(*packet);
-                            else bytes.clear();
-                        }
-                        if (auto ack = link.receive(now, bytes))
-                            cursor_socket->send_to(peer, crypto ? crypto->seal(*ack) : *ack);
+                if (received && source.same_address(video_peer) && (!cursor_peer || source == *cursor_peer)) {
+                    if (crypto) {
+                        auto packet = crypto->open(bytes);
+                        if (packet) bytes = std::move(*packet);
+                        else bytes.clear();
+                    }
+                    if (auto ack = link.receive(now, bytes)) {
+                        // The first valid state or shape identifies the Mac's UDP source port.
+                        cursor_peer = source;
+                        reply_cursor(crypto ? crypto->seal(*ack) : *ack, source);
                     }
                 }
                 link.expire(now);
@@ -201,18 +208,17 @@ struct Receiver {
     }
 
     template<class Channel>
-    wire::CursorOffer offer_cursor(Channel& channel, std::uint16_t sender_port) {
-        if (!cursor_socket) return {};
+    wire::CursorOffer offer_cursor(Channel& channel) {
         try {
-            auto peer = channel.peer_endpoint();
-            peer.port = sender_port;
+            const auto peer = channel.peer_endpoint();
             const auto token = secure::random_token();
-            const auto port = cursor_socket->local_port();
             auto crypto = channel.datagrams();
+            if (udp_listener) udp_listener->open_cursor(peer, token);
             cursor_stopping = false;
-            cursor_worker = std::thread(&Receiver::cursor_loop, this, std::move(peer), token, std::move(crypto));
-            return {port, token};
+            cursor_worker = std::thread(&Receiver::cursor_loop, this, peer, token, std::move(crypto));
+            return token;
         } catch (const std::exception& e) {
+            if (udp_listener) udp_listener->close_cursor();
             std::cerr << "Cursor channel unavailable: " << e.what() << '\n';
             return {};
         }
@@ -220,6 +226,7 @@ struct Receiver {
 
     void end_cursor() {
         cursor_stopping = true;
+        if (udp_listener) udp_listener->close_cursor();
         if (cursor_worker.joinable()) cursor_worker.join();
     }
 
@@ -400,7 +407,7 @@ struct Receiver {
     }
 
     template<class ReadHeader, class ReadFrame, class SendFeedback>
-    void receive_stream(ReadHeader read_header, ReadFrame read_frame, SendFeedback feedback) {
+    const wchar_t* receive_stream(ReadHeader read_header, ReadFrame read_frame, SendFeedback feedback) {
         {
             std::lock_guard lock(mutex);
             ++session_id;
@@ -420,7 +427,7 @@ struct Receiver {
             next_status = L"Stream error. See the console for details. Waiting for a connection";
         }
         end_cursor();
-        if (!stopping) show_status(next_status);
+        return next_status;
     }
 
     wire::DisplaySize display_size() const {
@@ -430,30 +437,17 @@ struct Receiver {
         return {static_cast<std::uint32_t>(pixels.cx), static_cast<std::uint32_t>(pixels.cy)};
     }
 
-    void listen(net::Socket& listener) {
-        while (!stopping) {
-            if (!net::wait_readable(listener, 150)) continue;
-            auto accepted = net::accept_tcp(listener);
-            if (!accepted) continue;
-            auto client = std::make_shared<net::Socket>(std::move(accepted));
-            {
-                std::lock_guard lock(mutex);
-                if (stopping) break;
-                active = client;
-            }
-            std::optional<secure::TcpChannel> channel;
-            receive_stream([&] {
-                channel.emplace(*client, password, secure::Role::receiver);
-                return channel->receive_header([&] { return display_size(); },
-                    [&](std::uint16_t port) { return offer_cursor(*channel, port); });
-            }, [&](auto& bytes, const auto& poll) { return channel->receive_frame(bytes, poll); },
-               [&](const auto& ack) { channel->send_feedback(ack); });
-            std::lock_guard lock(mutex);
-            active.reset();
-        }
+    const wchar_t* receive_tcp(net::Socket& client) {
+        std::optional<secure::TcpChannel> channel;
+        return receive_stream([&] {
+            channel.emplace(client, password, secure::Role::receiver);
+            return channel->receive_header([&] { return display_size(); }, [&] { return offer_cursor(*channel); });
+        }, [&](auto& bytes, const auto& poll) { return channel->receive_frame(bytes, poll); },
+           [&](const auto& ack) { channel->send_feedback(ack); });
     }
 
-    void listen(udp::Listener& listener) {
+    const wchar_t* receive_udp() {
+        auto& listener = *udp_listener;
         auto read = [&](std::vector<std::uint8_t>& bytes, const auto& poll) {
             while (!stopping) {
                 switch (listener.receive(bytes, poll())) {
@@ -464,23 +458,57 @@ struct Receiver {
             }
             return false;
         };
-        while (!stopping) {
-            if (!listener.accept(100)) continue;
-            receive_stream([&] {
-                return listener.receive_header([&] { return display_size(); }, [&] { return stopping.load(); },
-                    [&](std::uint16_t port) { return offer_cursor(listener, port); });
-            }, read, [&](const auto& ack) { listener.send_feedback(ack); });
-            listener.disconnect();
-        }
+        return receive_stream([&] {
+            return listener.receive_header([&] { return display_size(); }, [&] { return stopping.load(); },
+                                           [&] { return offer_cursor(listener); });
+        }, read, [&](const auto& ack) { listener.send_feedback(ack); });
     }
 
-    void receive(Listener& listener) {
+    void receive(net::Socket& tcp) {
+        // This thread owns admission across both transports. While the decode worker
+        // displays one session, competing connections are accepted and closed.
+        std::future<const wchar_t*> video;
+        bool serving_udp = false;
+        auto finish_if_ready = [&] {
+            if (!video.valid() || video.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return;
+            const auto message = video.get();
+            if (serving_udp) udp_listener->disconnect();
+            else {
+                std::lock_guard lock(mutex);
+                active.reset();
+            }
+            serving_udp = false;
+            if (!stopping) show_status(message);
+        };
         try {
-            std::visit([this](auto& server) { listen(server); }, listener);
+            while (!stopping) {
+                finish_if_ready();
+                if (udp_listener && !serving_udp && udp_listener->accept(0)) {
+                    if (video.valid()) {
+                        udp_listener->disconnect();
+                    } else {
+                        serving_udp = true;
+                        video = std::async(std::launch::async, &Receiver::receive_udp, this);
+                    }
+                }
+                if (!net::wait_readable(tcp, 15)) continue;
+                auto accepted = net::accept_tcp(tcp);
+                finish_if_ready();
+                if (!accepted || video.valid()) continue;
+                auto client = std::make_shared<net::Socket>(std::move(accepted));
+                {
+                    std::lock_guard lock(mutex);
+                    if (stopping) break;
+                    active = client;
+                }
+                video = std::async(std::launch::async, [this, client] { return receive_tcp(*client); });
+            }
         } catch (...) {
             listener_error = std::current_exception();
+            stop();
             PostMessageW(window, listener_failed, 0, 0);
         }
+        if (video.valid()) video.wait();
     }
 };
 
@@ -537,7 +565,7 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         if (pixels.cx > 0 && pixels.cy > 0)
             details += L"\nDisplay: " + std::to_wstring(pixels.cx) + L" × " + std::to_wstring(pixels.cy) + L" px";
         details += L"\n\nLocal IP addresses (";
-        details += receiver.transport == Transport::udp ? L"UDP " : L"TCP ";
+        details += receiver.udp_listener ? L"TCP and UDP " : L"TCP video and UDP cursor ";
         details += std::to_wstring(receiver.port) + L")\n" + receiver.address_text;
         const auto dpi = GetDpiForWindow(receiver.window);
         HFONT font = CreateFontW(-MulDiv(13, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -654,11 +682,16 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 
 int run_receiver(const ReceiverOptions& options) {
     win_info::KeepAwake keep_awake;
-    Listener listener;
-    if (options.transport == Transport::udp)
-        listener.emplace<udp::Listener>(options.bind, options.port, options.password);
-    else
-        listener.emplace<net::Socket>(net::listen_tcp(options.bind, options.port));
+    auto tcp = net::listen_tcp(options.bind, options.port);
+    Receiver receiver(options.password);
+    receiver.port = tcp.local_port();
+    receiver.binding = win_info::socket_binding(tcp.native_handle());
+    const auto& address = receiver.binding.address;
+    const auto bind = address.empty() ? (receiver.binding.family == AF_INET6 ? "::" : "0.0.0.0")
+                                      : std::string(address.begin(), address.end());
+    if (receiver.binding.family == AF_INET6) receiver.ipv6_cursor = net::bind_udp(bind, receiver.port);
+    else receiver.udp_listener.emplace(bind, receiver.port, options.password);
+
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{};
@@ -670,19 +703,6 @@ int run_receiver(const ReceiverOptions& options) {
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         throw std::system_error(GetLastError(), std::system_category(), "RegisterClassExW");
 
-    Receiver receiver(options.password);
-    receiver.binding = win_info::resolve_binding(options.bind, options.transport == Transport::udp);
-    try {
-        // ENet resolves names to IPv4, even when the same name has a preferred IPv6 address.
-        const auto& address = receiver.binding.address;
-        const auto bind = address.empty() ? (receiver.binding.family == AF_INET6 ? "::" : "0.0.0.0")
-                                          : std::string(address.begin(), address.end());
-        receiver.cursor_socket.emplace(net::bind_udp(bind));
-    } catch (const std::exception& e) {
-        std::cerr << "Cannot bind the cursor UDP port: " << e.what() << ". Using the video cursor.\n";
-    }
-    receiver.port = options.port;
-    receiver.transport = options.transport;
     receiver.require_hardware = options.require_hardware;
     receiver.stats_enabled = options.stats;
     receiver.refresh_addresses();
@@ -693,13 +713,13 @@ int run_receiver(const ReceiverOptions& options) {
     SetTimer(window, address_timer, 5000, nullptr);
     ShowWindow(window, SW_SHOWNORMAL);
     if (!options.windowed) toggle_fullscreen(receiver);
-    std::cout << "Listening on " << (options.transport == Transport::udp ? "UDP " : "TCP ")
-              << options.bind << ':' << options.port
+    std::cout << "Listening on " << (receiver.udp_listener ? "TCP and UDP " : "TCP video and UDP cursor ")
+              << (receiver.binding.family == AF_INET6 ? "[" + bind + "]" : bind) << ':' << receiver.port
               << (options.password.empty() ? "" : " (AES-128-GCM required)")
               << ". F11 toggles full screen. Esc exits.\n" << std::flush;
 
     try {
-        std::thread worker([&] { receiver.receive(listener); });
+        std::thread worker([&] { receiver.receive(tcp); });
         MSG message{};
         BOOL result;
         while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {

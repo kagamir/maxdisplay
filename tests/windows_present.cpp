@@ -2,6 +2,7 @@
 // client rendering. WM_PRINTCLIENT works even when another window obscures the viewer.
 #include "app.hpp"
 #include "cursor_link.hpp"
+#include "cursor_packet.hpp"
 #include "net.hpp"
 #include "secure_tcp.hpp"
 #include "udp.hpp"
@@ -127,8 +128,8 @@ bool sees_pattern(HWND window, bool final) {
 
 class TestSender {
 public:
-    TestSender(const ReceiverOptions& options, Codec codec, HWND query_window = nullptr) {
-        if (options.transport == Transport::udp) {
+    TestSender(const ReceiverOptions& options, Transport transport, Codec codec, HWND query_window = nullptr) {
+        if (transport == Transport::udp) {
             udp_.emplace(options.bind, options.port, options.password);
         } else {
             socket_ = net::connect_tcp(options.bind, options.port);
@@ -136,13 +137,18 @@ public:
         }
         if (query_window && codec == Codec::h264) {
             cursor_socket_ = net::bind_udp(options.bind);
-            const auto local_port = cursor_socket_.local_port();
-            const auto offer = udp_ ? udp_->request_cursor(local_port) : tcp_->request_cursor(local_port);
-            if (!offer.port || !offer.token) throw std::runtime_error("Receiver did not offer a cursor port");
+            const auto token = udp_ ? udp_->request_cursor() : tcp_->request_cursor();
+            if (!token) throw std::runtime_error("Receiver did not offer a cursor session");
             cursor_peer_ = udp_ ? udp_->peer_endpoint() : tcp_->peer_endpoint();
-            cursor_peer_.port = offer.port;
+            if (cursor_peer_.port != options.port) throw std::runtime_error("Unexpected video port");
             cursor_keys_ = udp_ ? udp_->datagrams() : tcp_->datagrams();
-            cursor_.emplace(offer.token);
+            cursor_.emplace(token);
+            // Even after learning our UDP endpoint, Windows must stay quiet until
+            // it receives a cursor packet belonging to this video session.
+            cursor::Sender foreign(token ^ 1);
+            foreign.update(now_us() / 1000, {}, {}, [&](const cursor::Bytes& bytes) { send_cursor(bytes); });
+            if (net::wait_readable(cursor_socket_, 150))
+                throw std::runtime_error("Receiver sent UDP data before a valid cursor packet");
         }
         if (query_window) {
             const auto size = udp_ ? udp_->request_display_size() : tcp_->request_display_size();
@@ -199,12 +205,13 @@ public:
             if (!wait_until([&] {
                 const auto now = now_us() / 1000;
                 cursor_->update(now, {visible, 8 * 240, 8 * y, video_floor}, shape, [&](const cursor::Bytes& packet) {
-                    cursor_socket_.send_to(cursor_peer_, cursor_keys_ ? cursor_keys_->seal(packet) : packet);
+                    send_cursor(packet);
                 });
                 net::Endpoint from;
                 cursor::Bytes datagram;
                 while (cursor_socket_.receive_from(from, datagram)) {
-                    if (!(from == cursor_peer_) || datagram.empty()) continue;
+                    if (from != cursor_peer_ || !cursor::packet::unwrap(datagram))
+                        throw std::runtime_error("Expected an MXCP cursor reply from the video port");
                     if (cursor_keys_) {
                         auto clear = cursor_keys_->open(datagram);
                         if (clear) cursor_->acknowledge(now, *clear);
@@ -236,6 +243,11 @@ public:
         std::cout << "Verified cursor alpha, absolute movement, hide, UDP ACK, idle expiry and handoff\n";
     }
 private:
+    void send_cursor(const cursor::Bytes& bytes) {
+        if (!cursor_socket_.send_to(cursor_peer_, cursor::packet::wrap(cursor_keys_ ? cursor_keys_->seal(bytes) : bytes)))
+            throw std::runtime_error("Could not send a loopback cursor packet");
+    }
+
     net::Socket cursor_socket_;
     net::Endpoint cursor_peer_{};
     std::unique_ptr<secure::Datagrams> cursor_keys_;
@@ -251,14 +263,32 @@ void send_initial_frames(TestSender& sender, const Frames& frames, HWND window) 
         throw std::runtime_error("The live window did not paint the initial green and gray pattern");
 }
 
+// A second video session must not displace the current viewer, including when
+// its connection arrives on the other transport.
+void check_busy_receiver(const ReceiverOptions& options, Transport transport) {
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        if (transport == Transport::tcp) {
+            auto socket = net::connect_tcp(options.bind, options.port);
+            secure::TcpChannel competitor(socket, options.password, secure::Role::sender);
+            competitor.request_display_size();
+        } else {
+            udp::Sender competitor(options.bind, options.port, options.password);
+            competitor.request_display_size();
+        }
+    } catch (const std::runtime_error& e) {
+        if (std::chrono::steady_clock::now() - started >= 4s)
+            throw std::runtime_error(std::string("A competing connection stalled instead of closing: ") + e.what());
+        return;
+    }
+    throw std::runtime_error("A competing connection reached the receiver during an active video stream");
+}
+
 void check(const Frames& frames, Codec codec, Transport transport, bool encrypted) {
     ReceiverOptions options;
     options.bind = "127.0.0.1";
-    options.transport = transport;
-    if (transport == Transport::udp)
-        options.port = udp::Listener(options.bind, 0).local_port();
-    else
-        options.port = net::listen_tcp(options.bind, 0).local_port();
+    options.port = net::listen_tcp(options.bind, 0).local_port();
+    const auto other = transport == Transport::udp ? Transport::tcp : Transport::udp;
     if (encrypted) options.password = "MaxDisplay test passphrase";
     options.windowed = true;
     options.stats = true;
@@ -279,7 +309,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
         for (bool late : {false, true}) {
-            client.emplace(options, codec, late ? nullptr : window);
+            client.emplace(options, late ? other : transport, codec, late ? nullptr : window);
             if (late) {
                 // A static desktop may produce just one picture. It must paint while the session stays open.
                 client->send(frames, 0, 1);
@@ -291,6 +321,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
                 client->send(frames, 1, 2, true, stamp);
             } else {
                 send_initial_frames(*client, frames, window);
+                if (codec == Codec::h264) check_busy_receiver(options, other);
                 // Sequence 4 (a reference picture) was lost. Deliver the following delta.
                 client->send(frames, 4, 5, true);
             }
@@ -303,7 +334,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             if (!wait_until([&] { return !near_color(read_colors(window)[0], RGB(20, 220, 20), 18); }, 4s))
                 throw std::runtime_error("Disconnected window did not clear its last frame");
         }
-        client.emplace(options, codec);
+        client.emplace(options, transport, codec);
         send_initial_frames(*client, frames, window);
     } catch (...) {
         failure = std::current_exception();
@@ -344,7 +375,7 @@ int main(int argc, char** argv) {
         DestroyWindow(probe);
         check(frames, codec == "h265" ? Codec::h265 : codec == "av1" ? Codec::av1 : Codec::h264,
               transport == "udp" ? Transport::udp : Transport::tcp, encrypted);
-        std::cout << codec << "/" << transport << (encrypted ? " (encrypted)" : "") << ": verified missing and late frame recovery, window pixels, reconnect and Escape shutdown\n";
+        std::cout << codec << "/" << transport << (encrypted ? " (encrypted)" : "") << ": verified missing and late frame recovery, window pixels, cross-transport reconnect and Escape shutdown\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

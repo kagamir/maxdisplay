@@ -1,4 +1,5 @@
 #include "secure.hpp"
+#include "cursor_packet.hpp"
 #include "wire.hpp"
 
 #include <algorithm>
@@ -58,12 +59,14 @@ void test_datagrams(Session& sender, Session& receiver) {
             "Incorrect rotated cursor key");
     require(rx->open(next_epoch) == packet && rx->open(last_epoch) == packet && !rx->open(next_epoch),
             "Cursor reordering across key rotation failed");
-    Bytes largest(net::max_datagram_size - datagram_overhead, 0xaa);
-    require(rx->open(tx->seal(largest)) == largest, "Maximum cursor datagram rejected");
+    Bytes largest(cursor::packet::max_payload - datagram_overhead, 0xaa);
+    auto framed = cursor::packet::wrap(tx->seal(largest));
+    require(framed.size() == net::max_datagram_size && cursor::packet::unwrap(framed) && rx->open(framed) == largest,
+            "Maximum framed cursor datagram did not round-trip");
     largest.push_back(0);
     rejects([&] { tx->seal(largest); }, "Encrypted oversized cursor packet");
     rejects([&] { tx->seal(Bytes(8)); }, "Encrypted cursor packet without a body");
-    require(!rx->open(Bytes(net::max_datagram_size + 1)) && !rx->open({}), "Accepted invalid cursor length");
+    require(!rx->open(Bytes(cursor::packet::max_payload + 1)) && !rx->open({}), "Accepted invalid cursor length");
 }
 
 void test_session() {

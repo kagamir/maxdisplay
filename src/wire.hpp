@@ -35,19 +35,14 @@ struct DisplaySize {
     std::uint32_t width, height;
 };
 
-struct CursorOffer {
-    std::uint16_t port = 0;
-    std::uint64_t token = 0;
-};
-using CursorResponder = std::function<CursorOffer(std::uint16_t sender_port)>;
-extern const std::vector<std::uint8_t> cursor_query_prefix;
-constexpr std::size_t cursor_query_size = 12;
-constexpr std::size_t cursor_reply_size = 24;
-std::vector<std::uint8_t> encode_cursor_query(std::uint16_t port);
-std::uint16_t decode_cursor_query(const std::vector<std::uint8_t>& bytes);
-std::vector<std::uint8_t> encode_cursor_reply(CursorOffer offer);
+// A zero token disables the cursor channel. Both transports use the video service port.
+using CursorOffer = std::uint64_t;
+using CursorResponder = std::function<CursorOffer()>;
+extern const std::vector<std::uint8_t> cursor_query;
+constexpr std::size_t cursor_reply_size = 16;
+std::vector<std::uint8_t> encode_cursor_reply(CursorOffer token);
 CursorOffer decode_cursor_reply(const std::vector<std::uint8_t>& bytes);
-CursorOffer request_cursor(net::Socket& socket, std::uint16_t port);
+CursorOffer request_cursor(net::Socket& socket);
 
 // Optional preamble when the sender needs the receiver display dimensions.
 extern const std::vector<std::uint8_t> display_query;

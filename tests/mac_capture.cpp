@@ -100,7 +100,7 @@ void check_av1(const std::vector<uint8_t>& frame, uint32_t width, uint32_t heigh
 // Exercise the production sampler, cipher and ARQ without moving the runner's real mouse.
 // Wait for distinct position sequences after acknowledging its bitmap. A stalled sender
 // that just retransmits the same tail packet cannot satisfy this check.
-void check_cursor(net::Socket socket, net::Endpoint peer, std::uint64_t token,
+void check_cursor(udp::Listener& listener, std::uint64_t token,
                   std::unique_ptr<secure::Datagrams> cipher, bool interrupt, const std::atomic<bool>& video_ready) {
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
@@ -110,10 +110,9 @@ void check_cursor(net::Socket socket, net::Endpoint peer, std::uint64_t token,
     std::optional<std::uint32_t> last_seq, original_floor, fallback_seq;
     unsigned positions = 0;
     while (Clock::now() - start < 30s) {
-        if (!net::wait_readable(socket, 50)) continue;
         net::Endpoint source;
         cursor::Bytes bytes;
-        if (!socket.receive_from(source, bytes) || source != peer) continue;
+        if (!listener.receive_cursor(bytes, source, 50)) continue;
         const auto now = Clock::now();
         // In this profile the stream must start with the pointer in video.
         // Once it hands off to the overlay, simulate a full bidirectional outage.
@@ -126,7 +125,7 @@ void check_cursor(net::Socket socket, net::Endpoint peer, std::uint64_t token,
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
         auto ack = receiver.receive(elapsed, bytes);
         if (!ack) throw std::runtime_error("Invalid Mac cursor packet");
-        socket.send_to(peer, cipher ? cipher->seal(*ack) : *ack);
+        listener.send_cursor(cipher ? cipher->seal(*ack) : *ack, source);
         if (reopen_at && !first_reply) first_reply = now;
         if (bytes[8] == cursor::detail::shape_type) shape_seen = true;
         if (!shape_seen || bytes[8] != cursor::detail::state_type) continue;
@@ -182,39 +181,33 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
     const auto original = online_displays();
 
     net::Socket tcp;
-    std::unique_ptr<udp::Listener> incoming_udp;
-    if (transport == Transport::udp) {
-        incoming_udp = std::make_unique<udp::Listener>(options.host, 0, options.password);
-        options.port = incoming_udp->local_port();
-    } else {
-        tcp = net::listen_tcp(options.host, 0);
-        options.port = tcp.local_port();
-    }
+    if (transport == Transport::tcp) tcp = net::listen_tcp(options.host, 0);
+    auto incoming_udp = std::make_unique<udp::Listener>(options.host, tcp ? tcp.local_port() : 0, options.password);
+    options.port = incoming_udp->local_port();
 
     std::promise<void> stopped;
     auto stopped_future = stopped.get_future();
     auto receive = std::async(std::launch::async, [&] {
         // Release the listener if validation fails, so the sender observes disconnect.
-        auto datagrams = std::move(incoming_udp);
+        auto listener = std::move(incoming_udp);
+        auto* datagrams = transport == Transport::udp ? listener.get() : nullptr;
         wire::Header mode{};
         net::Socket peer;
         std::optional<secure::TcpChannel> channel;
         bool queried = false, cursor_queried = false;
         std::atomic<bool> video_ready{false};
         std::future<void> side;
-        auto offer_cursor = [&](std::uint16_t sender_port) -> wire::CursorOffer {
+        auto offer_cursor = [&]() -> wire::CursorOffer {
             if (queried || cursor_queried || options.video_cursor)
                 throw std::runtime_error("Unexpected cursor query");
             cursor_queried = true;
             if (unavailable_cursor) return {};
-            auto socket = net::bind_udp(options.host);
-            const wire::CursorOffer offer{socket.local_port(), secure::random_token()};
-            auto endpoint = datagrams ? datagrams->peer_endpoint() : channel->peer_endpoint();
-            endpoint.port = sender_port;
+            const auto token = secure::random_token();
+            listener->open_cursor(datagrams ? datagrams->peer_endpoint() : channel->peer_endpoint(), token);
             auto cipher = datagrams ? datagrams->datagrams() : channel->datagrams();
-            side = std::async(std::launch::async, check_cursor, std::move(socket), endpoint, offer.token,
-                              std::move(cipher), encrypted && transport == Transport::udp, std::cref(video_ready));
-            return offer;
+            side = std::async(std::launch::async, check_cursor, std::ref(*listener), token, std::move(cipher),
+                              encrypted && transport == Transport::udp, std::cref(video_ready));
+            return token;
         };
         auto monitor = [&] {
             if (!automatic || queried) throw std::runtime_error("Unexpected display size query");

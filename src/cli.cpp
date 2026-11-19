@@ -14,14 +14,14 @@
 namespace {
 void print_help() {
     std::cout << "MaxDisplay - use a Windows PC as a Mac extended display\n\n"
-                 "Windows: maxdisplay [receive] [--bind IP] [--port PORT] [--transport tcp|udp]\n"
+                 "Windows: maxdisplay [receive] [--bind IP] [--port PORT]\n"
                  "                              [--require-hardware] [--windowed] [--stats] [--password PASSWORD]\n"
                  "macOS:   maxdisplay send WINDOWS_HOST [--port PORT] [--size WIDTHxHEIGHT]\n"
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|h265|av1] [--transport tcp|udp]\n"
                  "                                      [--frame-timeout-ms MS] [--fixed-bitrate] [--fixed-fps]\n"
                  "                                      [--require-hardware] [--video-cursor] [--stats] [--password PASSWORD]\n\n"
-                 "Start Windows first. Defaults: H.264 over TCP 49300, scale 1, up to 60 fps and 12 Mbps.\n"
+                 "Windows listens on TCP and UDP at --port (default 49300). Start it first.\n"
                  "Use --password PASSWORD on both devices for AES-128-GCM encryption. Omit it on both for plaintext.\n"
                  "Use --password=VALUE for a password beginning with a dash.\n"
                  "--stats prints per-second streaming statistics on this device.\n"
@@ -29,7 +29,7 @@ void print_help() {
                  "Omit --size to use the Windows monitor's pixel dimensions divided by --scale for the desktop.\n"
                  "H.264/H.265 prefer hardware and warn on software fallback. --require-hardware disables fallback.\n"
                  "--fps and --bitrate-mbps are adaptive ceilings. Each can be fixed independently.\n"
-                 "The Mac pointer normally travels separately over UDP. Use --video-cursor to capture it in video.\n"
+                 "The Mac sends its pointer over UDP to the same receiver port. Use --video-cursor to capture it in video.\n"
                  "The default frame deadline is 200 ms.\n"
                  "Windows: F11 toggles full screen, Esc exits. Mac: Ctrl+C stops sharing.\n"
                  "Use --licenses to view bundled third-party notices.\n";
@@ -61,13 +61,13 @@ std::string_view password_value(std::string_view key, int& index, int argc, char
     return value;
 }
 
+#ifdef __APPLE__
 Transport parse_transport(std::string_view value) {
     if (value == "tcp") return Transport::tcp;
     if (value == "udp") return Transport::udp;
     throw std::invalid_argument("--transport expects tcp or udp");
 }
 
-#ifdef __APPLE__
 double parse_scale(std::string_view value) {
     std::istringstream input{std::string(value)};
     input.imbue(std::locale::classic());
@@ -160,8 +160,6 @@ int run_cli(int argc, char** argv) {
             options.bind = option_value(i, argc, argv);
         } else if (key == "--port") {
             options.port = static_cast<std::uint16_t>(number(option_value(i, argc, argv), 1, 65535, key));
-        } else if (key == "--transport") {
-            options.transport = parse_transport(option_value(i, argc, argv));
         } else if (key == "--windowed") {
             options.windowed = true;
         } else if (key == "--password" || key.compare(0, password_prefix.size(), password_prefix) == 0) {

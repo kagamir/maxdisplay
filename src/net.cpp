@@ -243,7 +243,7 @@ Endpoint Socket::peer_endpoint() const {
 }
 
 bool Socket::send_to(const Endpoint& peer, const std::vector<std::uint8_t>& bytes) const {
-    if (bytes.size() > max_datagram_size || !peer.port) return false;
+    if (bytes.empty() || bytes.size() > max_datagram_size || !peer.port) return false;
     sockaddr_storage storage{};
     Length length;
     if (peer.v6) {
@@ -260,7 +260,7 @@ bool Socket::send_to(const Endpoint& peer, const std::vector<std::uint8_t>& byte
         std::memcpy(&addr.sin_addr, peer.address.data(), 4);
         length = sizeof(addr);
     }
-    const char* payload = bytes.empty() ? "" : reinterpret_cast<const char*>(bytes.data());
+    const auto* payload = reinterpret_cast<const char*>(bytes.data());
     for (;;) {
         const auto count = sendto(handle_, payload, static_cast<int>(bytes.size()), 0,
                                   reinterpret_cast<const sockaddr*>(&storage), length);
@@ -271,7 +271,7 @@ bool Socket::send_to(const Endpoint& peer, const std::vector<std::uint8_t>& byte
 
 bool Socket::receive_from(Endpoint& source, std::vector<std::uint8_t>& bytes) const {
     // The extra byte catches truncation on platforms returning a short payload
-    // instead of EMSGSIZE. A zero-length firewall punch is a valid datagram.
+    // instead of EMSGSIZE.
     std::array<std::uint8_t, max_datagram_size + 1> buffer;
     sockaddr_storage storage{};
     for (;;) {
@@ -378,8 +378,14 @@ Socket bind_udp(const std::string& bind_address, std::uint16_t port) {
 
 Socket listen_tcp(const std::string& bind_address, std::uint16_t port) {
     const auto addresses = resolve(bind_address, port, true);
+    // On dual-stack names, choose a binding that can also serve ENet video.
+    std::vector<const addrinfo*> ordered;
+    for (auto* address = addresses.get(); address; address = address->ai_next) ordered.push_back(address);
+    std::stable_partition(ordered.begin(), ordered.end(), [](const auto* address) {
+        return address->ai_family == AF_INET;
+    });
     std::string reason = "No matching address";
-    for (auto* address = addresses.get(); address; address = address->ai_next) {
+    for (const auto* address : ordered) {
         try {
             auto socket = open_socket(*address);
             const auto handle = socket.native_handle();
