@@ -222,11 +222,12 @@ std::uint16_t Socket::local_port() const {
     return ntohs(reinterpret_cast<const sockaddr_in*>(&address)->sin_port);
 }
 
-bool Socket::read_exact(void* destination, std::size_t size) const {
+bool Socket::read_exact(void* destination, std::size_t size, const std::function<unsigned()>& poll_interval) const {
     auto* bytes = static_cast<char*>(destination);
     std::size_t received = 0;
     while (received < size) {
         if (stopped_.load()) throw std::runtime_error("Socket was shut down");
+        const auto timeout = poll_interval ? std::min<unsigned>(poll_interval(), INT_MAX) : 250u;
         const int chunk = static_cast<int>(std::min<std::size_t>(size - received, INT_MAX));
         const auto count = recv(handle_, bytes + received, chunk, 0);
         if (count > 0) {
@@ -236,37 +237,42 @@ bool Socket::read_exact(void* destination, std::size_t size) const {
             throw std::runtime_error("Peer disconnected in the middle of a message");
         } else {
             const int error = last_error();
-            if (would_block(error)) wait_ready(handle_, false, 250);
+            if (would_block(error)) wait_ready(handle_, false, static_cast<int>(timeout));
             else if (!interrupted(error)) throw socket_error("recv", error);
         }
     }
     return true;
 }
 
-void Socket::write_all(const void* source, std::size_t size) const {
-    const auto* bytes = static_cast<const char*>(source);
-    std::size_t sent = 0;
-    const auto deadline = Clock::now() + io_timeout;
+std::size_t Socket::write_some_until(const void* source, std::size_t size, Clock::time_point deadline) const {
+    if (!size) return 0;
+    const int chunk = static_cast<int>(std::min<std::size_t>(size, INT_MAX));
 #ifdef MSG_NOSIGNAL
     constexpr int flags = MSG_NOSIGNAL;
 #else
     constexpr int flags = 0;
 #endif
-    while (sent < size) {
+    for (;;) {
         if (stopped_.load()) throw std::runtime_error("Socket was shut down");
+        if (Clock::now() >= deadline) return 0;
         const int remaining = remaining_ms(deadline);
-        if (!remaining) throw std::runtime_error("Sending video timed out");
-        const int chunk = static_cast<int>(std::min<std::size_t>(size - sent, INT_MAX));
-        const auto count = send(handle_, bytes + sent, chunk, flags);
-        if (count > 0) {
-            sent += static_cast<std::size_t>(count);
-        } else if (count == 0) {
-            throw std::runtime_error("Peer disconnected during send");
-        } else {
-            const int error = last_error();
-            if (would_block(error)) wait_ready(handle_, true, remaining);
-            else if (!interrupted(error)) throw socket_error("send", error);
-        }
+        if (!remaining) return 0;
+        const auto count = send(handle_, static_cast<const char*>(source), chunk, flags);
+        if (count > 0) return static_cast<std::size_t>(count);
+        if (count == 0) throw std::runtime_error("Peer disconnected during send");
+        const int error = last_error();
+        if (would_block(error)) wait_ready(handle_, true, remaining);
+        else if (!interrupted(error)) throw socket_error("send", error);
+    }
+}
+
+void Socket::write_all(const void* source, std::size_t size) const {
+    const auto* bytes = static_cast<const char*>(source);
+    const auto deadline = Clock::now() + io_timeout;
+    for (std::size_t sent = 0; sent < size;) {
+        const auto count = write_some_until(bytes + sent, size - sent, deadline);
+        if (!count) throw std::runtime_error("Sending video timed out");
+        sent += count;
     }
 }
 

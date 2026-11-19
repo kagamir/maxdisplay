@@ -206,18 +206,22 @@ void check(const Frames& frames, Codec codec, Transport transport) {
         constexpr uint32_t timeout_ms = 1000;
         for (bool late : {false, true}) {
             client.emplace(options, codec, timeout_ms);
-            send_initial_frames(*client, frames, window);
             if (late) {
-                // Sequence 4 arrives in order, but its timestamp is older than the deadline.
+                // A static desktop may produce just one picture. It must paint while the session stays open.
+                client->send(frames, 0, 1);
+                if (!wait_until([&] { return sees_pattern(window, false); }, 8s))
+                    throw std::runtime_error("A single keyframe never appeared on the idle connection");
+                // Sequence 2 arrives in order, but its timestamp is older than the deadline.
                 const auto stamp = TestSender::now_us();
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms) + 150ms);
-                client->send(frames, 3, 4, true, stamp);
+                client->send(frames, 1, 2, true, stamp);
             } else {
+                send_initial_frames(*client, frames, window);
                 // Sequence 4 (a reference picture) was lost. Deliver the following delta.
                 client->send(frames, 4, 5, true);
             }
             for (unsigned i = 5; i < frames.size(); ++i)
-                client->send(frames, i, late ? i : i + 1);
+                client->send(frames, i, late ? i - 2 : i + 1);
             if (!wait_until([&] { return sees_pattern(window, true); }, 8s))
                 throw std::runtime_error("The live window never painted the recovered gray level");
             client.reset();

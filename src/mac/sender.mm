@@ -125,14 +125,17 @@ public:
         });
     }
 
-    struct EncodeRequest { std::uint32_t bitrate; bool force_key; };
+    struct EncodeRequest {
+        std::uint32_t bitrate;
+        bool force_key;
+    };
 
     std::optional<EncodeRequest> prepare(std::uint64_t capture, bool refresh_only) {
         std::lock_guard lock(mutex_);
         if (closing_) return std::nullopt;
         const auto now = now_us();
         expire(now);
-        if (control_.expired(now, capture)) {
+        if (!legacy_ && control_.expired(now, capture)) {
             // This sample was already old when ScreenCaptureKit delivered it.
             // The timer can resample its image if no newer sample arrives.
             pending_.clear();
@@ -152,10 +155,11 @@ public:
         if (closing_) return;
         const auto now = now_us();
         expire(now);
-        if (control_.expired(now, capture_us_) || pending_.size() >= 4) {
+        const bool stale = !legacy_ && control_.expired(now, capture_us_);
+        if (stale || pending_.size() >= 4) {
             pending_.clear();
             control_.loss(now);
-            if (control_.expired(now, capture_us_)) return;
+            if (stale) return;
         }
         const auto sequence = next_sequence_++;
         if (!control_.accept_encoded(sequence, keyframe)) return;
@@ -189,7 +193,7 @@ public:
 private:
     void expire(std::uint64_t now) {
         if (control_.poll(now)) pending_.clear();
-        if (!pending_.empty() && control_.expired(now, pending_.front().timestamp_us)) {
+        if (!legacy_ && !pending_.empty() && control_.expired(now, pending_.front().timestamp_us)) {
             pending_.clear();
             control_.loss(now);
         }
@@ -204,8 +208,9 @@ private:
     void receive_feedback() {
         if (udp_) {
             if (udp_->peer_closed()) throw std::runtime_error("Windows receiver disconnected");
-            if (!legacy_)
+            if (!legacy_) {
                 if (auto message = udp_->take_feedback()) feedback(*message);
+            }
         } else if (legacy_) {
             if (tcp_.peer_closed()) throw std::runtime_error("Windows receiver disconnected");
         } else {
@@ -238,12 +243,17 @@ private:
                 pending_.pop_front();
                 control_.sent(frame.sequence, now, frame.data.size());
             }
-            const auto message = legacy_ ? std::move(frame.data) : wire::pack_frame(frame);
-            if (!udp_) {
-                wire::send_frame(tcp_, message);
-            } else if (legacy_) {
-                udp_->send(message);
-            } else if (!udp_->send_frame(message)) {
+            if (legacy_) {
+                if (udp_) udp_->send(frame.data);
+                else wire::send_frame(tcp_, frame.data);
+                continue;
+            }
+            const auto message = wire::pack_frame(frame);
+            const auto age_limit = std::chrono::microseconds(control_.deadline(frame.timestamp_us));
+            const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
+            const bool sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message))
+                                   : wire::send_frame_before(tcp_, message, deadline);
+            if (!sent) {
                 std::lock_guard lock(mutex_);
                 pending_.clear();
                 control_.loss(now_us());
@@ -292,6 +302,7 @@ private:
         if (bitrate != request->bitrate) {
             encoder->set_bitrate(request->bitrate);
             bitrate = request->bitrate;
+            std::clog << "Adaptive encoder target: " << bitrate / 1000 << " kbps" << std::endl;
         }
         encoder->encode(latest, CMTimeMake(now_us(), 1'000'000), request->force_key);
     } catch (...) { connection->fail(std::current_exception()); }
@@ -393,8 +404,12 @@ int stream_desktop(const SenderOptions& options) {
                   << options.host << ':' << options.port << " using "
                   << codec_name(options.codec) << (encoder->hardware_accelerated() ? " (hardware)" : " (software)")
                   << " over "
-                  << (options.transport == Transport::udp ? "UDP" : "TCP")
-                  << ". Press Ctrl+C to stop." << std::endl;
+                  << (options.transport == Transport::udp ? "UDP" : "TCP") << ", "
+                  << (options.adaptive && !options.legacy ? "adaptive" : "fixed")
+                  << " bitrate " << options.bitrate / 1000 << " kbps";
+        if (options.legacy) std::cout << ", legacy stream";
+        else std::cout << ", frame budget " << options.timeout_ms << " ms";
+        std::cout << ". Press Ctrl+C to stop." << std::endl;
         while (!interrupted) {
             connection->check();
             encoder->check_error();

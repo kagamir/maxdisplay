@@ -20,6 +20,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -92,11 +93,18 @@ struct Receiver {
     }
 
     template<class ReadFrame, class SendFeedback>
-    void receive_live(wire::Header header, Decoder& decoder, ReadFrame& read_frame, SendFeedback& feedback) {
+    void receive_live(wire::Header header, ReadFrame& read_frame, SendFeedback& feedback) {
         using Clock = std::chrono::steady_clock;
         FrameRecovery recovery(header.timeout_ms);
-        std::deque<Clock::time_point> deadlines;
+        std::optional<Decoder> decoder;
+        decoder.emplace(header.width, header.height, header.fps, header.codec, require_hardware);
         bool used_decoder = false;
+        std::deque<Clock::time_point> deadlines;
+        Clock::time_point drain_at;
+        const auto idle_interval = std::chrono::microseconds(2'000'000 / header.fps);
+        auto acknowledge = [&] {
+            feedback(wire::pack_feedback({recovery.sequence(), recovery.waiting_for_keyframe()}));
+        };
         auto display = [&](VideoFrame&& decoded) {
             if (deadlines.empty()) return;
             const auto deadline = deadlines.front();
@@ -106,24 +114,61 @@ struct Receiver {
             else
                 recovery.recover();
         };
+        auto poll_interval = [&]() -> unsigned {
+            if (deadlines.empty() || recovery.waiting_for_keyframe()) return 100;
+            const auto now = Clock::now();
+            if (now < drain_at) {
+                const auto ms = std::chrono::ceil<std::chrono::milliseconds>(drain_at - now).count();
+                return static_cast<unsigned>(std::min<std::int64_t>(100, ms));
+            }
+            // Some MFTs buffer an input even in low-latency mode. A static Mac
+            // desktop might never send the next sample that would release it.
+            try {
+                decoder->finish(display);
+            } catch (const HardwareDecodeUnavailable&) {
+                throw;
+            } catch (const std::runtime_error& e) {
+                std::cerr << "Failed to drain video decoder: " << e.what() << '\n';
+                recovery.recover();
+            }
+            const bool need_image = recovery.waiting_for_keyframe() || !deadlines.empty();
+            decoder.reset(); // finish() ended the Media Foundation stream.
+            deadlines.clear();
+            recovery.recover();
+            // A successfully displayed static picture can stay idle indefinitely.
+            // Request a new key only on the next delta, or if the drain failed.
+            if (need_image) acknowledge();
+            return 100;
+        };
 
         std::vector<std::uint8_t> bytes;
-        while (!stopping && read_frame(bytes)) {
+        while (!stopping && read_frame(bytes, poll_interval)) {
             const auto now = Clock::now();
             const auto arrival = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch());
-            const auto packet = wire::unpack_frame(bytes);
-            if (!deadlines.empty() && now > deadlines.front()) recovery.recover();
+            wire::Frame packet;
+            try {
+                packet = wire::unpack_frame(bytes);
+            } catch (const std::runtime_error&) {
+                recovery.recover();
+                acknowledge();
+                continue;
+            }
+            if (deadlines.size() >= 32 || (!deadlines.empty() && now > deadlines.front()))
+                recovery.recover();
             const bool keyframe = packet.keyframe && has_recovery_picture(header.codec, packet.data);
             const auto action = recovery.inspect(packet.sequence, packet.timestamp_us, keyframe, arrival.count());
             if (action != FrameRecovery::Action::drop) {
                 if (action == FrameRecovery::Action::restart) {
                     deadlines.clear();
-                    if (used_decoder) decoder.reset();
+                    if (!decoder)
+                        decoder.emplace(header.width, header.height, header.fps, header.codec, require_hardware);
+                    else if (used_decoder)
+                        decoder->reset();
                 }
                 used_decoder = true;
                 deadlines.push_back(now + std::chrono::microseconds(recovery.remaining_us()));
                 try {
-                    decoder.decode(packet.data, display);
+                    decoder->decode(packet.data, display);
                 } catch (const HardwareDecodeUnavailable&) {
                     throw;
                 } catch (const std::runtime_error& e) {
@@ -131,11 +176,14 @@ struct Receiver {
                               << " frame " << packet.sequence << ": " << e.what() << '\n';
                     recovery.recover();
                 }
+                if (!deadlines.empty()) {
+                    // Leave time for the hardware readback and color conversion.
+                    drain_at = std::min(now + idle_interval, now + (deadlines.front() - now) / 2);
+                }
             }
-            const auto ack = wire::pack_feedback({recovery.sequence(), recovery.waiting_for_keyframe()});
-            feedback(ack);
+            acknowledge();
         }
-        if (!stopping && used_decoder && !recovery.waiting_for_keyframe()) decoder.finish(display);
+        if (!stopping && !deadlines.empty() && !recovery.waiting_for_keyframe()) decoder->finish(display);
     }
 
     template<class ReadHeader, class ReadFrame, class SendFeedback>
@@ -144,13 +192,13 @@ struct Receiver {
         const wchar_t* next_status = L"Stream ended. Waiting for the Mac to reconnect";
         try {
             const auto header = read_header();
-            Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
             if (header.timeout_ms) {
-                receive_live(header, decoder, read_frame, feedback);
+                receive_live(header, read_frame, feedback);
             } else {
+                Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
                 auto display = [this](VideoFrame&& decoded) { present(std::move(decoded)); };
                 std::vector<std::uint8_t> bytes;
-                while (!stopping && read_frame(bytes)) decoder.decode(bytes, display);
+                while (!stopping && read_frame(bytes, [] { return 100u; })) decoder.decode(bytes, display);
                 if (!stopping) decoder.finish(display);
             }
         } catch (const std::exception& e) {
@@ -172,7 +220,7 @@ struct Receiver {
                 active = client;
             }
             receive_stream([&] { return wire::receive_header(*client); },
-                           [&](auto& bytes) { return wire::receive_frame(*client, bytes); },
+                           [&](auto& bytes, const auto& poll) { return wire::receive_frame(*client, bytes, poll); },
                            [&](const auto& ack) { client->write_all(ack.data(), ack.size()); });
             std::lock_guard lock(mutex);
             active.reset();
@@ -180,9 +228,9 @@ struct Receiver {
     }
 
     void listen(udp::Listener& listener) {
-        auto read = [&](std::vector<std::uint8_t>& bytes) {
+        auto read = [&](std::vector<std::uint8_t>& bytes, const auto& poll) {
             while (!stopping) {
-                switch (listener.receive(bytes, 100)) {
+                switch (listener.receive(bytes, poll())) {
                 case udp::ReadResult::message: return true;
                 case udp::ReadResult::disconnected: return false;
                 case udp::ReadResult::timeout: break;
@@ -194,7 +242,8 @@ struct Receiver {
             if (!listener.accept(100)) continue;
             receive_stream([&] {
                 std::vector<std::uint8_t> bytes;
-                if (!read(bytes)) throw std::runtime_error("UDP stream ended before its header");
+                if (!read(bytes, [] { return 100u; }))
+                    throw std::runtime_error("UDP stream ended before its header");
                 return wire::decode_header(bytes);
             }, read, [&](const auto& ack) { listener.send_feedback(ack); });
             listener.disconnect();

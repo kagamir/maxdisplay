@@ -160,14 +160,26 @@ void send_frame(net::Socket& socket, const std::vector<std::uint8_t>& access_uni
     socket.write_all(access_unit.data(), access_unit.size());
 }
 
-bool receive_frame(net::Socket& socket, std::vector<std::uint8_t>& access_unit) {
+bool send_frame_before(net::Socket& socket, const std::vector<std::uint8_t>& access_unit,
+                       std::chrono::steady_clock::time_point deadline) {
+    check_size(access_unit.size());
+    const auto length = to_bytes(static_cast<std::uint32_t>(access_unit.size()));
+    const auto count = socket.write_some_until(length.data(), length.size(), deadline);
+    if (!count) return false;
+    socket.write_all(length.data() + count, length.size() - count);
+    socket.write_all(access_unit.data(), access_unit.size());
+    return true;
+}
+
+bool receive_frame(net::Socket& socket, std::vector<std::uint8_t>& access_unit,
+                   const std::function<unsigned()>& poll_interval) {
     Word length{};
-    if (!socket.read_exact(length.data(), length.size()))
+    if (!socket.read_exact(length.data(), length.size(), poll_interval))
         return false;
     const auto size = from_bytes(length.data());
     check_size(size);
     access_unit.resize(size);
-    if (!socket.read_exact(access_unit.data(), size))
+    if (!socket.read_exact(access_unit.data(), size, poll_interval))
         throw std::runtime_error("Peer disconnected before sending the video access unit");
     return true;
 }

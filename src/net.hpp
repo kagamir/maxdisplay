@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace net {
@@ -31,10 +33,16 @@ public:
     bool peer_closed() const;
 
     // Returns false on EOF before the first byte. A partial read at EOF throws.
-    bool read_exact(void* destination, std::size_t size) const;
+    // Before each read, poll_interval can service pending video and choose how
+    // long to wait if the next bytes haven't arrived yet.
+    bool read_exact(void* destination, std::size_t size,
+                    const std::function<unsigned()>& poll_interval = {}) const;
     // Returns zero if no data is ready. EOF and connection failures throw.
     std::size_t try_read(void* destination, std::size_t size) const;
     void write_all(const void* source, std::size_t size) const;
+    // Returns the number committed, or zero when the deadline expires first.
+    std::size_t write_some_until(const void* source, std::size_t size,
+                                 std::chrono::steady_clock::time_point deadline) const;
 
     NativeSocket native_handle() const noexcept { return handle_; }
     std::uint16_t local_port() const;

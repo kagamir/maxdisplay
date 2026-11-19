@@ -64,6 +64,30 @@ void adaptation() {
         control.acknowledge(seq, false, now + 5'000);
     }
     expect(control.bitrate() == ceiling, "Recovery failed to respect the configured ceiling");
+
+    control.loss(now += 300'000);
+    const auto idle_rate = control.bitrate();
+    for (int i = 0; i < 3; ++i, ++seq) {
+        now += 8'000'000;
+        control.sent(seq, now, 500);
+        control.acknowledge(seq, false, now + 5'000);
+    }
+    expect(control.bitrate() == idle_rate, "Sparse ACKs incorrectly counted as sustained delivery");
+}
+
+void latency_baseline() {
+    StreamControl control(4'000'000, 60, 200, true, true);
+    control.sent(1, 1'000, 8'000);
+    control.acknowledge(1, false, 5'000);
+    std::uint32_t floor = control.bitrate();
+    // The route changes from 4ms to a stable 90ms, still within the deadline.
+    for (unsigned seq = 2; seq <= 160; ++seq) {
+        const auto sent = seq * 100'000u;
+        control.sent(seq, sent, 8'000);
+        control.acknowledge(seq, false, sent + 90'000);
+        floor = std::min(floor, control.bitrate());
+    }
+    expect(floor < 4'000'000 && control.bitrate() > floor, "RTT baseline never adapted to the new route");
 }
 
 void fixed_and_wrapped() {
@@ -94,6 +118,7 @@ int main() {
     try {
         idle_recovery();
         adaptation();
+        latency_baseline();
         fixed_and_wrapped();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';

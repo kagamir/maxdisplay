@@ -167,6 +167,44 @@ void malformed_frame(const Bytes& bytes) {
     expect_failure([&] { wire::receive_frame(connection.reader, frame); }, "Invalid frame was accepted");
 }
 
+void partial_frame_polling() {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    Connection connection;
+    const Bytes prefix{0, 0};
+    connection.writer.write_all(prefix.data(), prefix.size());
+    unsigned stage = 0;
+    auto resume = Clock::now() + 12ms;
+    auto poll = [&] {
+        if (stage < 2 && Clock::now() >= resume) {
+            // Resume first a partial length prefix, then a partial frame body.
+            const Bytes next = stage == 0 ? Bytes{0, 3, 0xaa} : Bytes{0xbb, 0xcc};
+            connection.writer.write_all(next.data(), next.size());
+            ++stage;
+            resume = Clock::now() + 12ms;
+        }
+        return 2u;
+    };
+    Bytes frame;
+    require(wire::receive_frame(connection.reader, frame, poll) && frame == Bytes{0xaa, 0xbb, 0xcc},
+            "Polling a partial TCP frame lost framing");
+    require(stage == 2, "No idle poll during partial TCP frame");
+}
+
+void frame_commit_deadline() {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    Connection connection;
+    require(!wire::send_frame_before(connection.writer, {0x41}, Clock::now() - 1ms),
+            "An expired frame was committed to TCP");
+    require(!net::wait_readable(connection.reader, 0), "Dropped TCP frame left a length prefix");
+    require(wire::send_frame_before(connection.writer, {0x65}, Clock::now() + 2s),
+            "Fresh frame missed the TCP commit deadline");
+    Bytes frame;
+    require(wire::receive_frame(connection.reader, frame) && frame == Bytes{0x65},
+            "Dropped frame corrupted the subsequent TCP frame");
+}
+
 void cancel_read() {
     Connection connection;
     std::promise<void> reading;
@@ -198,6 +236,8 @@ int main() {
         check_layout();
         codec_headers();
         timed_frames_and_feedback();
+        partial_frame_polling();
+        frame_commit_deadline();
         large_frame();
         auto header = hello;
         header[0] = 0;

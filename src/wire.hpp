@@ -44,6 +44,10 @@ Frame unpack_frame(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> pack_feedback(Feedback feedback);
 Feedback unpack_feedback(const std::vector<std::uint8_t>& bytes);
 void send_frame(net::Socket& socket, const std::vector<std::uint8_t>& access_unit);
-bool receive_frame(net::Socket& socket, std::vector<std::uint8_t>& access_unit);
+// Drops an expired frame only before writing any part of its length prefix.
+bool send_frame_before(net::Socket& socket, const std::vector<std::uint8_t>& access_unit,
+                       std::chrono::steady_clock::time_point deadline);
+bool receive_frame(net::Socket& socket, std::vector<std::uint8_t>& access_unit,
+                   const std::function<unsigned()>& poll_interval = {});
 
 } // namespace wire

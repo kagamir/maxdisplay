@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -19,9 +20,8 @@ public:
 
     std::uint32_t bitrate() const { return bitrate_; }
     bool needs_key() const { return needs_key_; }
-    bool expired(std::uint64_t now, std::uint64_t capture) const {
-        return now >= capture && now - capture >= budget_;
-    }
+    std::uint64_t deadline(std::uint64_t capture) const { return capture + budget_; }
+    bool expired(std::uint64_t now, std::uint64_t capture) const { return now >= deadline(capture); }
 
     // Call periodically even on a stationary screen. A single missing final
     // frame cannot be discovered from the next sequence number on such screens.
@@ -73,8 +73,7 @@ public:
                 if (sample.sequence == sequence) break;
             } while (!flight_.empty());
             record_delivery(bytes, now, request_key);
-            base_rtt_ = std::min(base_rtt_.value_or(rtt), rtt);
-            const auto queued_delay = rtt - *base_rtt_;
+            const auto queued_delay = rtt - baseline_rtt(rtt, now);
             if (rtt >= budget_ || queued_delay > std::max<std::uint64_t>(12'000, budget_ / 3))
                 congestion(now);
             else if (!request_key && queued_delay <= budget_ / 6)
@@ -97,13 +96,33 @@ private:
     bool adaptive_, feedback_, needs_key_ = true;
     std::deque<Sample> flight_;
     std::optional<std::uint32_t> latest_key_;
-    std::optional<std::uint64_t> last_request_, last_cut_, healthy_since_, base_rtt_;
+    std::optional<std::uint64_t> last_request_, last_cut_, healthy_since_;
+    std::optional<std::uint64_t> rtt_window_start_, previous_min_rtt_;
+    std::uint64_t current_min_rtt_ = 0;
     std::optional<std::uint64_t> delivery_start_;
     std::uint64_t delivered_ = 0;
     std::optional<std::uint32_t> delivery_bps_;
 
+    // Keep a rolling minimum across two windows so a lasting change of route
+    // below the frame budget eventually establishes a new latency baseline.
+    std::uint64_t baseline_rtt(std::uint64_t rtt, std::uint64_t now) {
+        constexpr std::uint64_t window = 5'000'000;
+        if (!rtt_window_start_ || now - *rtt_window_start_ >= window) {
+            if (rtt_window_start_ && now - *rtt_window_start_ < 2 * window)
+                previous_min_rtt_ = current_min_rtt_;
+            else
+                previous_min_rtt_.reset();
+            rtt_window_start_ = now;
+            current_min_rtt_ = rtt;
+        } else {
+            current_min_rtt_ = std::min(current_min_rtt_, rtt);
+        }
+        return std::min(current_min_rtt_, previous_min_rtt_.value_or(current_min_rtt_));
+    }
+
     void record_delivery(std::uint64_t bytes, std::uint64_t now, bool loss_reported) {
         if (!delivery_start_ || loss_reported || now - *delivery_start_ > 1'000'000) {
+            healthy_since_.reset();
             delivery_start_ = now;
             delivered_ = 0;
             delivery_bps_.reset();
