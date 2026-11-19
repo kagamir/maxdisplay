@@ -1,32 +1,109 @@
 # MaxDisplay
 
-把 Windows 笔记本用作 Mac 的第二块屏幕。Mac 在系统中注册一台名为 **MaxDisplay** 的虚拟显示器，Windows 全屏显示这块桌面。你可以在 Mac 内置屏上写代码，同时把浏览器或其他窗口拖到 Windows 屏上。键盘和指针由 Mac 控制。
+[![Build](https://github.com/kagamir/maxdisplay/actions/workflows/build.yml/badge.svg)](https://github.com/kagamir/maxdisplay/actions/workflows/build.yml)
+[![Latest release](https://img.shields.io/github/v/release/kagamir/maxdisplay)](https://github.com/kagamir/maxdisplay/releases/latest)
 
-MaxDisplay 使用一套 C++17 代码和一个 CMake 项目，按操作系统生成一个可执行文件。macOS 的系统接口通过 Objective-C++ 调用。Mac 使用 VideoToolbox 编码 H.264 和 H.265（HEVC），也可以用 libaom 软件编码 AV1。Windows 根据发送端选择的格式解码。
+**Use a Windows PC as a second display for your Mac.**
 
-## 开始使用
+MaxDisplay adds a virtual display named **MaxDisplay** to your Mac and streams it to a Windows PC, which shows it full screen. Keep your code on the Mac's built-in screen and drag a browser, or any other window, onto the Windows one. The keyboard and pointer stay on the Mac.
 
-从 [GitHub Releases](https://github.com/kagamir/maxdisplay/releases) 打开所需版本，在 **Assets** 下载对应平台的程序。Windows x64 下载并运行 `maxdisplay-windows-x64.exe`。Apple Silicon Mac 下载 `maxdisplay-macos-arm64.tar.gz`，运行 `tar -xzf maxdisplay-macos-arm64.tar.gz` 即可取出 `maxdisplay`。推送 Git 标签后，CI 会在双平台构建及互通测试通过后，将程序发布到同名 Release。Windows 用户运行单个 EXE 即可。需要替换内置 HEVC 解码库并重新链接 Windows 程序时，可下载同一 Release 内的 `maxdisplay-windows-relink.zip`。
+[Quick start](#quick-start) · [Configuration](#configuration) · [Command reference](#command-reference) · [Troubleshooting](#troubleshooting) · [Building from source](#building-from-source) · [How it works](#how-it-works)
 
-1. 将两台电脑接入同一个可信局域网。Windows 接收端启动后会在等待界面列出监听地址和窗口所在显示器的当前像素分辨率。有默认路由的网卡地址优先，再列其他有路由的地址。下文用 `192.168.1.50` 举例。
-2. 在 Windows PowerShell 中启动接收端。直接双击下载的程序也会进入接收模式。防火墙若询问网络访问，请允许专用网络上的入站连接。
+## Features
 
-   ```powershell
-   .\maxdisplay-windows-x64.exe receive
-   ```
+- **A real extended display.** macOS treats MaxDisplay like any other monitor, so you arrange it in System Settings and drag windows across.
+- **Fits the Windows screen automatically.** The stream matches the pixel resolution of the monitor the receiver is on. `--size` and `--scale` give you HiDPI rendering or more desktop room.
+- **H.264, H.265 and AV1.** The Mac encodes with VideoToolbox hardware, Windows decodes with hardware when it can, and software fallbacks are built in on both sides.
+- **Adapts to your network.** Bitrate and frame rate adjust on their own, up to 60 fps and 12 Mbps by default.
+- **Sharp when still.** Once the desktop stops changing, the Mac keeps refining the last picture so text and edges clear up.
+- **TCP or UDP.** TCP is the default. UDP keeps latency low on networks that drop packets.
+- **Recovers by itself.** After loss or a timeout the receiver holds the last picture and resumes at the next keyframe. After a disconnect it waits for the Mac to come back.
+- **One executable per platform.** There is no installer and no background service.
 
-3. 在 Mac 终端启动发送端，把地址换成 Windows 的实际地址。
+## Requirements
 
-   ```bash
-   ./maxdisplay send 192.168.1.50
-   ```
+| | Mac (sender) | Windows (receiver) |
+| --- | --- | --- |
+| System | macOS 13 or later | Windows 10 version 1703 or later, or Windows 11, x64 |
+| Prebuilt download | Apple Silicon | x64 |
+| Setup | Screen Recording permission | Windows N editions need the Media Feature Pack, followed by a restart |
 
-4. 首次运行需要授予屏幕录制权限。如果系统要求重启，在「系统设置 → 隐私与安全性 → 屏幕录制」（部分版本称「屏幕与系统音频录制」）允许系统提示的终端或程序，完全退出并重新打开它，再执行上面的命令。
-5. 在 Mac 的「系统设置 → 显示器 → 排列」中把 **MaxDisplay** 拖到 Windows 电脑实际所在的一侧，随后把一个窗口拖过该边缘。Windows 上按 **F11** 切换全屏，按 **Esc** 退出。在 Mac 上按 **Ctrl+C** 会释放虚拟屏，Windows 接收端可继续等待下次连接。
+Both computers must be on the same trusted local network.
 
-默认使用 H.264 和 TCP 49300，串流分辨率跟随 Windows 接收窗口所在的显示器。帧率上限为 60 fps，码率上限为 12 Mbps，帧超时为 200 ms。Windows 接收端在等待和播放期间都会阻止系统因空闲而自动关屏或睡眠，退出时释放该请求。屏幕静止时保留最后一帧。Windows 接收端默认监听所有 IPv4 接口，一次接收一个 Mac。TCP 和 UDP 均使用明文传输，请使用可信局域网或私有网络连接。
+> [!WARNING]
+> MaxDisplay sends video unencrypted over both TCP and UDP. Use it only on a local or private network you trust.
 
-## 调整画质和监听地址
+## Quick start
+
+### 1. Download
+
+Get both files from the [latest release](https://github.com/kagamir/maxdisplay/releases/latest), under **Assets**.
+
+| Platform | File |
+| --- | --- |
+| Windows x64 | `maxdisplay-windows-x64.exe` |
+| Mac with Apple Silicon | `maxdisplay-macos-arm64.tar.gz` |
+
+On the Mac, unpack the archive to get the `maxdisplay` executable:
+
+```bash
+tar -xzf maxdisplay-macos-arm64.tar.gz
+```
+
+### 2. Start the receiver on Windows
+
+Double-click `maxdisplay-windows-x64.exe`, or run it from PowerShell:
+
+```powershell
+.\maxdisplay-windows-x64.exe receive
+```
+
+If Windows Firewall asks about network access, allow inbound connections on private networks.
+
+The waiting screen lists the addresses the receiver is listening on and the pixel resolution of the monitor it is on. Addresses on the adapter with the default route come first. The examples below use `192.168.1.50`.
+
+### 3. Start the sender on the Mac
+
+Replace the address with one from the Windows waiting screen:
+
+```bash
+./maxdisplay send 192.168.1.50
+```
+
+The first run needs Screen Recording permission. If macOS asks you to restart the app:
+
+1. Open **System Settings → Privacy & Security → Screen Recording**. Some macOS versions call it **Screen & System Audio Recording**.
+2. Allow the terminal or app named in the prompt.
+3. Quit that app completely, reopen it, and run the command again.
+
+### 4. Arrange the display
+
+On the Mac, open **System Settings → Displays → Arrange** and drag **MaxDisplay** to the side where the Windows PC actually sits. Then drag a window across that edge.
+
+### Controls
+
+| Where | Key | Action |
+| --- | --- | --- |
+| Windows | **F11** | Toggle full screen |
+| Windows | **Esc** | Exit the receiver |
+| Mac | **Ctrl+C** | Stop sharing and remove the virtual display. The receiver keeps waiting for the next connection |
+
+### Defaults
+
+| Setting | Default |
+| --- | --- |
+| Codec | H.264 |
+| Transport | TCP, port 49300 |
+| Stream resolution | The pixel resolution of the monitor the receiver window is on |
+| Frame rate | Up to 60 fps |
+| Bitrate | Up to 12 Mbps |
+| Frame timeout | 200 ms |
+
+The receiver listens on all IPv4 interfaces and accepts one Mac at a time. While it is waiting or playing, it stops Windows from turning off the display or going to sleep when idle, and it releases that request on exit. When the Mac's screen is still, the last frame stays on screen.
+
+## Configuration
+
+Both executables print their options with `--help`. This example moves the receiver to a specific address and port in a window, and sends a 2560×1440 desktop at up to 24 Mbps:
 
 ```powershell
 .\maxdisplay-windows-x64.exe receive --bind 192.168.1.50 --port 49301 --windowed
@@ -36,52 +113,172 @@ MaxDisplay 使用一套 C++17 代码和一个 CMake 项目，按操作系统生�
 ./maxdisplay send 192.168.1.50 --port 49301 --size 2560x1440 --fps 60 --bitrate-mbps 24
 ```
 
-**`--size` 定义 Mac 虚拟桌面的逻辑分辨率**，它决定桌面能排下多少内容。`--scale` 决定每个逻辑点对应多少个串流像素，默认 1。省略 `--size` 时，Mac 在建立连接时查询 Windows 接收窗口所在显示器的当前像素分辨率，用宽、高分别除以 `--scale`，四舍五入得到逻辑尺寸。Windows 上的系统缩放百分比不参与计算。
+### Resolution and scaling
 
-| Windows 屏幕 | Mac 参数 | Mac 虚拟桌面 | 串流画面 |
+Two options on the Mac control the picture size:
+
+- **`--size`** sets the logical resolution of the Mac's virtual desktop, which decides how much fits on it.
+- **`--scale`** sets how many stream pixels each logical point gets. The default is 1.
+
+The stream size is `--size` multiplied by `--scale`. A scale above 1 gives sharper, larger content. A scale below 1 gives more room.
+
+Without `--size`, the Mac asks the receiver at connection time for the current pixel resolution of the monitor the receiver window is on, divides the width and height by `--scale`, and rounds the result to get the logical size. The Windows display scaling percentage plays no part.
+
+| Windows screen | Mac options | Mac virtual desktop | Stream |
 | --- | --- | --- | --- |
-| 1920×1080 | 使用默认参数 | 1920×1080 | 1920×1080 |
+| 1920×1080 | none | 1920×1080 | 1920×1080 |
 | 1920×1080 | `--scale 0.75` | 2560×1440 | 1920×1080 |
 | 2560×1440 | `--scale 2` | 1280×720 | 2560×1440 |
 | 1920×1080 | `--size 1280x720 --scale 1.5` | 1280×720 | 1920×1080 |
 
-显式指定 `--size` 时，逻辑尺寸保持不变，宽、高分别乘以 `--scale` 得到编码尺寸，乘积都须为偶数整数。自动取值时，如果 Windows 屏幕某一边为奇数，编码尺寸在该边少 1 像素，以满足 4:2:0 格式要求。大于 1 的比例会优先请求系统以 2× HiDPI 绘制虚拟桌面，再采样到目标视频尺寸。系统未能启用 HiDPI 时会保留相同的逻辑桌面尺寸。Mac 的启动日志会分别列出虚拟桌面和串流尺寸。
+Details worth knowing:
 
-串流尺寸受编解码器约束，目前最大为 4096×2304。H.264 还受 Level 5.1 的宏块速率限制，自动帧率会把 3840×2160 的上限降至 30 fps。如果接收屏超出支持范围，可以显式指定较小的桌面和串流尺寸。两端可用 `--help` 查看参数。
+- With an explicit `--size`, the logical size stays exactly as given. The width and height multiplied by `--scale` must both be even integers.
+- In automatic mode, if one side of the Windows screen has an odd number of pixels, the stream is 1 pixel smaller on that side, as 4:2:0 video requires.
+- A scale above 1 asks macOS to draw the virtual desktop at 2× HiDPI and then resamples it to the stream size. If macOS cannot enable HiDPI, the logical desktop size stays the same.
+- The Mac's startup log prints the virtual desktop size and the stream size separately.
 
-### H.265、硬件加速和 UDP
+**Limits.** The stream can be at most 4096×2304. H.264 is also bound by the Level 5.1 macroblock rate, so the automatic frame rate caps 3840×2160 at 30 fps. If the Windows screen is larger than the supported range, pass a smaller `--size` and `--scale` explicitly.
 
-Mac 用 `--codec h264`、`--codec h265` 或 `--codec av1` 选择编码，Windows 会自动识别。比如，两台电脑通过 Wi-Fi 连接时，可用下面的命令传输 2560×1440 的 H.265 画面，每秒最多 60 帧。两端都选用 UDP，Windows 防火墙需允许该 UDP 端口入站。
+### Codecs and hardware acceleration
 
-**Windows**
+Choose the codec on the Mac with `--codec h264`, `--codec h265` or `--codec av1`. The receiver detects it automatically.
+
+| Codec | Mac encoder | Windows decoder |
+| --- | --- | --- |
+| H.264 (default) | VideoToolbox hardware, then the system software encoder | Hardware when available, then software |
+| H.265 | VideoToolbox hardware, then the system software encoder | Hardware when available, then software |
+| AV1 | Built-in libaom software encoder | Hardware when available, then software |
+
+- On the Mac, if hardware setup, encoding or a bitrate change fails, MaxDisplay logs the reason and switches to the system's software encoder for the same codec.
+- On Windows, if hardware decoding fails, MaxDisplay prints a warning and switches to software. The fallbacks are Windows Media Foundation and the built-in HEVC and AV1 software decoders, so H.265 works even without the system HEVC component.
+- Pass `--require-hardware` on either side to make that side use hardware only. On the Mac it applies to H.264 and H.265.
+
+### TCP or UDP
+
+TCP is the default. It delivers everything in order, so data already written to the connection still has to arrive, even when it is late.
+
+UDP splits each picture into fragments. Missing keyframe fragments are retransmitted individually, and a regular frame that loses a fragment is skipped. Choose UDP when low latency matters more than every frame on a network that drops packets, such as Wi-Fi.
+
+Set `--transport udp` on both sides, and allow that UDP port inbound in Windows Firewall. For example, this sends a 2560×1440 H.265 stream at up to 60 fps over Wi-Fi:
 
 ```powershell
 .\maxdisplay-windows-x64.exe receive --transport udp
 ```
 
-**Mac**
-
 ```bash
 ./maxdisplay send 192.168.1.50 --codec h265 --transport udp --size 1280x720 --scale 2 --fps 60 --bitrate-mbps 16 --frame-timeout-ms 150
 ```
 
-H.264 和 H.265 默认在 Mac 优先尝试 VideoToolbox 硬编码。硬件初始化、编码或码率调整失败时，Mac 会记录原因并尝试系统的同格式软件编码器。Mac 选择 AV1 时使用内置的 libaom 软件编码。Windows 会优先尝试可用的硬件解码器，失败时输出警告并切换到软件。Windows 自带的 Media Foundation、内置的 HEVC 和 AV1 软件解码器提供回退路径。两个平台都可以单独指定 `--require-hardware` 强制本机使用硬件。
+### Adaptive bitrate and frame rate
 
-### 动态码率、帧率和超时恢复
+Both adapt by default. `--bitrate-mbps` and `--fps` set the ceilings.
 
-- 默认同时开启动态码率与帧率。`--bitrate-mbps` 和 `--fps` 分别设置上限。出现网络排队时先降码率。编码持续过慢或连续降低码率后仍有积压，才降低帧率。帧率按采集上限的整数约数调整，例如 60、30、20、15 fps。健康反馈可以跨桌面操作的空闲间隙累计，恢复时优先回到此前稳定的码率。
-- 桌面停止变化后，Mac 在最多 2 秒内重复编码最后一幅画面，逐步补清文字和边缘。在支持质量指标的 VideoToolbox 编码器上，亮度 PSNR 达到 42 dB 或连续 500 ms 的提升不足 0.2 dB 时提前结束。AV1 的量化值降到 24 或更低时提前结束。丢帧或拥塞也会停止本轮补帧。
-- 用 `--fixed-fps` 固定帧率目标并保留动态码率，用 `--fixed-bitrate` 固定码率目标并保留动态帧率。可以同时使用两项。控制台会报告目标值的调整。
-- 排查画质和卡顿时，两端分别添加 `--stats`。Mac 每秒输出目标和实际发送的码率、帧率、RTT、估算排队延迟、编码耗时、可用画质指标以及分原因降档和关键帧统计。Windows 每秒输出收帧、解码、实际绘制的帧数和耗时、解码器类型，以及请求关键帧的原因。
-- `--frame-timeout-ms` 设置实时帧预算，默认 200 ms。反馈模式下仅在起流和恢复时主动请求关键帧，关键帧的发送和确认使用较宽的时限。发送端丢弃排队过久的帧，接收端用两帧之间的相对时间变化估算新增排队延迟，无需两台机器校时。发生序号缺口、超时或解码错误时，接收端保留最后一幅已显示的画面，等待可独立解码的关键帧，然后恢复。该预算无法保证从采集到屏幕点亮的总延迟。
-- TCP 保证按序交付，已经写入 TCP 的数据仍需传完。UDP 会分片发送画面。关键帧缺失的分片可单独重传，同一时间最多有一个关键帧等待传输确认。普通视频帧丢失分片后直接跳过。需要在有丢包的网络上优先保持低延迟时，可在两端选择 `--transport udp`。
-- 新接收端兼容已有的流协议。若 Windows 支持 v3 但尚未升级到自动尺寸查询版本，请显式传 `--size`。连接更早的 v1/v2 接收端时，加 `--legacy` 使用旧版 H.264/AV1 握手和固定码率、帧率，省略尺寸时使用 1920×1080 的逻辑桌面。
+- When the network starts to queue, MaxDisplay lowers the bitrate first.
+- It lowers the frame rate only when encoding stays too slow, or when a backlog remains after repeated bitrate cuts. The frame rate moves in whole divisors of the capture ceiling, such as 60, 30, 20 and 15 fps.
+- Healthy feedback adds up across the idle gaps in normal desktop use, and recovery returns to the last stable bitrate first.
+- `--fixed-bitrate` holds the bitrate target while the frame rate still adapts. `--fixed-fps` holds the frame rate target while the bitrate still adapts. You can combine them.
 
-## 从源码构建
+The console reports each change to the targets.
 
-在仓库根目录运行，要求 CMake 3.20 或更新版以及 Git。首次配置时 CMake 会获取固定版本的 ENet、libaom 及 Windows 所需的 libde265 并静态链接。可执行文件的 `--licenses` 选项列出随程序分发的第三方声明。
+### Refinement when the screen is still
 
-**macOS 13 或更新版**，使用 Xcode 或对应的命令行工具和 macOS SDK。
+When the desktop stops changing, the Mac re-encodes the last picture for up to 2 seconds so text and edges get progressively cleaner. It stops early when:
+
+- a VideoToolbox encoder that reports quality metrics reaches a luma PSNR of 42 dB, or improves by less than 0.2 dB over 500 ms,
+- the AV1 quantizer drops to 24 or below, or
+- a frame is dropped or the network becomes congested.
+
+### Frame timeout and recovery
+
+`--frame-timeout-ms` sets the real-time budget for a frame. The default is 200 ms.
+
+- The sender drops frames that have waited in its queue too long.
+- The receiver estimates added queueing delay from the change in timing between frames, so the two clocks do not need to be synchronized.
+- After a sequence gap, a timeout or a decoding error, the receiver keeps the last displayed picture, waits for a keyframe it can decode on its own, and then resumes.
+- Keyframes are requested only at stream start and during recovery, and they get a wider time limit for sending and acknowledgement. Over UDP, at most one keyframe awaits acknowledgement at a time.
+
+This budget does not guarantee the total delay from capture to the screen lighting up.
+
+### Statistics
+
+Add `--stats` on either side to print per-second statistics on that device. Use it on both when you are chasing blur or stutter.
+
+- **Mac:** target and actual bitrate and frame rate, round-trip time, estimated queueing delay, encoding time, available quality metrics, and counts of step-downs and keyframes by cause.
+- **Windows:** frames received, decoded and actually drawn, with their timings, the decoder type, and the reasons for keyframe requests.
+
+### Older receivers
+
+A current receiver accepts every earlier version of the stream protocol. For a current Mac sending to an older Windows receiver:
+
+- If the receiver speaks protocol v3 but predates automatic size detection, pass `--size` explicitly.
+- For a v1 or v2 receiver, add `--legacy`. This uses the old H.264 or AV1 handshake with a fixed bitrate and frame rate, and a 1920×1080 logical desktop when `--size` is omitted. It cannot be combined with `--codec h265` or `--frame-timeout-ms`.
+
+## Command reference
+
+### `maxdisplay send <windows-host>` on macOS
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--port PORT` | `49300` | Receiver port |
+| `--size WIDTHxHEIGHT` | Windows monitor ÷ scale | Logical size of the virtual desktop |
+| `--scale FACTOR` | `1` | Stream pixels per logical point. Any positive number, such as `1.5` or `2` |
+| `--codec NAME` | `h264` | `h264`, `h265` (or `hevc`) or `av1` |
+| `--transport NAME` | `tcp` | `tcp` or `udp`. Must match the receiver |
+| `--fps FPS` | `60` | Frame rate ceiling, 1 to 120 |
+| `--bitrate-mbps MBPS` | `12` | Bitrate ceiling, 1 to 100 |
+| `--frame-timeout-ms MS` | `200` | Real-time frame budget, 1 to 60000 |
+| `--fixed-bitrate` | off | Hold the bitrate at its target |
+| `--fixed-fps` | off | Hold the frame rate at its target |
+| `--require-hardware` | off | Use the hardware encoder only. H.264 and H.265 |
+| `--legacy` | off | Talk to a v1 or v2 receiver |
+| `--stats` | off | Print per-second statistics |
+
+### `maxdisplay [receive]` on Windows
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--bind IP` | `0.0.0.0` | IPv4 address to listen on |
+| `--port PORT` | `49300` | Port to listen on |
+| `--transport NAME` | `tcp` | `tcp` or `udp`. Must match the sender |
+| `--windowed` | off | Start in a window instead of full screen |
+| `--require-hardware` | off | Use a hardware decoder only |
+| `--stats` | off | Print per-second statistics |
+
+### Both platforms
+
+| Option | Description |
+| --- | --- |
+| `--help`, `-h` | Show usage |
+| `--licenses` | Print the notices for bundled third-party software |
+
+## Troubleshooting
+
+**The Mac cannot connect.**
+Start the Windows receiver first. Use an address from its waiting screen, and make sure `--port` and `--transport` match on both sides. In Windows Firewall, allow inbound connections for MaxDisplay on private networks. That is TCP 49300 by default, or the UDP port when you use `--transport udp`.
+
+**The sender stops and asks for Screen Recording.**
+Allow the terminal or app under **System Settings → Privacy & Security → Screen Recording**, quit it completely, reopen it, and run the command again.
+
+**The picture is soft or it stutters.**
+Add `--stats` on both sides to see where frames are lost or delayed. Raise `--bitrate-mbps` if the network has room. On Wi-Fi or any network that drops packets, try `--transport udp` on both sides.
+
+**The sender rejects the size.**
+The stream cannot exceed 4096×2304, and with an explicit `--size` the width and height multiplied by `--scale` must be even integers. Pass a smaller or different `--size` and `--scale`.
+
+**3840×2160 runs at 30 fps.**
+That is the H.264 Level 5.1 limit at that size.
+
+**The Windows receiver is an older build.**
+See [Older receivers](#older-receivers).
+
+## Building from source
+
+You need CMake 3.20 or later and Git. The first configure step downloads pinned versions of ENet, libaom and, on Windows, libde265, and links them statically. Run the commands from the repository root.
+
+### macOS 13 or later
+
+Install Xcode, or the Command Line Tools with a macOS SDK.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -89,7 +286,9 @@ cmake --build build --parallel
 ./build/maxdisplay --help
 ```
 
-**Windows 10（1703 或更新版）或 Windows 11 x64**，使用 Visual Studio 2022 的「使用 C++ 的桌面开发」工作负载和 Windows SDK，并将 NASM 加入 PATH。Windows N 版需要安装 Media Feature Pack 并重启。
+### Windows 10 (1703 or later) or Windows 11, x64
+
+Install Visual Studio 2022 with the **Desktop development with C++** workload and a Windows SDK, and put NASM on your `PATH`.
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -97,10 +296,49 @@ cmake --build build --config Release --parallel
 .\build\Release\maxdisplay.exe --help
 ```
 
-## 实现与验证
+### Tests
 
-- macOS 通过 CoreGraphics 的私有 `CGVirtualDisplay` 接口建立虚拟屏，用 ScreenCaptureKit 捕获画面和指针。VideoToolbox 使用实时模式并关闭帧重排。H.264 关键帧携带 SPS/PPS，HEVC Main 关键帧携带 VPS/SPS/PPS，均以 Annex B 发送。AV1 使用低延迟的 libaom 编码。
-- v3 握手协商编码、画面尺寸、帧率和超时，每个访问单元附带序号、发送端时间戳及实际关键帧标记。Windows 反馈接收进度与关键帧请求。TCP 对每帧使用大端长度前缀，UDP 通过 ENet 可靠传递握手及关键帧，其他视频帧使用可丢弃的有序消息。
-- Windows 从解码后的 YUV 数据生成显示画面，按比例缩放并在需要时留黑边。D3D11 路径读取实际解码表面。
-- 构建后执行 `ctest --test-dir build -C Release --output-on-failure`。测试覆盖协议、参数、码率调整和关键帧恢复。macOS 测试在已获得屏幕录制权限的环境中启动虚拟显示器并采集画面。CI 还会编码测试图，在 Windows 上验证解码像素、帧序和 TCP/UDP 接收。Windows 上的 HEVC 测试也覆盖缺少系统 HEVC 组件时的软件回退。
-- 双机验收可将窗口拖到虚拟屏，移动指针，观察 Windows 桌面是否只显示扩展区域。停止发送后检查 Mac 的显示器列表，再发起一次连接确认可以重新使用。
+```bash
+ctest --test-dir build -C Release --output-on-failure
+```
+
+The tests cover the protocol, option parsing, rate adaptation and keyframe recovery. On macOS they also start a virtual display and capture from it, which needs Screen Recording permission. CI additionally encodes test patterns on the Mac and checks decoded pixels, frame order and TCP and UDP reception on Windows. The Windows HEVC tests include the software fallback used when the system HEVC component is missing.
+
+To check a real pair of machines by hand:
+
+1. Drag a window onto the virtual display and move the pointer across it.
+2. Confirm that the Windows screen shows only the extended area.
+3. Stop the sender and check that MaxDisplay is gone from the Mac's display list.
+4. Connect again to confirm the receiver can be reused.
+
+### Releases
+
+Pushing a Git tag makes CI build both platforms, run the cross-platform interoperability tests and, once they pass, publish the binaries to the GitHub Release of the same name.
+
+## How it works
+
+```
+Mac (sender)                                          Windows (receiver)
+virtual display → capture → encode  ── TCP or UDP ──▶  decode → scale → window
+                                    ◀── feedback ────
+```
+
+MaxDisplay is one C++17 codebase and one CMake project that builds a single executable for each operating system. macOS system APIs are called through Objective-C++.
+
+- **Virtual display and capture.** macOS creates the display through CoreGraphics' private `CGVirtualDisplay` interface and captures the picture and pointer with ScreenCaptureKit.
+- **Encoding.** VideoToolbox runs in real-time mode with frame reordering off. H.264 keyframes carry SPS and PPS, and HEVC Main keyframes carry VPS, SPS and PPS, all sent as Annex B. AV1 uses libaom in a low-latency configuration.
+- **Protocol.** The v3 handshake negotiates codec, picture size, frame rate and timeout. Every access unit carries a sequence number, a sender timestamp and a flag marking real keyframes. The receiver reports its progress and requests keyframes.
+- **Transport.** TCP prefixes each frame with a big-endian length. UDP uses ENet: the handshake and keyframes travel reliably, and all other frames go as droppable, sequenced messages.
+- **Display.** Windows builds the picture from the decoded YUV data, scales it proportionally and adds black bars when needed. The D3D11 path reads the actual decoded surface.
+
+## Third-party software
+
+MaxDisplay links these libraries statically. Run `maxdisplay --licenses` for the full notices.
+
+| Library | Used for | License |
+| --- | --- | --- |
+| [ENet](http://enet.bespin.org/) | UDP transport | MIT |
+| [libaom](https://aomedia.googlesource.com/aom/) | AV1 encoding and decoding | BSD 2-Clause, with the AOM Patent License 1.0 |
+| [libde265](https://github.com/strukturag/libde265) | HEVC software decoding on Windows | LGPL-3.0-or-later |
+
+To replace the bundled HEVC decoder library and relink the Windows program, download `maxdisplay-windows-relink.zip` from the same release.
