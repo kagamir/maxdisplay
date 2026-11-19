@@ -149,11 +149,6 @@ int main(int argc, char** argv) {
         probe(argv[1], codec, hardware, recovery_frame);
 #endif
         std::cout << "Checked " << frame_count << " " << name << " pattern frames\n";
-#ifdef _WIN32
-    } catch (const HevcDecoderUnavailable& error) {
-        std::cerr << error.what() << '\n';
-        return 78;
-#endif
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

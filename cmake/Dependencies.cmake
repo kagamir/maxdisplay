@@ -36,6 +36,20 @@ if(APPLE OR WIN32)
         file(READ "${libaom_SOURCE_DIR}/${notice}" license_text)
         string(APPEND notices "\n${notice}\n${license_text}\n")
     endforeach()
+    if(WIN32)
+        # ENABLE_DECODER controls the upstream example executable. The library always builds.
+        set(ENABLE_DECODER OFF CACHE BOOL "Build the libde265 decoder application" FORCE)
+        set(ENABLE_SDL OFF CACHE BOOL "Build libde265 SDL viewers" FORCE)
+        FetchContent_Declare(libde265
+            GIT_REPOSITORY https://github.com/strukturag/libde265.git
+            GIT_TAG ba62bf4cfb3242f3bf0a45617ff09e35236e4d82)
+        FetchContent_MakeAvailable(libde265)
+        file(READ "${libde265_SOURCE_DIR}/COPYING" de265_license)
+        string(APPEND notices "\nlibde265 1.1.3 - Copyright struktur AG and contributors. LGPL-3.0-or-later.\n"
+               "The Windows release includes a source and relinking kit.\n${de265_license}")
+    endif()
+    # MSVC limits individual string literals. Split at line boundaries.
+    string(REPLACE "\n" ")MaxDisplay\" \"\\n\"\nR\"MaxDisplay(" notices "${notices}")
     configure_file("${CMAKE_CURRENT_LIST_DIR}/third_party_notices.hpp.in"
                    "${PROJECT_BINARY_DIR}/generated/third_party_notices.hpp" @ONLY)
 endif()

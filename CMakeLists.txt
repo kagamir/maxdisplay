@@ -41,13 +41,28 @@ if(APPLE)
     add_executable(maxdisplay src/main.cpp src/cli.cpp)
     target_link_libraries(maxdisplay PRIVATE mac_sender)
 elseif(WIN32)
-    add_library(video_codec STATIC src/win/decoder.cpp src/av1.cpp)
+    add_library(video_codec STATIC src/win/decoder.cpp src/win/hevc_software.cpp src/av1.cpp)
+    target_link_libraries(video_codec PRIVATE de265)
+    target_include_directories(video_codec PRIVATE "${libde265_SOURCE_DIR}" "${libde265_BINARY_DIR}")
+    target_compile_definitions(video_codec PRIVATE LIBDE265_STATIC_BUILD)
     target_compile_definitions(video_codec PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
     target_link_libraries(video_codec PUBLIC mfplat mfuuid wmcodecdspuuid ole32 d3d11 dxgi dxguid)
     add_library(win_receiver STATIC src/win/receiver.cpp src/win/display_info.cpp)
     target_link_libraries(win_receiver PUBLIC transport video_codec user32 gdi32 iphlpapi)
-    add_executable(maxdisplay src/main.cpp src/cli.cpp)
+    add_library(windows_entry OBJECT src/main.cpp src/cli.cpp)
+    target_link_libraries(windows_entry PRIVATE win_receiver)
+    target_include_directories(windows_entry PRIVATE "${PROJECT_BINARY_DIR}/generated")
+    add_executable(maxdisplay $<TARGET_OBJECTS:windows_entry>)
     target_link_libraries(maxdisplay PRIVATE win_receiver)
+    if(MSVC)
+        add_custom_target(windows_relink_kit
+            COMMAND "${CMAKE_COMMAND}" "-DBUILD_ROOT=${PROJECT_BINARY_DIR}" "-DHEVC_SOURCE=${libde265_SOURCE_DIR}"
+                    "-DGENERATOR=${CMAKE_GENERATOR}" "-DPLATFORM=${CMAKE_GENERATOR_PLATFORM}" "-DCONFIG=$<CONFIG>"
+                    "-DAPP_OBJECTS=$<JOIN:$<TARGET_OBJECTS:windows_entry>,|>"
+                    "-DAPP_LIBRARIES=$<TARGET_FILE:win_receiver>|$<TARGET_FILE:video_codec>|$<TARGET_FILE:transport>|$<TARGET_FILE:aom>|$<TARGET_FILE:enet>"
+                    -P "${PROJECT_SOURCE_DIR}/cmake/WindowsRelink.cmake"
+            DEPENDS maxdisplay VERBATIM)
+    endif()
 else()
     message(STATUS "The display app targets macOS and Windows. Building the portable transport only.")
 endif()

@@ -67,6 +67,10 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Build and verify the Windows relink kit
+        if: runner.os == 'Windows'
+        run: cmake --build build --config Release --target windows_relink_kit
+
       - name: Encode H.264, H.265 and AV1 test patterns on Mac
         if: runner.os == 'macOS'
         run: |
@@ -118,6 +122,15 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+      - name: Stage corresponding source and relink files for the tagged release
+        if: runner.os == 'Windows' && github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: maxdisplay-windows-relink
+          path: build/maxdisplay-windows-relink.zip
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Store encoded test fixture
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v7
@@ -146,25 +159,14 @@ jobs:
           path: tools
       - *media-foundation
       - name: Decode all formats from a cold start and recover at a forced keyframe
-        id: decode
         run: |
-          $available = @()
           foreach ($codec in 'h264', 'h265', 'av1') {
             .\tools\codec_probe.exe "fixture/$codec.frames" $codec
-            if ($codec -eq 'h265' -and $LASTEXITCODE -eq 78) {
-              Write-Warning "No Media Foundation HEVC decoder is registered on this runner. Windows H.265 decode and display tests skipped."
-              continue
-            }
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $available += $codec
           }
-          "codecs=$($available -join ',')" >> $env:GITHUB_OUTPUT
-          exit 0
       - name: Check loss, deadline recovery and live Windows presentation over TCP and UDP
-        env:
-          CODECS: ${{ steps.decode.outputs.codecs }}
         run: |
-          foreach ($codec in $env:CODECS.Split(',')) {
+          foreach ($codec in 'h264', 'h265', 'av1') {
             foreach ($transport in 'tcp', 'udp') {
               .\tools\windows_present_tests.exe "fixture/$codec.frames" $codec $transport
               if ($LASTEXITCODE -eq 77) {
@@ -192,6 +194,10 @@ jobs:
         with:
           name: maxdisplay-windows-x64
           path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: maxdisplay-windows-relink
+          path: dist
       - name: Publish assets for the pushed tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -200,7 +206,7 @@ jobs:
         shell: bash
         run: |
           mv dist/maxdisplay.exe dist/maxdisplay-windows-x64.exe
-          assets=(dist/maxdisplay-macos-arm64.tar.gz dist/maxdisplay-windows-x64.exe)
+          assets=(dist/maxdisplay-macos-arm64.tar.gz dist/maxdisplay-windows-x64.exe dist/maxdisplay-windows-relink.zip)
           for file in "${assets[@]}"; do test -s "$file"; done
 
           if release=$(gh release view --json isDraft,assets -- "$TAG"); then

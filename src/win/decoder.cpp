@@ -1,5 +1,7 @@
 #include "decoder.hpp"
 #include "av1.hpp"
+#include "frame_recovery.hpp"
+#include "hevc_software.hpp"
 #include "wire.hpp"
 
 #include <windows.h>
@@ -91,7 +93,12 @@ struct Activations {
     }
 };
 
-ComPtr<IMFTransform> create_decoder(Codec codec, bool prefer_hardware) {
+const GUID& compressed_type(Codec codec) {
+    if (codec == Codec::av1) return MFVideoFormat_AV1;
+    return codec == Codec::h265 ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+}
+
+ComPtr<IMFTransform> create_decoder(Codec codec) {
     ComPtr<IMFTransform> transform;
     if (codec == Codec::h264) {
         check(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER,
@@ -99,31 +106,22 @@ ComPtr<IMFTransform> create_decoder(Codec codec, bool prefer_hardware) {
               "Load Windows H.264 decoder (Windows N requires the Media Feature Pack)");
         return transform;
     }
-    // The Windows HEVC Video Extensions decoder, like the H.264 decoder, has
-    // a synchronous IMFTransform API and can use DXVA internally.
-    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_HEVC};
+    // System codec extensions can expose synchronous D3D11-aware transforms.
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, compressed_type(codec)};
     Activations matches;
     check(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
                     MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                    &input, nullptr, &matches.entries, &matches.count), "Find Windows HEVC decoder");
-    if (!matches.count) {
-        throw HevcDecoderUnavailable("Windows HEVC decoder is unavailable. Install HEVC Video "
-                                     "Extensions (and the Media Feature Pack on Windows N).");
-    }
-    HRESULT hr = E_FAIL;
-    ComPtr<IMFTransform> fallback;
+                    &input, nullptr, &matches.entries, &matches.count), "Find Windows video decoder");
+    if (!matches.count)
+        throw std::runtime_error(std::string("No Media Foundation ") + codec_name(codec) + " decoder is registered");
     for (UINT32 i = 0; i < matches.count; ++i) {
-        hr = matches.entries[i]->ActivateObject(IID_PPV_ARGS(transform.ReleaseAndGetAddressOf()));
-        if (FAILED(hr)) continue;
+        const auto hr = matches.entries[i]->ActivateObject(IID_PPV_ARGS(transform.ReleaseAndGetAddressOf()));
         ComPtr<IMFAttributes> attributes;
-        if (!prefer_hardware || (SUCCEEDED(transform->GetAttributes(&attributes)) &&
-                                 MFGetAttributeUINT32(attributes.Get(), MF_SA_D3D11_AWARE, FALSE)))
+        if (SUCCEEDED(hr) && SUCCEEDED(transform->GetAttributes(&attributes)) &&
+            MFGetAttributeUINT32(attributes.Get(), MF_SA_D3D11_AWARE, FALSE))
             return transform;
-        if (!fallback) fallback = transform;
     }
-    if (fallback) return fallback;
-    check(hr, "Activate Windows HEVC decoder");
-    return transform;
+    throw std::runtime_error(std::string("No D3D11-aware Windows ") + codec_name(codec) + " decoder");
 }
 
 struct MappedTexture {
@@ -148,8 +146,9 @@ struct GpuDecoderDevice {
             throw std::runtime_error("Windows decoder does not support D3D11");
         ComPtr<IDXGIFactory1> factory;
         check(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())), "Find D3D11 graphics adapters");
-        const GUID profile = codec == Codec::h265 ? D3D11_DECODER_PROFILE_HEVC_VLD_MAIN
-                                                  : D3D11_DECODER_PROFILE_H264_VLD_NOFGT;
+        const GUID profile = codec == Codec::av1 ? D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0 :
+                             codec == Codec::h265 ? D3D11_DECODER_PROFILE_HEVC_VLD_MAIN :
+                                                    D3D11_DECODER_PROFILE_H264_VLD_NOFGT;
         const D3D11_VIDEO_DECODER_DESC decoder_desc{profile, w, h, DXGI_FORMAT_NV12};
         for (UINT i = 0; ; ++i) {
             ComPtr<IDXGIAdapter1> adapter;
@@ -228,34 +227,22 @@ struct Decoder::Impl {
     ComPtr<IMFMediaType> nv12;
     UINT32 width, height;
     Codec codec;
-    bool require_hardware, hardware = false;
+    bool hardware = false, ended = false;
     bool reported_backend = false;
     bool discontinuity = true;
     LONGLONG time = 0;
     LONGLONG duration;
 
-    Impl(UINT32 w, UINT32 h, UINT32 fps, Codec format, bool require)
-        : width(w), height(h), codec(format), require_hardware(require), duration(0) {
-        if (!wire::valid_mode(width, height, fps, codec)) {
-            throw std::runtime_error("Unsupported video display dimensions or frame rate");
-        }
-        duration = 10000000LL / fps;
-        transform = create_decoder(codec, true);
-        try {
+    Impl(UINT32 w, UINT32 h, UINT32 fps, Codec format, bool use_gpu)
+        : width(w), height(h), codec(format), duration(10000000LL / fps) {
+        transform = create_decoder(codec);
+        if (use_gpu) {
             gpu = std::make_unique<GpuDecoderDevice>();
             ComPtr<IMFAttributes> attributes;
             check(transform->GetAttributes(&attributes), "Get decoder attributes");
             gpu->attach(transform.Get(), attributes.Get(), codec, w, h);
-            configure(fps);
-        } catch (const std::runtime_error& error) {
-            if (require_hardware) throw HardwareDecodeUnavailable(error.what());
-            std::cerr << "D3D11 video decoding unavailable (" << error.what()
-                      << "). Trying software decoding.\n";
-            transform.Reset();
-            gpu.reset();
-            transform = create_decoder(codec, false);
-            configure(fps);
         }
+        configure(fps);
     }
 
     void configure(UINT32 fps) {
@@ -266,7 +253,7 @@ struct Decoder::Impl {
         ComPtr<IMFMediaType> input;
         check(MFCreateMediaType(&input), "MFCreateMediaType");
         check(input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Set video type");
-        check(input->SetGUID(MF_MT_SUBTYPE, codec == Codec::h265 ? MFVideoFormat_HEVC : MFVideoFormat_H264),
+        check(input->SetGUID(MF_MT_SUBTYPE, compressed_type(codec)),
               "Set compressed video subtype");
         if (codec == Codec::h265)
             check(input->SetUINT32(MF_MT_VIDEO_PROFILE, eAVEncH265VProfile_Main_420_8), "Set HEVC Main profile");
@@ -309,7 +296,7 @@ struct Decoder::Impl {
     }
 
     void record_backend(bool accelerated) {
-        if (require_hardware && !accelerated)
+        if (gpu && !accelerated)
             throw HardwareDecodeUnavailable("Windows decoder did not output a hardware decoder surface");
         if (!reported_backend || hardware != accelerated) {
             std::clog << codec_name(codec) << " decoder: "
@@ -340,8 +327,8 @@ struct Decoder::Impl {
             top = static_cast<UINT32>(crop.OffsetY.value);
         } else if (aperture != MF_E_ATTRIBUTENOTFOUND) {
             check(aperture, "Read display aperture");
-        } else if (coded_width - width > (codec == Codec::h265 ? 63u : 15u) ||
-                   coded_height - height > (codec == Codec::h265 ? 63u : 15u)) {
+        } else if (coded_width - width > (codec == Codec::h264 ? 15u : 127u) ||
+                   coded_height - height > (codec == Codec::h264 ? 15u : 127u)) {
             throw std::runtime_error("Unexpected coded frame padding");
         }
         if (left > coded_width - width || top > coded_height - height || (left | top) % 2) {
@@ -406,33 +393,33 @@ struct Decoder::Impl {
             }
         }
     }
+    void decode(const std::vector<uint8_t>& access_unit, const Output& output);
+    void reset() {
+        check(transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0), "Flush video decoder");
+        if (ended) {
+            check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "Resume decoder streaming");
+            ended = false;
+        }
+        check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Resume decoder stream");
+        discontinuity = true;
+    }
+
+    void finish(const Output& output) {
+        check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0), "End stream");
+        check(transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "Drain video decoder");
+        read_output(output);
+        check(transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0), "End streaming");
+        ended = true;
+    }
 };
 
-Decoder::Decoder(uint32_t width, uint32_t height, uint32_t fps, Codec codec, bool require_hardware) {
-    if (codec == Codec::av1) {
-        if (require_hardware) throw HardwareDecodeUnavailable("AV1 decoding uses the software decoder");
-        av1_ = std::make_unique<Av1Decoder>(width, height);
-    } else if (codec == Codec::h264 || codec == Codec::h265)
-        impl_ = std::make_unique<Impl>(width, height, fps, codec, require_hardware);
-    else
-        throw std::invalid_argument("Unsupported video codec");
-}
-
-Decoder::~Decoder() = default;
-
-bool Decoder::hardware_accelerated() const { return impl_ && impl_->hardware; }
-
-void Decoder::decode(const std::vector<uint8_t>& access_unit, const Output& output) {
-    if (av1_) return av1_->decode(access_unit, output);
-    if (access_unit.empty() || access_unit.size() > wire::max_frame_bytes) {
-        throw std::runtime_error("Invalid video access unit length");
-    }
+void Decoder::Impl::decode(const std::vector<uint8_t>& access_unit, const Output& output) {
     const DWORD length = static_cast<DWORD>(access_unit.size());
-    const DWORD buffer_size = (std::max)(length, impl_->input_info.cbSize);
+    const DWORD buffer_size = (std::max)(length, input_info.cbSize);
     if (buffer_size > wire::max_frame_bytes) {
         throw std::runtime_error("Invalid decoder input buffer size");
     }
-    auto sample = make_sample(buffer_size, impl_->input_info.cbAlignment);
+    auto sample = make_sample(buffer_size, input_info.cbAlignment);
     ComPtr<IMFMediaBuffer> buffer;
     check(sample->GetBufferByIndex(0, &buffer), "Get video input buffer");
     {
@@ -440,33 +427,95 @@ void Decoder::decode(const std::vector<uint8_t>& access_unit, const Output& outp
         std::memcpy(lock.bytes, access_unit.data(), length);
     }
     check(buffer->SetCurrentLength(length), "Set video input length");
-    if (impl_->discontinuity) {
+    if (discontinuity) {
         check(sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE), "Mark decoder discontinuity");
     }
-    check(sample->SetSampleTime(impl_->time), "Set input time");
-    check(sample->SetSampleDuration(impl_->duration), "Set input duration");
+    check(sample->SetSampleTime(time), "Set input time");
+    check(sample->SetSampleDuration(duration), "Set input duration");
 
-    HRESULT hr = impl_->transform->ProcessInput(0, sample.Get(), 0);
+    HRESULT hr = transform->ProcessInput(0, sample.Get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
-        impl_->read_output(output);
-        hr = impl_->transform->ProcessInput(0, sample.Get(), 0);
+        read_output(output);
+        hr = transform->ProcessInput(0, sample.Get(), 0);
     }
     check(hr, "Submit video input");
-    impl_->discontinuity = false;
-    impl_->time += impl_->duration;
-    impl_->read_output(output);
+    discontinuity = false;
+    time += duration;
+    read_output(output);
+}
+
+Decoder::Decoder(uint32_t width, uint32_t height, uint32_t fps, Codec codec, bool require_hardware)
+    : width_(width), height_(height), fps_(fps), codec_(codec), require_hardware_(require_hardware) {
+    if (!wire::valid_mode(width, height, fps, codec))
+        throw std::invalid_argument("Unsupported video display dimensions, codec or frame rate");
+    try {
+        impl_ = std::make_unique<Impl>(width, height, fps, codec, true);
+    } catch (const std::runtime_error& error) {
+        fallback(error);
+    }
+}
+
+Decoder::~Decoder() = default;
+
+void Decoder::fallback(const std::exception& error) {
+    if (require_hardware_) throw HardwareDecodeUnavailable(error.what());
+    impl_.reset();
+    std::cerr << "Warning: " << codec_name(codec_) << " hardware decoding failed (" << error.what()
+              << "). Switching to software decoding.\n";
+    if (codec_ == Codec::av1) av1_ = std::make_unique<Av1Decoder>(width_, height_);
+    else if (codec_ == Codec::h265) hevc_ = std::make_unique<HevcSoftwareDecoder>(width_, height_);
+    else impl_ = std::make_unique<Impl>(width_, height_, fps_, codec_, false);
+}
+
+bool Decoder::hardware_accelerated() const { return impl_ && impl_->hardware; }
+
+bool Decoder::decode(const std::vector<uint8_t>& unit, const Output& output) {
+    if (unit.empty() || unit.size() > wire::max_frame_bytes)
+        throw std::runtime_error("Invalid video access unit length");
+    if (impl_ && impl_->gpu) {
+        try {
+            impl_->decode(unit, output);
+            fresh_ = false;
+            return true;
+        } catch (const std::runtime_error& error) {
+            fallback(error);
+            waiting_for_sync_ = true;
+            // Previously buffered pictures may have been abandoned. Let the live
+            // receiver clear their deadlines when it restarts at the next key.
+            if (!fresh_) return false;
+        }
+    }
+    if (waiting_for_sync_ && !has_recovery_picture(codec_, unit)) return false;
+    if (av1_) av1_->decode(unit, output);
+    else if (hevc_) hevc_->decode(unit, output);
+    else impl_->decode(unit, output);
+    waiting_for_sync_ = false;
+    return true;
 }
 
 void Decoder::reset() {
+    fresh_ = true;
+    waiting_for_sync_ = false;
     if (av1_) return av1_->reset();
-    check(impl_->transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0), "Flush video decoder");
-    impl_->discontinuity = true;
+    if (hevc_) return hevc_->reset();
+    try {
+        impl_->reset();
+    } catch (const std::runtime_error& error) {
+        if (!impl_->gpu) throw;
+        fallback(error);
+    }
 }
 
 void Decoder::finish(const Output& output) {
     if (av1_) return av1_->finish(output);
-    check(impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0), "End stream");
-    check(impl_->transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "Drain video decoder");
-    impl_->read_output(output);
-    check(impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0), "End streaming");
+    if (hevc_) return hevc_->finish(output);
+    try {
+        impl_->finish(output);
+    } catch (const std::runtime_error& error) {
+        if (!impl_->gpu) throw;
+        fallback(error);
+        waiting_for_sync_ = true;
+        // The receiver requests a new key if the drained session lost an image.
+        throw;
+    }
 }

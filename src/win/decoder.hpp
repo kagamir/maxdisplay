@@ -11,10 +11,7 @@
 
 class Av1Decoder;
 
-class HevcDecoderUnavailable : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
+class HevcSoftwareDecoder;
 
 class HardwareDecodeUnavailable : public std::runtime_error {
 public:
@@ -31,12 +28,18 @@ public:
     ~Decoder();
     // True only after a decoded frame has arrived on a hardware decoder surface.
     bool hardware_accelerated() const;
-    void decode(const std::vector<uint8_t>& access_unit, const Output& output);
+    // False means a failed GPU session was replaced and a fresh keyframe is needed.
+    bool decode(const std::vector<uint8_t>& access_unit, const Output& output);
     void reset(); // Drop queued samples before submitting a recovery keyframe.
     void finish(const Output& output);
 
 private:
     struct Impl;
+    void fallback(const std::exception& error);
+    uint32_t width_, height_, fps_;
+    Codec codec_;
+    bool require_hardware_, waiting_for_sync_ = false, fresh_ = true;
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<HevcSoftwareDecoder> hevc_;
     std::unique_ptr<Av1Decoder> av1_;
 };

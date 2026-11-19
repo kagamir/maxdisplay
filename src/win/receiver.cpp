@@ -96,8 +96,7 @@ struct Receiver {
     void receive_live(wire::Header header, ReadFrame& read_frame, SendFeedback& feedback) {
         using Clock = std::chrono::steady_clock;
         FrameRecovery recovery(header.timeout_ms);
-        std::optional<Decoder> decoder;
-        decoder.emplace(header.width, header.height, header.fps, header.codec, require_hardware);
+        Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
         bool used_decoder = false;
         std::deque<Clock::time_point> deadlines;
         Clock::time_point drain_at;
@@ -123,7 +122,7 @@ struct Receiver {
             // Some MFTs buffer an input even in low-latency mode. A static Mac
             // desktop might never send the next sample that would release it.
             try {
-                decoder->finish(display);
+                decoder.finish(display);
             } catch (const HardwareDecodeUnavailable&) {
                 throw;
             } catch (const std::runtime_error& e) {
@@ -131,7 +130,6 @@ struct Receiver {
                 recovery.recover();
             }
             const bool need_image = recovery.waiting_for_keyframe() || !deadlines.empty();
-            decoder.reset(); // finish() ended the Media Foundation stream.
             deadlines.clear();
             recovery.recover();
             // A successfully displayed static picture can stay idle indefinitely.
@@ -159,15 +157,12 @@ struct Receiver {
             if (action != FrameRecovery::Action::drop) {
                 if (action == FrameRecovery::Action::restart) {
                     deadlines.clear();
-                    if (!decoder)
-                        decoder.emplace(header.width, header.height, header.fps, header.codec, require_hardware);
-                    else if (used_decoder)
-                        decoder->reset();
+                    if (used_decoder) decoder.reset();
                 }
                 used_decoder = true;
                 deadlines.push_back(now + std::chrono::microseconds(recovery.remaining_us()));
                 try {
-                    decoder->decode(packet.data, display);
+                    if (!decoder.decode(packet.data, display)) recovery.recover();
                 } catch (const HardwareDecodeUnavailable&) {
                     throw;
                 } catch (const std::runtime_error& e) {
@@ -184,7 +179,7 @@ struct Receiver {
             }
             acknowledge();
         }
-        if (!stopping && !deadlines.empty() && !recovery.waiting_for_keyframe()) decoder->finish(display);
+        if (!stopping && !deadlines.empty() && !recovery.waiting_for_keyframe()) decoder.finish(display);
     }
 
     template<class ReadHeader, class ReadFrame, class SendFeedback>
