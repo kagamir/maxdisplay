@@ -24,6 +24,7 @@ struct SenderOptions {
     bool require_hardware = false;
     bool legacy = false;
     bool stats = false;
+    std::string password;
 };
 
 struct ReceiverOptions {
@@ -33,6 +34,7 @@ struct ReceiverOptions {
     Transport transport = Transport::tcp;
     bool require_hardware = false;
     bool stats = false;
+    std::string password;
 };
 
 int run_cli(int argc, char** argv);

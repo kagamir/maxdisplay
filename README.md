@@ -28,10 +28,7 @@ MaxDisplay adds a virtual display named **MaxDisplay** to your Mac and streams i
 | Prebuilt download | Apple Silicon | x64 |
 | Setup | Screen Recording permission | Windows N editions need the Media Feature Pack, followed by a restart |
 
-Both computers must be on the same trusted local network.
-
-> [!WARNING]
-> MaxDisplay sends video unencrypted over both TCP and UDP. Use it only on a local or private network you trust.
+The Mac must be able to reach the Windows receiver over the selected transport. By default, MaxDisplay sends video and feedback in plaintext. Use this default on a trusted private network, or enable password encryption on both computers.
 
 ## Quick start
 
@@ -94,6 +91,7 @@ On the Mac, open **System Settings → Displays → Arrange** and drag **MaxDisp
 | --- | --- |
 | Codec | H.264 |
 | Transport | TCP, port 49300 |
+| Encryption | Off |
 | Stream resolution | The pixel resolution of the monitor the receiver window is on |
 | Frame rate | Up to 60 fps |
 | Bitrate | Up to 12 Mbps |
@@ -169,6 +167,22 @@ Set `--transport udp` on both sides, and allow that UDP port inbound in Windows 
 ```bash
 ./maxdisplay send 192.168.1.50 --codec h265 --transport udp --size 1280x720 --scale 2 --fps 60 --bitrate-mbps 16 --frame-timeout-ms 150
 ```
+
+### Password encryption
+
+Start the Windows receiver and the Mac sender with the same nonempty password. Replace the example value with a long, randomly generated password. These commands use TCP. Add `--transport udp` to both for UDP.
+
+```powershell
+.\maxdisplay-windows-x64.exe receive --password 'your-shared-password'
+```
+
+```bash
+./maxdisplay send 192.168.1.50 --password 'your-shared-password'
+```
+
+Both peers contribute fresh random values on each connection. PBKDF2-HMAC-SHA256 runs for 600,000 iterations at connection setup. The peers prove they have the same password before exchanging display dimensions, stream settings, video or feedback. AES-128-GCM encrypts and authenticates these messages with separate keys for each direction.
+
+Omit `--password` on **both** computers to use plaintext. A password mismatch or a peer configured for a different mode ends the connection. Encryption requires an updated build on both computers, including when using `--legacy`. A password passed on the command line can appear in shell history and process listings.
 
 ### Adaptive bitrate and frame rate
 
@@ -249,6 +263,7 @@ A current receiver accepts every earlier version of the stream protocol. For a c
 
 | Option | Description |
 | --- | --- |
+| `--password VALUE` | Enable AES-128-GCM with a shared password. Omit on both peers for plaintext |
 | `--help`, `-h` | Show usage |
 | `--licenses` | Print the notices for bundled third-party software |
 
@@ -274,7 +289,7 @@ See [Older receivers](#older-receivers).
 
 ## Building from source
 
-You need CMake 3.20 or later and Git. The first configure step downloads pinned versions of ENet, libaom and, on Windows, libde265, and links them statically. Run the commands from the repository root.
+You need CMake 3.20 or later and Git. The first configure step downloads pinned versions of ENet, Mbed TLS, libaom and, on Windows, libde265, and links them statically. Run the commands from the repository root.
 
 ### macOS 13 or later
 
@@ -338,6 +353,7 @@ MaxDisplay links these libraries statically. Run `maxdisplay --licenses` for the
 | Library | Used for | License |
 | --- | --- | --- |
 | [ENet](http://enet.bespin.org/) | UDP transport | MIT |
+| [Mbed TLS](https://github.com/Mbed-TLS/mbedtls) | Password-based key derivation and AES-128-GCM | Apache-2.0 or GPL-2.0-or-later |
 | [libaom](https://aomedia.googlesource.com/aom/) | AV1 encoding and decoding | BSD 2-Clause, with the AOM Patent License 1.0 |
 | [libde265](https://github.com/strukturag/libde265) | HEVC software decoding on Windows | LGPL-3.0-or-later |
 

@@ -185,6 +185,17 @@ jobs:
             }
           }
 
+      - name: Check encrypted Windows presentation over TCP and UDP
+        run: |
+          foreach ($transport in 'tcp', 'udp') {
+            .\tools\windows_present_tests.exe fixture/h264.frames h264 $transport encrypted
+            if ($LASTEXITCODE -eq 77) {
+              Write-Warning "Window readback skipped in this desktop session."
+              exit 0
+            }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
   release:
     name: Publish binaries to GitHub Releases
     needs: codec-interop

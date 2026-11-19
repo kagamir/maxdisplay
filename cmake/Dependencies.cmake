@@ -10,11 +10,28 @@ if(WIN32)
     target_link_libraries(enet INTERFACE winmm ws2_32)
 endif()
 
+# Use the upstream release archive, which includes the generated C sources.
+FetchContent_Declare(mbedtls
+    URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.8/mbedtls-3.6.8.tar.bz2
+    URL_HASH SHA256=bc54b818e87f49c0b3281dd85d24adaede0e63b4e822e3fbd49c005a38b9595b
+    SOURCE_SUBDIR maxdisplay-populate-only)
+FetchContent_MakeAvailable(mbedtls)
+set(ENABLE_PROGRAMS OFF CACHE BOOL "Build Mbed TLS programs" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "Build Mbed TLS tests" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "Treat dependency warnings as errors" FORCE)
+set(USE_STATIC_MBEDTLS_LIBRARY ON CACHE BOOL "Build static crypto library" FORCE)
+set(USE_SHARED_MBEDTLS_LIBRARY OFF CACHE BOOL "Build shared crypto libraries" FORCE)
+set(BUILD_SHARED_LIBS OFF)
+if(MSVC)
+    set(MSVC_STATIC_RUNTIME ON CACHE BOOL "Use static CRT for Mbed TLS" FORCE)
+endif()
+# Build only the crypto library and its dependencies on CMake 3.20+.
+add_subdirectory("${mbedtls_SOURCE_DIR}" "${mbedtls_BINARY_DIR}" EXCLUDE_FROM_ALL)
+
 if(APPLE OR WIN32)
     foreach(option ENABLE_APPS ENABLE_DOCS ENABLE_EXAMPLES ENABLE_TESTDATA ENABLE_TESTS ENABLE_TOOLS)
         set(${option} OFF CACHE BOOL "Build libaom components" FORCE)
     endforeach()
-    set(BUILD_SHARED_LIBS OFF)
     set(CONFIG_REALTIME_ONLY 1 CACHE STRING "Use the realtime AV1 encoder" FORCE)
     set(CONFIG_AV1_HIGHBITDEPTH 0 CACHE STRING "Use 8-bit video" FORCE)
     set(CONFIG_SIZE_LIMIT 1 CACHE STRING "Limit AV1 decoder allocation" FORCE)
@@ -70,7 +87,10 @@ if(APPLE OR WIN32)
         string(APPEND notices "\nlibde265 1.1.3 - Copyright struktur AG and contributors. LGPL-3.0-or-later.\n"
                "The Windows release includes a source and relinking kit.\n${de265_license}")
     endif()
-    # MSVC limits individual string literals. Split at line boundaries.
+    file(READ "${mbedtls_SOURCE_DIR}/LICENSE" crypto_license)
+    set(crypto_notices "\nMbed TLS 3.6.8 - The Mbed TLS Contributors. Includes Project Everest (INRIA and Microsoft).\n${crypto_license}")
+    # MSVC limits individual string literals and the size of a concatenated literal.
+    string(REPLACE "\n" ")MaxDisplay\" \"\\n\"\nR\"MaxDisplay(" crypto_notices "${crypto_notices}")
     string(REPLACE "\n" ")MaxDisplay\" \"\\n\"\nR\"MaxDisplay(" notices "${notices}")
     configure_file("${CMAKE_CURRENT_LIST_DIR}/third_party_notices.hpp.in"
                    "${PROJECT_BINARY_DIR}/generated/third_party_notices.hpp" @ONLY)

@@ -3,6 +3,7 @@
 #include "encoder.hpp"
 #include "net.hpp"
 #include "rate_control.hpp"
+#include "secure_tcp.hpp"
 #include "udp.hpp"
 #include "wire.hpp"
 #include "virtual_display.hpp"
@@ -108,26 +109,27 @@ class Connection {
 public:
     explicit Connection(const SenderOptions& options)
         : legacy_(options.legacy) {
-        if (options.transport == Transport::udp)
-            udp_ = std::make_unique<udp::Sender>(options.host, options.port);
-        else
-            tcp_ = net::connect_tcp(options.host, options.port);
+        if (options.transport == Transport::udp) {
+            udp_ = std::make_unique<udp::Sender>(options.host, options.port, options.password);
+        } else {
+            socket_ = net::connect_tcp(options.host, options.port);
+            tcp_.emplace(socket_, options.password, secure::Role::sender);
+        }
     }
 
     ~Connection() { close(); }
 
     wire::DisplaySize request_display_size() {
-        return udp_ ? udp_->request_display_size() : wire::request_display_size(tcp_);
+        return udp_ ? udp_->request_display_size() : tcp_->request_display_size();
     }
 
     void send_header(const SenderOptions& options, const DisplayGeometry& mode) {
         control_.emplace(options.bitrate, options.fps, options.timeout_ms,
                          options.adaptive, options.adaptive_fps, !legacy_);
-        const auto timeout = legacy_ ? 0u : options.timeout_ms;
-        if (udp_)
-            udp_->send(wire::encode_header({mode.stream_width, mode.stream_height, options.fps, options.codec, timeout}));
-        else
-            wire::send_header(tcp_, mode.stream_width, mode.stream_height, options.fps, options.codec, timeout);
+        const wire::Header header{mode.stream_width, mode.stream_height, options.fps, options.codec,
+                                  legacy_ ? 0u : options.timeout_ms};
+        if (udp_) udp_->send_header(header);
+        else tcp_->send_header(header);
         writer_ = std::thread([this] {
             try { run(); }
             catch (...) { fail(std::current_exception()); }
@@ -229,7 +231,7 @@ public:
             wake_.notify_one();
         }
         if (udp_) udp_->shutdown();
-        else tcp_.shutdown();
+        else socket_.shutdown();
         if (writer_.joinable()) writer_.join();
     }
 
@@ -256,18 +258,13 @@ private:
                 if (auto message = udp_->take_feedback()) feedback(*message);
             }
         } else if (legacy_) {
-            if (tcp_.peer_closed()) throw std::runtime_error("Windows receiver disconnected");
+            if (socket_.peer_closed()) throw std::runtime_error("Windows receiver disconnected");
         } else {
-            // Fixed-size records may straddle TCP reads. Limit each drain to
-            // leave time to transmit when feedback arrives in a burst.
+            // Leave time to transmit when feedback arrives in a burst.
             for (unsigned i = 0; i < 64; ++i) {
-                auto count = tcp_.try_read(ack_.data() + ack_used_, ack_.size() - ack_used_);
-                if (!count) break;
-                ack_used_ += count;
-                if (ack_used_ == ack_.size()) {
-                    feedback(ack_);
-                    ack_used_ = 0;
-                }
+                auto message = tcp_->take_feedback();
+                if (!message) break;
+                feedback(*message);
             }
         }
     }
@@ -292,13 +289,13 @@ private:
             bool sent = true;
             if (legacy_) {
                 if (udp_) udp_->send(frame.data);
-                else wire::send_frame(tcp_, frame.data);
+                else tcp_->send_frame(frame.data);
             } else {
                 const auto message = wire::pack_frame(frame);
                 const auto age_limit = std::chrono::microseconds(control_->deadline(frame.timestamp_us, frame.keyframe));
                 const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
                 sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
-                            : wire::send_frame_before(tcp_, message, deadline);
+                            : tcp_->send_frame_before(message, deadline);
             }
             std::lock_guard lock(mutex_);
             if (sent) {
@@ -312,7 +309,8 @@ private:
 
     bool legacy_;
     std::optional<StreamControl> control_;
-    net::Socket tcp_;
+    net::Socket socket_;
+    std::optional<secure::TcpChannel> tcp_;
     std::unique_ptr<udp::Sender> udp_;
     std::thread writer_;
     std::mutex mutex_;
@@ -322,8 +320,6 @@ private:
     std::exception_ptr error_;
     std::uint32_t next_sequence_ = 1;
     std::uint64_t capture_us_ = 0, encode_start_us_ = 0;
-    std::vector<std::uint8_t> ack_ = std::vector<std::uint8_t>(wire::feedback_size);
-    std::size_t ack_used_ = 0;
     std::optional<double> last_psnr_;
     std::optional<int> last_quantizer_;
 };
@@ -520,7 +516,8 @@ int stream_desktop(SenderOptions options) {
                   << options.host << ':' << options.port << " using "
                   << codec_name(options.codec) << (encoder->hardware_accelerated() ? " (hardware)" : " (software)")
                   << " over "
-                  << (options.transport == Transport::udp ? "UDP" : "TCP") << ", "
+                  << (options.transport == Transport::udp ? "UDP" : "TCP")
+                  << (options.password.empty() ? ", " : " (AES-128-GCM), ")
                   << (options.adaptive && !options.legacy ? "adaptive" : "fixed")
                   << " bitrate " << options.bitrate / 1000 << " kbps, "
                   << (options.adaptive_fps && !options.legacy ? "adaptive" : "fixed")

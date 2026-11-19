@@ -40,7 +40,8 @@ int main() {
 #ifdef __APPLE__
         expect(invoke({"send", "example"}) == 0 && sender.width == 0 && sender.height == 0 &&
                sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp &&
-               sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware && !sender.legacy && !sender.stats,
+               sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware &&
+               !sender.legacy && !sender.stats && sender.password.empty(),
                "Unexpected Mac defaults");
         expect(invoke({"send", "example", "--codec", "av1", "--transport", "udp", "--size", "640x360",
                        "--scale", "1.5"}) == 0 && sender.width == 640 && sender.height == 360 &&
@@ -56,6 +57,14 @@ int main() {
         expect(invoke({"send", "example", "--legacy"}) == 0 && sender.legacy && !sender.adaptive &&
                !sender.adaptive_fps && sender.width == 1920 && sender.height == 1080,
                "Legacy protocol selected adaptive feedback");
+        expect(invoke({"send", "example", "--password", u8"共享 密碼", "--legacy"}) == 0 &&
+               sender.password == u8"共享 密碼" && sender.legacy, "Legacy sender lost its UTF-8 password");
+        expect(invoke({"send", "example", "--password=--help"}) == 0 && sender.password == "--help",
+               "Option-like password triggered help");
+        invalid({"send", "example", "--password"});
+        invalid({"send", "example", "--password", ""});
+        invalid({"send", "example", "--password="});
+        invalid({"send", "example", "--password", "--help"});
         invalid({"send", "example", "--legacy", "--codec", "hevc"});
         invalid({"send", "example", "--legacy", "--frame-timeout-ms", "300"});
         invalid({"send", "example", "--require-hardware", "--codec", "av1"});
@@ -75,11 +84,20 @@ int main() {
         invalid({"send", "example", "--codec", "unknown"});
         invalid({"send", "example", "--transport", "sctp"});
 #elif defined(_WIN32)
-        expect(invoke({}) == 0 && receiver.transport == Transport::tcp && !receiver.require_hardware && !receiver.stats,
+        expect(invoke({}) == 0 && receiver.transport == Transport::tcp && !receiver.require_hardware &&
+               !receiver.stats && receiver.password.empty(),
                "Unexpected Windows defaults");
         expect(invoke({"receive", "--transport", "udp", "--port", "12345", "--windowed", "--require-hardware", "--stats"}) == 0 &&
                receiver.transport == Transport::udp && receiver.port == 12345 && receiver.windowed && receiver.require_hardware && receiver.stats,
                "Windows UDP options lost");
+        expect(invoke({"receive", "--password", u8"共享 密碼", "--transport", "udp"}) == 0 &&
+               receiver.password == u8"共享 密碼", "Receiver lost its UTF-8 password");
+        expect(invoke({"--password=-leading-dash"}) == 0 && receiver.password == "-leading-dash",
+               "Default receive mode lost its password");
+        invalid({"receive", "--password"});
+        invalid({"receive", "--password", ""});
+        invalid({"receive", "--password="});
+        invalid({"receive", "--password", "--licenses"});
         invalid({"receive", "--transport", "invalid"});
 #endif
         std::cout << "CLI option checks passed\n";

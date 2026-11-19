@@ -2,6 +2,7 @@
 #include "app.hpp"
 #include "av1.hpp"
 #include "frame_recovery.hpp"
+#include "secure_tcp.hpp"
 #include "udp.hpp"
 #include "wire.hpp"
 
@@ -16,6 +17,7 @@
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <stdexcept>
 #include <string>
@@ -93,11 +95,12 @@ void check_av1(const std::vector<uint8_t>& frame, uint32_t width, uint32_t heigh
     if (!decoded) throw std::runtime_error("No picture decoded from the first AV1 desktop frame");
 }
 
-void capture(Codec codec, Transport transport, double scale, bool automatic, wire::DisplaySize expected) {
+void capture(Codec codec, Transport transport, double scale, bool automatic, wire::DisplaySize expected, bool encrypted) {
     SenderOptions options;
     options.codec = codec;
     options.transport = transport;
     options.host = "127.0.0.1";
+    if (encrypted) options.password = "MaxDisplay test passphrase";
     options.fps = 30;
     // Leave time to decode the scaled AV1 keyframe on a shared runner.
     options.timeout_ms = 1000;
@@ -110,7 +113,7 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
     net::Socket tcp;
     std::unique_ptr<udp::Listener> incoming_udp;
     if (transport == Transport::udp) {
-        incoming_udp = std::make_unique<udp::Listener>(options.host, 0);
+        incoming_udp = std::make_unique<udp::Listener>(options.host, 0, options.password);
         options.port = incoming_udp->local_port();
     } else {
         tcp = net::listen_tcp(options.host, 0);
@@ -124,6 +127,7 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
         auto datagrams = std::move(incoming_udp);
         wire::Header mode{};
         net::Socket peer;
+        std::optional<secure::TcpChannel> channel;
         bool queried = false;
         auto monitor = [&] {
             if (!automatic || queried) throw std::runtime_error("Unexpected display size query");
@@ -137,7 +141,8 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
             if (!net::wait_readable(tcp, 8000)) throw std::runtime_error("TCP sender did not connect");
             peer = net::accept_tcp(tcp);
             if (!peer) throw std::runtime_error("TCP connection withdrawn");
-            mode = wire::receive_header(peer, monitor);
+            channel.emplace(peer, options.password, secure::Role::receiver);
+            mode = channel->receive_header(monitor);
         }
         if (queried != automatic || mode.width != expected.width || mode.height != expected.height || mode.fps != options.fps ||
             mode.codec != codec || mode.timeout_ms != options.timeout_ms)
@@ -153,7 +158,7 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
                         throw std::runtime_error(std::string("UDP disconnected during ") + stage);
                 } else {
                     if (!net::wait_readable(peer, 100)) continue;
-                    if (!wire::receive_frame(peer, message))
+                    if (!channel->receive_frame(message))
                         throw std::runtime_error(std::string("TCP disconnected during ") + stage);
                 }
                 return wire::unpack_frame(message);
@@ -163,7 +168,7 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
         auto feedback = [&](uint32_t sequence, bool request_keyframe) {
             auto bytes = wire::pack_feedback({sequence, request_keyframe});
             if (datagrams) datagrams->send_feedback(bytes);
-            else peer.write_all(bytes.data(), bytes.size());
+            else channel->send_feedback(bytes);
         };
         auto check_keyframe = [&](const wire::Frame& key) {
             if (!key.keyframe) throw std::runtime_error("Missing keyframe flag");
@@ -227,7 +232,9 @@ void capture(Codec codec, Transport transport, double scale, bool automatic, wir
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 2) return 2;
+    if (argc < 2 || argc > 3) return 2;
+    const bool encrypted = argc == 3;
+    if (encrypted && std::string_view(argv[2]) != "encrypted") return 2;
     const std::string_view profile = argv[1];
     if (profile != "h264-tcp" && profile != "h265-udp" && profile != "av1-udp") return 2;
     if (!CGPreflightScreenCaptureAccess()) {
@@ -237,13 +244,13 @@ int main(int argc, char** argv) {
 
     try {
         if (profile == "av1-udp") {
-            capture(Codec::av1, Transport::udp, 2.0, false, {2560, 1440});
+            capture(Codec::av1, Transport::udp, 2.0, false, {2560, 1440}, encrypted);
             std::cout << "Captured and decoded a 2560x1440 AV1/UDP desktop at scale 2\n";
         } else if (profile == "h265-udp") {
-            capture(Codec::h265, Transport::udp, 1.5, true, {1920, 1080});
+            capture(Codec::h265, Transport::udp, 1.5, true, {1920, 1080}, encrypted);
             std::cout << "Negotiated a 1920x1080 HEVC stream from a 1280x720 desktop over UDP\n";
         } else {
-            capture(Codec::h264, Transport::tcp, 0.75, true, {960, 540});
+            capture(Codec::h264, Transport::tcp, 0.75, true, {960, 540}, encrypted);
             std::cout << "Negotiated a 960x540 H.264 stream from a 1280x720 desktop over TCP\n";
         }
     } catch (const std::exception& error) {

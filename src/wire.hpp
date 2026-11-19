@@ -46,6 +46,7 @@ std::vector<std::uint8_t> encode_display_reply(DisplaySize size);
 DisplaySize decode_display_reply(const std::vector<std::uint8_t>& bytes);
 DisplaySize request_display_size(net::Socket& socket, unsigned timeout_ms = display_query_timeout_ms);
 
+constexpr std::size_t max_header_size = 28; // Longest inner stream header (v3).
 constexpr std::uint32_t max_frame_bytes = 16 * 1024 * 1024;
 constexpr std::uint32_t max_timeout_ms = 60000;
 constexpr std::size_t feedback_size = 12;
@@ -61,11 +62,13 @@ std::vector<std::uint8_t> pack_frame(const Frame& frame);
 Frame unpack_frame(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> pack_feedback(Feedback feedback);
 Feedback unpack_feedback(const std::vector<std::uint8_t>& bytes);
-void send_frame(net::Socket& socket, const std::vector<std::uint8_t>& access_unit);
+// A protected TCP record uses the same length prefix with room for its authentication tag.
+void send_frame(net::Socket& socket, const std::vector<std::uint8_t>& access_unit,
+                std::size_t max_bytes = max_frame_bytes);
 // Drops an expired frame only before writing any part of its length prefix.
 bool send_frame_before(net::Socket& socket, const std::vector<std::uint8_t>& access_unit,
-                       std::chrono::steady_clock::time_point deadline);
+                       std::chrono::steady_clock::time_point deadline, std::size_t max_bytes = max_frame_bytes);
 bool receive_frame(net::Socket& socket, std::vector<std::uint8_t>& access_unit,
-                   const std::function<unsigned()>& poll_interval = {});
+                   const std::function<unsigned()>& poll_interval = {}, std::size_t max_bytes = max_frame_bytes);
 
 } // namespace wire

@@ -14,7 +14,6 @@ constexpr Word feedback_magic{'M', 'X', 'F', 'B'};
 constexpr Word display_magic{'M', 'X', 'D', 'R'};
 constexpr std::size_t legacy_size = 20;
 constexpr std::size_t extended_size = 24;
-constexpr std::size_t timed_size = 28;
 constexpr std::size_t frame_prefix_size = 16;
 
 Word to_bytes(std::uint32_t value) {
@@ -37,7 +36,7 @@ std::size_t header_size(const std::uint8_t* prefix) {
         switch (from_bytes(prefix + 4)) {
             case 1: return legacy_size;
             case 2: return extended_size;
-            case 3: return timed_size;
+            case 3: return max_header_size;
         }
     }
     throw std::runtime_error("Unrecognized MaxDisplay stream or protocol version");
@@ -52,8 +51,8 @@ void check_mode(const Header& header) {
         throw std::runtime_error("H.265 requires stream protocol version 3");
 }
 
-void check_size(std::size_t size) {
-    if (!size || size > max_frame_bytes)
+void check_size(std::size_t size, std::size_t max_bytes) {
+    if (!size || size > max_bytes || size > UINT32_MAX)
         throw std::runtime_error("Video access unit length is outside protocol limits");
 }
 
@@ -121,7 +120,7 @@ std::vector<std::uint8_t> encode_header(Header header) {
     check_mode(header);
     const unsigned version = header.timeout_ms ? 3 : (header.codec == Codec::h264 ? 1 : 2);
     std::vector<std::uint8_t> data(magic.begin(), magic.end());
-    data.reserve(timed_size);
+    data.reserve(max_header_size);
     append_word(data, version);
     append_word(data, header.width);
     append_word(data, header.height);
@@ -137,7 +136,7 @@ Header decode_header(const std::vector<std::uint8_t>& bytes) {
     Header header{from_bytes(bytes.data() + 8), from_bytes(bytes.data() + 12),
                   from_bytes(bytes.data() + 16)};
     if (bytes.size() >= extended_size) header.codec = static_cast<Codec>(from_bytes(bytes.data() + 20));
-    if (bytes.size() == timed_size) {
+    if (bytes.size() == max_header_size) {
         header.timeout_ms = from_bytes(bytes.data() + 24);
         if (!header.timeout_ms) throw std::runtime_error("Missing frame deadline");
     }
@@ -212,16 +211,16 @@ Feedback unpack_feedback(const std::vector<std::uint8_t>& bytes) {
     return {from_bytes(bytes.data() + 4), flags != 0};
 }
 
-void send_frame(net::Socket& socket, const std::vector<std::uint8_t>& access_unit) {
-    check_size(access_unit.size());
+void send_frame(net::Socket& socket, const std::vector<std::uint8_t>& access_unit, std::size_t max_bytes) {
+    check_size(access_unit.size(), max_bytes);
     const auto length = to_bytes(static_cast<std::uint32_t>(access_unit.size()));
     socket.write_all(length.data(), length.size());
     socket.write_all(access_unit.data(), access_unit.size());
 }
 
 bool send_frame_before(net::Socket& socket, const std::vector<std::uint8_t>& access_unit,
-                       std::chrono::steady_clock::time_point deadline) {
-    check_size(access_unit.size());
+                       std::chrono::steady_clock::time_point deadline, std::size_t max_bytes) {
+    check_size(access_unit.size(), max_bytes);
     const auto length = to_bytes(static_cast<std::uint32_t>(access_unit.size()));
     const auto count = socket.write_some_until(length.data(), length.size(), deadline);
     if (!count) return false;
@@ -231,12 +230,12 @@ bool send_frame_before(net::Socket& socket, const std::vector<std::uint8_t>& acc
 }
 
 bool receive_frame(net::Socket& socket, std::vector<std::uint8_t>& access_unit,
-                   const std::function<unsigned()>& poll_interval) {
+                   const std::function<unsigned()>& poll_interval, std::size_t max_bytes) {
     Word length{};
     if (!socket.read_exact(length.data(), length.size(), poll_interval))
         return false;
     const auto size = from_bytes(length.data());
-    check_size(size);
+    check_size(size, max_bytes);
     access_unit.resize(size);
     if (!socket.read_exact(access_unit.data(), size, poll_interval))
         throw std::runtime_error("Peer disconnected before sending the video access unit");

@@ -1,2 +1,5 @@
 #pragma once
-inline constexpr const char third_party_notices[] = R"MaxDisplay(@notices@)MaxDisplay";
+inline constexpr const char* third_party_notices[] = {
+    R"MaxDisplay(@notices@)MaxDisplay",
+    R"MaxDisplay(@crypto_notices@)MaxDisplay"
+};

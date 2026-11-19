@@ -2,6 +2,7 @@
 // client rendering. WM_PRINTCLIENT works even when another window obscures the viewer.
 #include "app.hpp"
 #include "net.hpp"
+#include "secure_tcp.hpp"
 #include "udp.hpp"
 #include "wire.hpp"
 
@@ -125,10 +126,14 @@ class TestSender {
 public:
     TestSender(const ReceiverOptions& options, Codec codec, uint32_t timeout_ms, HWND query_window = nullptr)
         : timed_(timeout_ms != 0) {
-        if (options.transport == Transport::udp) udp_.emplace(options.bind, options.port);
-        else tcp_ = net::connect_tcp(options.bind, options.port);
+        if (options.transport == Transport::udp) {
+            udp_.emplace(options.bind, options.port, options.password);
+        } else {
+            socket_ = net::connect_tcp(options.bind, options.port);
+            tcp_.emplace(socket_, options.password, secure::Role::sender);
+        }
         if (query_window) {
-            const auto size = udp_ ? udp_->request_display_size() : wire::request_display_size(tcp_);
+            const auto size = udp_ ? udp_->request_display_size() : tcp_->request_display_size();
             MONITORINFO info{};
             info.cbSize = sizeof(info);
             if (!GetMonitorInfoW(MonitorFromWindow(query_window, MONITOR_DEFAULTTONEAREST), &info))
@@ -138,10 +143,9 @@ public:
                 size.height != static_cast<unsigned>(info.rcMonitor.bottom - info.rcMonitor.top))
                 throw std::runtime_error("Receiver reported a display size other than the window's monitor");
         }
-        if (udp_)
-            udp_->send(wire::encode_header({width, height, fps, codec, timeout_ms}));
-        else
-            wire::send_header(tcp_, width, height, fps, codec, timeout_ms);
+        const wire::Header header{width, height, fps, codec, timeout_ms};
+        if (udp_) udp_->send_header(header);
+        else tcp_->send_header(header);
     }
 
     static uint64_t now_us() {
@@ -153,32 +157,28 @@ public:
               bool expect_request = false, uint64_t stamp = now_us()) {
         if (!timed_) {
             if (udp_) udp_->send(frames[index]);
-            else wire::send_frame(tcp_, frames[index]);
+            else tcp_->send_frame(frames[index]);
             return;
         }
         const bool keyframe = index == 0 || index == 5;
         auto bytes = wire::pack_frame({sequence, stamp, keyframe, frames[index]});
-        std::vector<uint8_t> reply;
         if (udp_) {
             if (!udp_->send_frame(bytes, keyframe)) throw std::runtime_error("UDP loopback queue is full");
-            if (!wait_until([&] {
-                auto received = udp_->take_feedback();
-                if (!received) return false;
-                reply = std::move(*received);
-                return true;
-            }, 8s)) throw std::runtime_error("Timed out waiting for UDP receiver feedback");
         } else {
-            wire::send_frame(tcp_, bytes);
-            reply.resize(wire::feedback_size);
-            if (!net::wait_readable(tcp_, 8000) || !tcp_.read_exact(reply.data(), reply.size()))
-                throw std::runtime_error("Missing TCP receiver feedback");
+            tcp_->send_frame(bytes);
         }
-        auto ack = wire::unpack_feedback(reply);
+        std::optional<std::vector<uint8_t>> reply;
+        if (!wait_until([&] {
+            reply = udp_ ? udp_->take_feedback() : tcp_->take_feedback();
+            return reply.has_value();
+        }, 8s)) throw std::runtime_error("Timed out waiting for receiver feedback");
+        auto ack = wire::unpack_feedback(*reply);
         if (ack.sequence != sequence || ack.request_keyframe != expect_request)
             throw std::runtime_error("Unexpected recovery feedback for sequence " + std::to_string(sequence));
     }
 private:
-    net::Socket tcp_;
+    net::Socket socket_;
+    std::optional<secure::TcpChannel> tcp_;
     std::optional<udp::Sender> udp_;
     bool timed_;
 };
@@ -189,7 +189,7 @@ void send_initial_frames(TestSender& sender, const Frames& frames, HWND window) 
         throw std::runtime_error("The live window did not paint the initial green and gray pattern");
 }
 
-void check(const Frames& frames, Codec codec, Transport transport) {
+void check(const Frames& frames, Codec codec, Transport transport, bool encrypted) {
     ReceiverOptions options;
     options.bind = "127.0.0.1";
     options.transport = transport;
@@ -197,6 +197,7 @@ void check(const Frames& frames, Codec codec, Transport transport) {
         options.port = udp::Listener(options.bind, 0).local_port();
     else
         options.port = net::listen_tcp(options.bind, 0).local_port();
+    if (encrypted) options.password = "MaxDisplay test passphrase";
     options.windowed = true;
     options.stats = true;
     std::promise<DWORD> started;
@@ -258,7 +259,9 @@ void check(const Frames& frames, Codec codec, Transport transport) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 4) return 2;
+    if (argc < 2 || argc > 5) return 2;
+    const bool encrypted = argc == 5;
+    if (encrypted && std::string(argv[4]) != "encrypted") return 2;
     const std::string codec = argc > 2 ? argv[2] : "h264";
     const std::string transport = argc > 3 ? argv[3] : "tcp";
     if ((codec != "av1" && codec != "h264" && codec != "h265") || (transport != "tcp" && transport != "udp")) return 2;
@@ -279,8 +282,8 @@ int main(int argc, char** argv) {
         }
         DestroyWindow(probe);
         check(frames, codec == "h265" ? Codec::h265 : codec == "av1" ? Codec::av1 : Codec::h264,
-              transport == "udp" ? Transport::udp : Transport::tcp);
-        std::cout << codec << "/" << transport << ": verified missing and late frame recovery, window pixels, reconnect and Escape shutdown\n";
+              transport == "udp" ? Transport::udp : Transport::tcp, encrypted);
+        std::cout << codec << "/" << transport << (encrypted ? " (encrypted)" : "") << ": verified missing and late frame recovery, window pixels, reconnect and Escape shutdown\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

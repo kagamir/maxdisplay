@@ -55,15 +55,15 @@ void exercise(udp::Listener& listener, bool close_sender) {
     require(sender.peer_closed(), "Receiver disconnect was not observed");
 }
 
-void timed_stream(udp::Listener& listener) {
+void timed_stream(udp::Listener& listener, const std::string& password = {}) {
     const std::vector<std::uint8_t> video(1024 * 1024, 0x65);
     const std::vector<std::uint8_t> delta(9000, 0x41); // Multiple unreliable MTU-sized fragments.
     const auto port = listener.local_port();
     std::promise<void> queued;
     auto queued_signal = queued.get_future();
     auto sending = std::async(std::launch::async, [&] {
-        udp::Sender sender("127.0.0.1", port);
-        sender.send(wire::encode_header({1920, 1080, 60, Codec::h265, 100}));
+        udp::Sender sender("127.0.0.1", port, password);
+        sender.send_header({1920, 1080, 60, Codec::h265, 100});
         const auto first = wire::pack_frame({1, 5000, true, video});
         require(sender.send_frame(first, true), "First timed frame dropped");
         require(!sender.send_frame(first, true), "Queued duplicate sync while first still in flight");
@@ -85,6 +85,7 @@ void timed_stream(udp::Listener& listener) {
         throw std::runtime_error("Reverse UDP feedback timed out");
     });
     require(listener.accept(6000), "Timed UDP session did not connect");
+    require(listener.receive_header({}).timeout_ms == 100, "Reliable header did not precede timed frames");
     require(queued_signal.wait_for(5s) == std::future_status::ready, "Timed UDP frames were not queued");
     std::vector<std::uint8_t> bytes;
     auto next = [&] {
@@ -96,8 +97,6 @@ void timed_stream(udp::Listener& listener) {
         }
         throw std::runtime_error("Timed UDP message timed out");
     };
-    next();
-    require(wire::decode_header(bytes).timeout_ms == 100, "Reliable header did not precede timed frames");
     next();
     auto frame = wire::unpack_frame(bytes);
     require(frame.sequence == 1 && frame.keyframe && frame.data == video, "Reliable key reassembly failed");
@@ -112,7 +111,7 @@ void timed_stream(udp::Listener& listener) {
     sending.get();
 }
 
-void display_negotiation(udp::Listener& listener, bool automatic) {
+void display_negotiation(udp::Listener& listener, bool automatic, const std::string& password = {}) {
     const auto port = listener.local_port();
     auto receiver = std::async(std::launch::async, [&] {
         require(listener.accept(6000), "Display negotiation peer did not connect");
@@ -121,18 +120,23 @@ void display_negotiation(udp::Listener& listener, bool automatic) {
             queried = true;
             return wire::DisplaySize{3840, 2160};
         });
+        std::vector<std::uint8_t> bytes;
+        const auto deadline = Clock::now() + 5s;
+        while (Clock::now() < deadline && listener.receive(bytes, 100) == udp::ReadResult::timeout) {}
+        require(bytes == std::vector<std::uint8_t>({0x42, 0x10}), "Lost reliable legacy access unit");
         listener.disconnect();
         require(queried == automatic, "Unexpected UDP display query");
         require(header.width == 1920 && header.height == 1080 && header.fps == 60,
                 "Lost UDP stream header after display query");
     });
-    udp::Sender sender("127.0.0.1", port);
+    udp::Sender sender("127.0.0.1", port, password);
     if (automatic) {
         const auto size = sender.request_display_size();
         require(size.width == 3840 && size.height == 2160, "Incorrect UDP monitor size");
         require(!sender.take_feedback(), "Resolution reply leaked into frame feedback");
     }
-    sender.send(wire::encode_header({1920, 1080, 60}));
+    sender.send_header({1920, 1080, 60});
+    sender.send({0x42, 0x10});
     receiver.get();
 }
 
@@ -155,6 +159,37 @@ void unavailable_display(udp::Listener& listener) {
     legacy.get();
     require(manual_hint, "No manual size hint when a legacy UDP peer rejected the query");
 }
+void wrong_password(udp::Listener& listener) {
+    const auto port = listener.local_port();
+    auto receive = std::async(std::launch::async, [&] {
+        require(listener.accept(6000), "Wrong-password peer did not reach handshake");
+        bool queried = false, rejected = false;
+        try {
+            listener.receive_header([&] { queried = true; return wire::DisplaySize{640, 480}; });
+        } catch (const std::runtime_error&) { rejected = true; }
+        listener.disconnect();
+        require(rejected && !queried, "Receiver exposed display information before authenticating");
+    });
+    bool rejected = false;
+    try { udp::Sender sender("127.0.0.1", port, "incorrect"); }
+    catch (const std::runtime_error&) { rejected = true; }
+    receive.get();
+    require(rejected, "Wrong UDP password was accepted");
+}
+
+void password_mode_mismatch(udp::Listener& listener, const std::string& sender_password) {
+    const auto port = listener.local_port();
+    auto receive = std::async(std::launch::async, [&] {
+        require(!listener.accept(1500), "UDP connection accepted with mismatched password mode");
+    });
+    bool rejected = false;
+    try {
+        udp::Sender sender("127.0.0.1", port, sender_password);
+        sender.request_display_size(3000);
+    } catch (const std::runtime_error&) { rejected = true; }
+    receive.get();
+    require(rejected, "UDP password mode mismatch silently fell back to plaintext");
+}
 } // namespace
 
 int main() {
@@ -168,6 +203,14 @@ int main() {
         display_negotiation(listener, true);
         display_negotiation(listener, false);
         unavailable_display(listener);
+        const std::string password = "UDP test password";
+        udp::Listener encrypted("127.0.0.1", 0, password);
+        wrong_password(encrypted);
+        password_mode_mismatch(encrypted, {});
+        password_mode_mismatch(listener, password);
+        display_negotiation(encrypted, true, password);
+        display_negotiation(encrypted, false, password);
+        timed_stream(encrypted, password);
         std::cout << "UDP ordering, fragmentation, disconnect and reconnect passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

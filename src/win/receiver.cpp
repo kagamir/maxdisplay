@@ -3,6 +3,7 @@
 #include "display_info.hpp"
 #include "frame_recovery.hpp"
 #include "net.hpp"
+#include "secure_tcp.hpp"
 #include "udp.hpp"
 #include "wire.hpp"
 
@@ -70,6 +71,8 @@ struct PaintStats {
 };
 
 struct Receiver {
+    explicit Receiver(const std::string& password) : password(password) {}
+    const std::string& password;
     HWND window = nullptr;
     win_info::Binding binding{};
     std::uint16_t port = 0;
@@ -324,9 +327,12 @@ struct Receiver {
                 if (stopping) break;
                 active = client;
             }
-            receive_stream([&] { return wire::receive_header(*client, [&] { return display_size(); }); },
-                           [&](auto& bytes, const auto& poll) { return wire::receive_frame(*client, bytes, poll); },
-                           [&](const auto& ack) { client->write_all(ack.data(), ack.size()); });
+            std::optional<secure::TcpChannel> channel;
+            receive_stream([&] {
+                channel.emplace(*client, password, secure::Role::receiver);
+                return channel->receive_header([&] { return display_size(); });
+            }, [&](auto& bytes, const auto& poll) { return channel->receive_frame(bytes, poll); },
+               [&](const auto& ack) { channel->send_feedback(ack); });
             std::lock_guard lock(mutex);
             active.reset();
         }
@@ -550,7 +556,7 @@ int run_receiver(const ReceiverOptions& options) {
     win_info::KeepAwake keep_awake;
     Listener listener;
     if (options.transport == Transport::udp)
-        listener.emplace<udp::Listener>(options.bind, options.port);
+        listener.emplace<udp::Listener>(options.bind, options.port, options.password);
     else
         listener.emplace<net::Socket>(net::listen_tcp(options.bind, options.port));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -564,7 +570,7 @@ int run_receiver(const ReceiverOptions& options) {
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         throw std::system_error(GetLastError(), std::system_category(), "RegisterClassExW");
 
-    Receiver receiver;
+    Receiver receiver(options.password);
     receiver.binding = win_info::resolve_binding(options.bind, options.transport == Transport::udp);
     receiver.port = options.port;
     receiver.transport = options.transport;
@@ -580,6 +586,7 @@ int run_receiver(const ReceiverOptions& options) {
     if (!options.windowed) toggle_fullscreen(receiver);
     std::cout << "Listening on " << (options.transport == Transport::udp ? "UDP " : "TCP ")
               << options.bind << ':' << options.port
+              << (options.password.empty() ? "" : " (AES-128-GCM required)")
               << ". F11 toggles full screen. Esc exits.\n" << std::flush;
 
     try {

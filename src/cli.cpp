@@ -15,13 +15,15 @@ namespace {
 void print_help() {
     std::cout << "MaxDisplay - use a Windows PC as a Mac extended display\n\n"
                  "Windows: maxdisplay [receive] [--bind IP] [--port PORT] [--transport tcp|udp]\n"
-                 "                              [--require-hardware] [--windowed] [--stats]\n"
+                 "                              [--require-hardware] [--windowed] [--stats] [--password PASSWORD]\n"
                  "macOS:   maxdisplay send WINDOWS_HOST [--port PORT] [--size WIDTHxHEIGHT]\n"
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|h265|av1] [--transport tcp|udp]\n"
                  "                                      [--frame-timeout-ms MS] [--fixed-bitrate] [--fixed-fps]\n"
-                 "                                      [--require-hardware] [--legacy] [--stats]\n\n"
+                 "                                      [--require-hardware] [--legacy] [--stats] [--password PASSWORD]\n\n"
                  "Start Windows first. Defaults: H.264 over TCP 49300, scale 1, up to 60 fps and 12 Mbps.\n"
+                 "Use --password PASSWORD on both devices for AES-128-GCM encryption. Omit it on both for plaintext.\n"
+                 "Use --password=VALUE for a password beginning with a dash.\n"
                  "--stats prints per-second streaming statistics on this device.\n"
                  "--size sets the Mac virtual desktop. The stream size is --size times --scale.\n"
                  "Omit --size to use the Windows monitor's pixel dimensions divided by --scale for the desktop.\n"
@@ -47,6 +49,15 @@ std::string_view option_value(int& index, int argc, char** argv) {
     if (index + 1 == argc || std::string_view(argv[index + 1]).empty() || argv[index + 1][0] == '-')
         throw std::invalid_argument(std::string("Missing value for ") + argv[index]);
     return argv[++index];
+}
+
+constexpr std::string_view password_prefix = "--password=";
+
+std::string_view password_value(std::string_view key, int& index, int argc, char** argv) {
+    if (key == "--password") return option_value(index, argc, argv);
+    const auto value = key.substr(password_prefix.size());
+    if (value.empty()) throw std::invalid_argument("--password requires a nonempty value");
+    return value;
 }
 
 Transport parse_transport(std::string_view value) {
@@ -76,8 +87,13 @@ Codec parse_codec(std::string_view value) {
 
 int run_cli(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--password") {
+            option_value(i, argc, argv);
+            continue;
+        }
         if (std::string_view(argv[i]) == "--licenses") {
-            std::cout << third_party_notices << '\n';
+            for (const auto& notice : third_party_notices) std::cout << notice;
+            std::cout << '\n';
             return 0;
         }
         if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") {
@@ -118,6 +134,8 @@ int run_cli(int argc, char** argv) {
             options.adaptive = false;
         } else if (key == "--fixed-fps") {
             options.adaptive_fps = false;
+        } else if (key == "--password" || key.compare(0, password_prefix.size(), password_prefix) == 0) {
+            options.password = password_value(key, i, argc, argv);
         } else if (key == "--stats") {
             options.stats = true;
         } else if (key == "--require-hardware") {
@@ -157,6 +175,8 @@ int run_cli(int argc, char** argv) {
             options.transport = parse_transport(option_value(i, argc, argv));
         } else if (key == "--windowed") {
             options.windowed = true;
+        } else if (key == "--password" || key.compare(0, password_prefix.size(), password_prefix) == 0) {
+            options.password = password_value(key, i, argc, argv);
         } else if (key == "--stats") {
             options.stats = true;
         } else if (key == "--require-hardware") {
