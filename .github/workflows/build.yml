@@ -67,6 +67,24 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Encode H.264, H.265 and AV1 test patterns on Mac
+        if: runner.os == 'macOS'
+        run: |
+          ./build/Release/codec_probe h264.frames h264
+          ./build/Release/codec_probe h265.frames h265
+          ./build/Release/codec_probe av1.frames av1
+
+      - name: Independently decode VideoToolbox streams and restart at the forced keyframe
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            brew install ffmpeg
+          fi
+          python3 tests/check_bitstream.py h264 h264.frames
+          python3 tests/check_bitstream.py hevc h265.frames
+
       - name: Run tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
 
@@ -99,24 +117,6 @@ jobs:
             build/Release/windows_present_tests.exe
           retention-days: 1
           if-no-files-found: error
-
-      - name: Encode H.264, H.265 and AV1 test patterns on Mac
-        if: runner.os == 'macOS'
-        run: |
-          ./build/Release/codec_probe h264.frames h264
-          ./build/Release/codec_probe h265.frames h265
-          ./build/Release/codec_probe av1.frames av1
-
-      - name: Independently decode VideoToolbox streams and restart at the forced keyframe
-        if: runner.os == 'macOS'
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-        run: |
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            brew install ffmpeg
-          fi
-          python3 tests/check_bitstream.py h264 h264.frames
-          python3 tests/check_bitstream.py hevc h265.frames
 
       - name: Store encoded test fixture
         if: runner.os == 'macOS'

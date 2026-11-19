@@ -10,10 +10,12 @@
 #include <chrono>
 #include <csignal>
 #include <future>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <utility>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -75,15 +77,23 @@ void capture(Codec codec, Transport transport) {
         if (mode.width != expected_width || mode.height != expected_height || mode.fps != options.fps ||
             mode.codec != codec || mode.timeout_ms != options.timeout_ms)
             throw std::runtime_error("Unexpected captured desktop mode");
-        auto receive_frame = [&] {
+        std::cout << "Received v3 header for " << codec_name(codec) << '\n' << std::flush;
+        auto receive_frame = [&](std::chrono::steady_clock::time_point deadline, const char* stage) {
             std::vector<uint8_t> message;
-            if (datagrams) {
-                if (datagrams->receive(message, 8000) != udp::ReadResult::message)
-                    throw std::runtime_error("No UDP video frame");
-            } else if (!net::wait_readable(peer, 8000) || !wire::receive_frame(peer, message)) {
-                throw std::runtime_error("No TCP video frame");
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (datagrams) {
+                    const auto result = datagrams->receive(message, 100);
+                    if (result == udp::ReadResult::timeout) continue;
+                    if (result == udp::ReadResult::disconnected)
+                        throw std::runtime_error(std::string("UDP disconnected during ") + stage);
+                } else {
+                    if (!net::wait_readable(peer, 100)) continue;
+                    if (!wire::receive_frame(peer, message))
+                        throw std::runtime_error(std::string("TCP disconnected during ") + stage);
+                }
+                return wire::unpack_frame(message);
             }
-            return wire::unpack_frame(message);
+            throw std::runtime_error(std::string("Timed out during ") + stage);
         };
         auto feedback = [&](uint32_t sequence, bool request_keyframe) {
             auto bytes = wire::pack_feedback({sequence, request_keyframe});
@@ -102,32 +112,52 @@ void capture(Codec codec, Transport transport) {
             if (codec == Codec::h264 ? (au[4] & 31) != 7 : ((au[4] >> 1) & 63) != 32)
                 throw std::runtime_error("Recovery frame did not begin with codec parameter sets");
         };
-        auto first = receive_frame();
-        check_keyframe(first);
-        feedback(first.sequence, true);
-        // Request a standalone picture even when no application is updating the desktop.
-        auto wait_key = [&](uint32_t previous, bool acknowledge_deltas) {
+        auto wait_key = [&](const char* stage, uint32_t previous, bool request_missing) {
             const auto deadline = std::chrono::steady_clock::now() + 8s;
-            do {
-                auto next = receive_frame();
-                if (next.keyframe && next.sequence > previous) {
+            unsigned received = 0;
+            for (;;) {
+                auto next = receive_frame(deadline, stage);
+                if (!received++ || next.keyframe)
+                    std::cout << stage << ": received sequence " << next.sequence
+                              << (next.keyframe ? " keyframe" : " delta") << '\n' << std::flush;
+                if (next.keyframe && (!previous || next.sequence > previous)) {
                     check_keyframe(next);
                     return next.sequence;
                 }
-                if (acknowledge_deltas) feedback(next.sequence, false);
-            } while (std::chrono::steady_clock::now() < deadline);
-            throw std::runtime_error("Mac did not send a recovery keyframe");
+                // A receiver with missing references repeats its request on every delta.
+                if (request_missing) feedback(next.sequence, true);
+            }
         };
-        auto recovery = wait_key(first.sequence, true);
+        auto first = wait_key("initial keyframe", 0, true);
+        feedback(first, true);
+        auto recovery = wait_key("requested keyframe", first, true);
         // Simulate the last picture going missing: send no feedback or further request.
-        auto retry = wait_key(recovery, false);
+        auto retry = wait_key("unacknowledged final picture", recovery, false);
         feedback(retry, false);
         std::raise(SIGINT);
-        stopped_future.wait_for(4s);
+        const auto end = std::chrono::steady_clock::now() + 4s;
+        while (stopped_future.wait_for(0ms) != std::future_status::ready &&
+               std::chrono::steady_clock::now() < end) {
+            if (!datagrams) {
+                stopped_future.wait_for(4s);
+                break;
+            }
+            std::vector<uint8_t> ignored;
+            if (datagrams->receive(ignored, 100) == udp::ReadResult::disconnected) break;
+        }
     });
-    const int status = run_sender(options);
+    int status = 1;
+    std::exception_ptr sender_error;
+    try {
+        status = run_sender(options);
+    } catch (const std::exception& error) {
+        std::cerr << "Mac sender: " << error.what() << '\n';
+        sender_error = std::current_exception();
+    }
     stopped.set_value();
+    // Surface a peer-side failure (e.g. missing keyframe) even if it closed the connection.
     receive.get();
+    if (sender_error) std::rethrow_exception(sender_error);
     if (status != 0) throw std::runtime_error("Sender did not stop normally");
 }
 } // namespace

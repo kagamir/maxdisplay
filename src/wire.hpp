@@ -3,7 +3,10 @@
 #include "media.hpp"
 #include "net.hpp"
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace wire {
