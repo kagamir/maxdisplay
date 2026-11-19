@@ -69,6 +69,25 @@ BOOL CALLBACK find_receiver(HWND candidate, LPARAM context) {
     return TRUE;
 }
 
+// Inspect the receiver's input queue on its own UI thread. The CI desktop's
+// real pointer may be over another window; drive hit tests without moving it.
+LRESULT CALLBACK cursor_probe_proc(HWND probe, UINT message, WPARAM wp, LPARAM lp) {
+    if (message != WM_APP) return DefWindowProcW(probe, message, wp, lp);
+    const auto viewer = reinterpret_cast<HWND>(wp);
+    const auto previous = GetCursor();
+    POINT point{};
+    if (GetCursorPos(&point) && WindowFromPoint(point) == viewer &&
+        SendMessageW(viewer, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y)) == HTCLIENT && previous)
+        return FALSE;
+    SetCursor(nullptr);
+    SendMessageW(viewer, WM_SETCURSOR, wp, MAKELPARAM(HTCAPTION, WM_MOUSEMOVE));
+    const bool title_bar_visible = GetCursor() != nullptr;
+    const auto handled = SendMessageW(viewer, WM_SETCURSOR, wp, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+    const bool client_hidden = GetCursor() == nullptr;
+    SetCursor(previous);
+    return title_bar_visible && handled && client_hidden;
+}
+
 struct Surface {
     HDC dc = CreateCompatibleDC(nullptr);
     HBITMAP bitmap = nullptr;
@@ -290,15 +309,27 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
     options.port = net::listen_tcp(options.bind, 0).local_port();
     const auto other = transport == Transport::udp ? Transport::tcp : Transport::udp;
     if (encrypted) options.password = "MaxDisplay test passphrase";
-    options.windowed = true;
+    options.windowed = transport == Transport::tcp; // Exercise both windowed and full-screen startup.
     options.stats = true;
-    std::promise<DWORD> started;
-    auto ui_id = started.get_future();
+    std::promise<HWND> started;
+    auto probe_ready = started.get_future();
     auto ui = std::async(std::launch::async, [&] {
-        started.set_value(GetCurrentThreadId());
-        return run_receiver(options);
+        WNDCLASSW cls{};
+        cls.lpfnWndProc = cursor_probe_proc;
+        cls.hInstance = GetModuleHandleW(nullptr);
+        cls.lpszClassName = L"MaxDisplayTestCursorProbe";
+        RegisterClassW(&cls);
+        HWND probe = CreateWindowW(cls.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE,
+                                   nullptr, cls.hInstance, nullptr);
+        started.set_value(probe);
+        if (!probe) return 1;
+        const int result = run_receiver(options);
+        DestroyWindow(probe);
+        return result;
     });
-    const DWORD thread = ui_id.get();
+    const HWND probe = probe_ready.get();
+    if (!probe) throw std::runtime_error("Cannot create cursor test window");
+    const DWORD thread = GetWindowThreadProcessId(probe, nullptr);
     HWND window = nullptr;
     std::optional<TestSender> client; // Remain connected during Escape shutdown.
     std::exception_ptr failure;
@@ -308,6 +339,11 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             return window || ui.wait_for(0s) == std::future_status::ready;
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
+        auto check_system_cursor = [&] {
+            if (!SendMessageW(probe, WM_APP, reinterpret_cast<WPARAM>(window), 0))
+                throw std::runtime_error("Unexpected Windows cursor over the receiver client or title bar");
+        };
+        check_system_cursor();
         for (bool late : {false, true}) {
             client.emplace(options, late ? other : transport, codec, late ? nullptr : window);
             if (late) {
@@ -321,6 +357,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
                 client->send(frames, 1, 2, true, stamp);
             } else {
                 send_initial_frames(*client, frames, window);
+                check_system_cursor();
                 if (codec == Codec::h264) check_busy_receiver(options, other);
                 // Sequence 4 (a reference picture) was lost. Deliver the following delta.
                 client->send(frames, 4, 5, true);
@@ -380,7 +417,7 @@ int main(int argc, char** argv) {
         DestroyWindow(probe);
         check(frames, codec == "h265" ? Codec::h265 : codec == "av1" ? Codec::av1 : Codec::h264,
               transport == "udp" ? Transport::udp : Transport::tcp, encrypted);
-        std::cout << codec << "/" << transport << (encrypted ? " (encrypted)" : "") << ": verified missing and late frame recovery, window pixels, cross-transport reconnect and Escape shutdown\n";
+        std::cout << codec << "/" << transport << (encrypted ? " (encrypted)" : "") << ": verified native cursor hiding, missing and late frame recovery, window pixels, cross-transport reconnect and Escape shutdown\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

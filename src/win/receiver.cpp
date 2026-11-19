@@ -615,6 +615,23 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     auto receiver = reinterpret_cast<Receiver*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (!receiver) return DefWindowProcW(window, message, wp, lp);
     switch (message) {
+    case WM_SETCURSOR:
+        if (reinterpret_cast<HWND>(wp) == window && LOWORD(lp) == HTCLIENT) {
+            SetCursor(nullptr);
+            return TRUE;
+        }
+        break;
+    case WM_WINDOWPOSCHANGED: {
+        const auto result = DefWindowProcW(window, message, wp, lp);
+        // Showing or resizing the viewer can put it under a stationary pointer.
+        POINT point{};
+        if (IsWindowVisible(window) && !IsIconic(window) && !GetCapture() &&
+            GetCursorPos(&point) && WindowFromPoint(point) == window) {
+            const auto hit = SendMessageW(window, WM_NCHITTEST, 0, MAKELPARAM(point.x, point.y));
+            SendMessageW(window, WM_SETCURSOR, reinterpret_cast<WPARAM>(window), MAKELPARAM(hit, 0));
+        }
+        return result;
+    }
     case cursor_changed:
         receiver->apply_cursor();
         return 0;
@@ -698,7 +715,6 @@ int run_receiver(const ReceiverOptions& options) {
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = window_proc;
     wc.hInstance = instance;
-    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
     wc.lpszClassName = window_class;
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         throw std::system_error(GetLastError(), std::system_category(), "RegisterClassExW");
