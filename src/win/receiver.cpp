@@ -331,9 +331,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 
 int run_receiver(const ReceiverOptions& options) {
     win_info::KeepAwake keep_awake;
-    Listener listener = options.transport == Transport::udp
-        ? Listener(std::in_place_type<udp::Listener>, options.bind, options.port)
-        : Listener(net::listen_tcp(options.bind, options.port));
+    Listener listener;
+    if (options.transport == Transport::udp)
+        listener.emplace<udp::Listener>(options.bind, options.port);
+    else
+        listener.emplace<net::Socket>(net::listen_tcp(options.bind, options.port));
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     WNDCLASSEXW wc{};
