@@ -38,19 +38,23 @@ int run_receiver(const ReceiverOptions& options) { receiver = options; return 0;
 int main() {
     try {
 #ifdef __APPLE__
-        expect(invoke({"send", "example"}) == 0 && sender.width == 1920 && sender.height == 1080 &&
+        expect(invoke({"send", "example"}) == 0 && sender.width == 0 && sender.height == 0 &&
                sender.scale == 1 && sender.codec == Codec::h264 && sender.transport == Transport::tcp &&
-               sender.timeout_ms == 200 && sender.adaptive && !sender.require_hardware && !sender.legacy,
+               sender.timeout_ms == 200 && sender.adaptive && sender.adaptive_fps && !sender.require_hardware && !sender.legacy,
                "Unexpected Mac defaults");
         expect(invoke({"send", "example", "--codec", "av1", "--transport", "udp", "--size", "640x360",
-                       "--scale", "1.5"}) == 0 && sender.width == 960 && sender.height == 540 &&
+                       "--scale", "1.5"}) == 0 && sender.width == 640 && sender.height == 360 &&
                sender.scale == 1.5 && sender.codec == Codec::av1 && sender.transport == Transport::udp,
                "Fractional scale or media selections lost");
         expect(invoke({"send", "example", "--codec", "h265", "--require-hardware", "--frame-timeout-ms", "150",
                        "--bitrate-mbps", "16", "--fixed-bitrate"}) == 0 && sender.codec == Codec::h265 &&
                sender.require_hardware && sender.timeout_ms == 150 && sender.bitrate == 16'000'000 &&
-               !sender.adaptive && !sender.legacy, "HEVC streaming options lost");
-        expect(invoke({"send", "example", "--legacy"}) == 0 && sender.legacy && !sender.adaptive,
+               !sender.adaptive && sender.adaptive_fps && !sender.legacy, "HEVC streaming options lost");
+        expect(invoke({"send", "example", "--fps", "48", "--fixed-fps", "--scale", "0.75"}) == 0 &&
+               sender.fps == 48 && !sender.adaptive_fps && sender.adaptive && sender.width == 0,
+               "Fixed frame rate interfered with adaptive bitrate or monitor sizing");
+        expect(invoke({"send", "example", "--legacy"}) == 0 && sender.legacy && !sender.adaptive &&
+               !sender.adaptive_fps && sender.width == 1920 && sender.height == 1080,
                "Legacy protocol selected adaptive feedback");
         invalid({"send", "example", "--legacy", "--codec", "hevc"});
         invalid({"send", "example", "--legacy", "--frame-timeout-ms", "300"});
@@ -58,14 +62,14 @@ int main() {
         invalid({"send", "example", "--frame-timeout-ms", "0"});
         invalid({"send", "example", "--frame-timeout-ms", "60001"});
         expect(invoke({"send", "example", "--scale", "2", "--size", "641x361"}) == 0 &&
-               sender.width == 1282 && sender.height == 722 && sender.scale == 2,
+               sender.width == 641 && sender.height == 361 && sender.scale == 2,
                "2x mode or option order mismatch");
         expect(invoke({"send", "example", "--size", "7680x4320", "--scale", ".25"}) == 0 &&
-               sender.width == 1920 && sender.height == 1080, "Downscaling used pre-scale limits");
+               sender.width == 7680 && sender.height == 4320, "Downscaling changed the desktop dimensions");
         expect(invoke({"send", "example", "--size", "100x100", "--scale", "0.58"}) == 0 &&
-               sender.width == 58 && sender.height == 58, "Binary rounding rejected a valid pixel count");
+               sender.width == 100 && sender.height == 100, "Binary rounding rejected a valid pixel count");
         for (auto bad : {"0", "-1", "NaN", "inf", "2oops", "1e999", "0.00001", "0.333", "1e100"})
-            invalid({"send", "example", "--scale", bad});
+            invalid({"send", "example", "--size", "1920x1080", "--scale", bad});
         invalid({"send", "example", "--size", "640x360", "--scale", "100"});
         invalid({"send", "example", "--size", "641x361"});
         invalid({"send", "example", "--codec", "unknown"});

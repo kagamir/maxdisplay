@@ -1,5 +1,7 @@
 #pragma once
 
+#include "wire.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -13,6 +15,7 @@ class Sender {
 public:
     Sender(const std::string& host, std::uint16_t port);
     ~Sender();
+    wire::DisplaySize request_display_size(unsigned timeout_ms = wire::display_query_timeout_ms);
     void send(const std::vector<std::uint8_t>& message);
     // Sync pictures can retransmit missing fragments. Delta pictures are sequenced/unreliable.
     // False reports a full local queue or a preceding sync picture still in flight.
@@ -36,6 +39,8 @@ public:
     ~Listener();
     std::uint16_t local_port() const;
     bool accept(unsigned timeout_ms);
+    wire::Header receive_header(const std::function<wire::DisplaySize()>& display_size,
+                                const std::function<bool()>& stopping = {});
     ReadResult receive(std::vector<std::uint8_t>& message, unsigned timeout_ms);
     void send_feedback(const std::vector<std::uint8_t>& message);
     void disconnect() noexcept;

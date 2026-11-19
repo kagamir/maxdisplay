@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "display_scale.hpp"
 #include "encoder.hpp"
 #include "net.hpp"
 #include "rate_control.hpp"
@@ -103,8 +104,7 @@ std::uint64_t now_us() {
 class Connection {
 public:
     explicit Connection(const SenderOptions& options)
-        : legacy_(options.legacy), control_(options.bitrate, options.fps, options.timeout_ms,
-                                           options.adaptive, !options.legacy) {
+        : legacy_(options.legacy) {
         if (options.transport == Transport::udp)
             udp_ = std::make_unique<udp::Sender>(options.host, options.port);
         else
@@ -113,12 +113,18 @@ public:
 
     ~Connection() { close(); }
 
-    void send_header(const SenderOptions& options) {
+    wire::DisplaySize request_display_size() {
+        return udp_ ? udp_->request_display_size() : wire::request_display_size(tcp_);
+    }
+
+    void send_header(const SenderOptions& options, const DisplayGeometry& mode) {
+        control_.emplace(options.bitrate, options.fps, options.timeout_ms,
+                         options.adaptive, options.adaptive_fps, !legacy_);
         const auto timeout = legacy_ ? 0u : options.timeout_ms;
         if (udp_)
-            udp_->send(wire::encode_header({options.width, options.height, options.fps, options.codec, timeout}));
+            udp_->send(wire::encode_header({mode.stream_width, mode.stream_height, options.fps, options.codec, timeout}));
         else
-            wire::send_header(tcp_, options.width, options.height, options.fps, options.codec, timeout);
+            wire::send_header(tcp_, mode.stream_width, mode.stream_height, options.fps, options.codec, timeout);
         writer_ = std::thread([this] {
             try { run(); }
             catch (...) { fail(std::current_exception()); }
@@ -127,6 +133,7 @@ public:
 
     struct EncodeRequest {
         std::uint32_t bitrate;
+        std::uint32_t fps;
         bool force_key;
     };
 
@@ -135,19 +142,22 @@ public:
         if (closing_) return std::nullopt;
         const auto now = now_us();
         expire(now);
-        if (!legacy_ && control_.expired(now, capture)) {
+        if (!refresh_only && !legacy_ && control_->expired(now, capture)) {
             // This sample was already old when ScreenCaptureKit delivered it.
             // The timer can resample its image if no newer sample arrives.
             pending_.clear();
-            control_.loss(now);
+            control_->loss(now);
             return std::nullopt;
         }
-        const bool force = control_.take_key_request(now);
-        if (!force && (refresh_only || control_.needs_key())) return std::nullopt;
+        const auto action = control_->next_capture(now, !refresh_only);
+        if (action == StreamControl::Capture::skip) return std::nullopt;
+        // On a timer tick the retained image is re-sampled. The capture queue
+        // owns that image and replaces it on every subsequent screen change.
+        encode_start_us_ = now;
         // encode() finishes the submitted frame before the capture queue submits
         // another. The callback itself may be delivered on a VideoToolbox thread.
         capture_us_ = std::max(capture, capture_us_ + 1);
-        return EncodeRequest{control_.bitrate(), force};
+        return EncodeRequest{control_->bitrate(), control_->fps(), action == StreamControl::Capture::force_key};
     }
 
     void encoded(std::vector<uint8_t> bytes, bool keyframe) {
@@ -155,14 +165,15 @@ public:
         if (closing_) return;
         const auto now = now_us();
         expire(now);
-        const bool stale = !legacy_ && control_.expired(now, capture_us_);
+        control_->observe_encode_time(now - encode_start_us_, keyframe);
+        const bool stale = !legacy_ && control_->expired(now, capture_us_);
         if (stale || pending_.size() >= 4) {
             pending_.clear();
-            control_.loss(now);
+            control_->loss(now);
             if (stale) return;
         }
         const auto sequence = next_sequence_++;
-        if (!control_.accept_encoded(sequence, keyframe)) return;
+        if (!control_->accept_encoded(sequence, keyframe)) return;
         pending_.push_back({sequence, capture_us_, keyframe, std::move(bytes)});
         wake_.notify_one();
     }
@@ -192,17 +203,17 @@ public:
 
 private:
     void expire(std::uint64_t now) {
-        if (control_.poll(now)) pending_.clear();
-        if (!legacy_ && !pending_.empty() && control_.expired(now, pending_.front().timestamp_us)) {
+        if (control_->poll(now)) pending_.clear();
+        if (!legacy_ && !pending_.empty() && control_->expired(now, pending_.front().timestamp_us)) {
             pending_.clear();
-            control_.loss(now);
+            control_->loss(now);
         }
     }
 
     void feedback(const std::vector<std::uint8_t>& bytes) {
         const auto ack = wire::unpack_feedback(bytes);
         std::lock_guard lock(mutex_);
-        if (control_.acknowledge(ack.sequence, ack.request_keyframe, now_us())) pending_.clear();
+        if (control_->acknowledge(ack.sequence, ack.request_keyframe, now_us())) pending_.clear();
     }
 
     void receive_feedback() {
@@ -241,7 +252,7 @@ private:
                 if (pending_.empty()) continue;
                 frame = std::move(pending_.front());
                 pending_.pop_front();
-                control_.sent(frame.sequence, now, frame.data.size());
+                control_->sent(frame.sequence, now, frame.data.size());
             }
             if (legacy_) {
                 if (udp_) udp_->send(frame.data);
@@ -249,20 +260,20 @@ private:
                 continue;
             }
             const auto message = wire::pack_frame(frame);
-            const auto age_limit = std::chrono::microseconds(control_.deadline(frame.timestamp_us));
+            const auto age_limit = std::chrono::microseconds(control_->deadline(frame.timestamp_us));
             const auto deadline = Clock::time_point(std::chrono::duration_cast<Clock::duration>(age_limit));
             const bool sent = udp_ ? (Clock::now() < deadline && udp_->send_frame(message, frame.keyframe))
                                    : wire::send_frame_before(tcp_, message, deadline);
             if (!sent) {
                 std::lock_guard lock(mutex_);
                 pending_.clear();
-                control_.loss(now_us());
+                control_->loss(now_us());
             }
         }
     }
 
     bool legacy_;
-    StreamControl control_;
+    std::optional<StreamControl> control_;
     net::Socket tcp_;
     std::unique_ptr<udp::Sender> udp_;
     std::thread writer_;
@@ -272,7 +283,7 @@ private:
     bool closing_ = false;
     std::exception_ptr error_;
     std::uint32_t next_sequence_ = 1;
-    std::uint64_t capture_us_ = 0;
+    std::uint64_t capture_us_ = 0, encode_start_us_ = 0;
     std::vector<std::uint8_t> ack_ = std::vector<std::uint8_t>(wire::feedback_size);
     std::size_t ack_used_ = 0;
 };
@@ -284,7 +295,7 @@ private:
     std::shared_ptr<Encoder> encoder;
     // Accessed only on the capture queue once capture starts.
     CVPixelBufferRef latest;
-    std::uint32_t bitrate;
+    std::uint32_t bitrate, fps;
 }
 - (void)encodeLatestAt:(std::uint64_t)capture refreshOnly:(bool)refresh;
 @end
@@ -303,6 +314,10 @@ private:
             encoder->set_bitrate(request->bitrate);
             bitrate = request->bitrate;
             std::clog << "Adaptive encoder target: " << bitrate / 1000 << " kbps" << std::endl;
+        }
+        if (fps != request->fps) {
+            fps = request->fps;
+            std::clog << "Adaptive frame rate: " << fps << " fps" << std::endl;
         }
         encoder->encode(latest, CMTimeMake(now_us(), 1'000'000), request->force_key);
     } catch (...) { connection->fail(std::current_exception()); }
@@ -356,19 +371,26 @@ void change_capture(SCStream *stream, bool start) {
     if (failure) throw capture_error(operation, failure);
 }
 
-int stream_desktop(const SenderOptions& options) {
+int stream_desktop(SenderOptions options) {
     if (!CGPreflightScreenCaptureAccess() && !CGRequestScreenCaptureAccess())
         throw std::runtime_error("Allow Screen Recording for MaxDisplay or your terminal in System Settings "
                                  "> Privacy & Security, then quit, reopen and retry.");
 
     auto connection = std::make_shared<Connection>(options);
-    VirtualDisplay display(options.width, options.height, options.fps, options.scale == 2.0);
+    wire::DisplaySize monitor{};
+    if (!options.width && !options.height) monitor = connection->request_display_size();
+    const auto mode = resolve_display_geometry(options, monitor.width, monitor.height);
+    if (mode.fps < options.fps)
+        std::clog << codec_name(options.codec) << " video at " << mode.stream_width << 'x'
+                  << mode.stream_height << " limits the frame rate to " << mode.fps << " fps\n";
+    options.fps = mode.fps;
+    VirtualDisplay display(mode.logical_width, mode.logical_height, mode.fps, options.scale > 1.0);
     CGDirectDisplayID display_id = display.id();
     SCDisplay *source = find_display(display_id);
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:source excludingWindows:@[]];
     SCStreamConfiguration *config = [SCStreamConfiguration new];
-    config.width = options.width;
-    config.height = options.height;
+    config.width = mode.stream_width;
+    config.height = mode.stream_height;
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     config.colorSpaceName = kCGColorSpaceITUR_709;
     config.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
@@ -377,13 +399,14 @@ int stream_desktop(const SenderOptions& options) {
     config.showsCursor = YES;
     config.capturesAudio = NO;
 
-    connection->send_header(options);
-    auto encoder = std::make_shared<Encoder>(options.width, options.height, options.fps, options.bitrate,
+    connection->send_header(options, mode);
+    auto encoder = std::make_shared<Encoder>(mode.stream_width, mode.stream_height, mode.fps, options.bitrate,
         [connection](std::vector<uint8_t> frame, bool keyframe) { connection->encoded(std::move(frame), keyframe); },
         options.codec, options.require_hardware);
     MDStreamSink *sink = [MDStreamSink new];
     sink->encoder = encoder;
     sink->bitrate = options.bitrate;
+    sink->fps = options.fps;
     sink->connection = connection;
     SCStream *stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:sink];
     auto samples = dispatch_queue_create("maxdisplay.capture", DISPATCH_QUEUE_SERIAL);
@@ -400,19 +423,21 @@ int stream_desktop(const SenderOptions& options) {
     std::exception_ptr failure;
     try {
         change_capture(stream, true);
-        std::cout << "Streaming MaxDisplay " << options.width << 'x' << options.height << " to "
+        std::cout << "Streaming MaxDisplay " << mode.logical_width << 'x' << mode.logical_height
+                  << " desktop points as " << mode.stream_width << 'x' << mode.stream_height << " pixels to "
                   << options.host << ':' << options.port << " using "
                   << codec_name(options.codec) << (encoder->hardware_accelerated() ? " (hardware)" : " (software)")
                   << " over "
                   << (options.transport == Transport::udp ? "UDP" : "TCP") << ", "
                   << (options.adaptive && !options.legacy ? "adaptive" : "fixed")
-                  << " bitrate " << options.bitrate / 1000 << " kbps";
+                  << " bitrate " << options.bitrate / 1000 << " kbps, "
+                  << (options.adaptive_fps && !options.legacy ? "adaptive" : "fixed")
+                  << " frame rate up to " << options.fps << " fps";
         if (options.legacy) std::cout << ", legacy stream";
         else std::cout << ", frame budget " << options.timeout_ms << " ms";
         std::cout << ". Press Ctrl+C to stop." << std::endl;
         while (!interrupted) {
             connection->check();
-            encoder->check_error();
             if (!CGDisplayIsOnline(display_id) || CGDisplayIsInMirrorSet(display_id))
                 throw std::runtime_error("MaxDisplay is no longer an independent display");
             pump(0.2);

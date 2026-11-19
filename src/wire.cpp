@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <stdexcept>
+#include <string>
 
 namespace wire {
 namespace {
@@ -10,6 +11,7 @@ namespace {
 using Word = std::array<std::uint8_t, 4>;
 constexpr Word magic{'M', 'X', 'D', 'S'};
 constexpr Word feedback_magic{'M', 'X', 'F', 'B'};
+constexpr Word display_magic{'M', 'X', 'D', 'R'};
 constexpr std::size_t legacy_size = 20;
 constexpr std::size_t extended_size = 24;
 constexpr std::size_t timed_size = 28;
@@ -55,7 +57,56 @@ void check_size(std::size_t size) {
         throw std::runtime_error("Video access unit length is outside protocol limits");
 }
 
+unsigned wait_remaining(std::chrono::steady_clock::time_point deadline) {
+    const auto ms = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+    if (ms.count() <= 0) throw std::runtime_error("Handshake timed out");
+    return static_cast<unsigned>(std::min<std::int64_t>(ms.count(), 250));
+}
+
+void validate_display(DisplaySize size) {
+    if (!size.width || !size.height || size.width > 65535 || size.height > 65535)
+        throw std::runtime_error("Invalid receiver display dimensions");
+}
+
 } // namespace
+
+// Twenty bytes lets older TCP receivers reject this immediately on reading their v1 header.
+const std::vector<std::uint8_t> display_query{'M','X','D','Q', 0,0,0,1, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+
+std::vector<std::uint8_t> encode_display_reply(DisplaySize size) {
+    validate_display(size);
+    std::vector<std::uint8_t> bytes(display_magic.begin(), display_magic.end());
+    append_word(bytes, 1);
+    append_word(bytes, size.width);
+    append_word(bytes, size.height);
+    return bytes;
+}
+
+DisplaySize decode_display_reply(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() != display_reply_size || !std::equal(display_magic.begin(), display_magic.end(), bytes.begin())
+        || from_bytes(bytes.data() + 4) != 1) throw std::runtime_error("Invalid display resolution reply");
+    DisplaySize size{from_bytes(bytes.data() + 8), from_bytes(bytes.data() + 12)};
+    validate_display(size);
+    return size;
+}
+
+DisplaySize request_display_size(net::Socket& socket, unsigned timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    try {
+        std::size_t sent = 0;
+        while (sent < display_query.size()) {
+            const auto n = socket.write_some_until(display_query.data() + sent, display_query.size() - sent, deadline);
+            if (!n) throw std::runtime_error("Sending query timed out");
+            sent += n;
+        }
+        std::vector<std::uint8_t> bytes(display_reply_size);
+        if (!socket.read_exact(bytes.data(), bytes.size(), [&] { return wait_remaining(deadline); }))
+            throw std::runtime_error("Receiver disconnected");
+        return decode_display_reply(bytes);
+    } catch (const std::runtime_error& e) {
+        throw std::runtime_error(std::string(display_query_hint) + e.what());
+    }
+}
 
 bool valid_mode(std::uint32_t width, std::uint32_t height, std::uint32_t fps, Codec codec) noexcept {
     if (width < 48 || width > 4096 || height < 48 || height > 2304 ||
@@ -100,14 +151,22 @@ void send_header(net::Socket& socket, std::uint32_t width, std::uint32_t height,
     socket.write_all(bytes.data(), bytes.size());
 }
 
-Header receive_header(net::Socket& socket) {
+Header receive_header(net::Socket& socket, const std::function<DisplaySize()>& display_size) {
+    const auto deadline = std::chrono::steady_clock::now() + header_timeout;
+    auto poll = [&] { return wait_remaining(deadline); };
     std::vector<std::uint8_t> bytes(legacy_size);
-    if (!socket.read_exact(bytes.data(), legacy_size))
+    if (!socket.read_exact(bytes.data(), bytes.size(), poll))
         throw std::runtime_error("Peer disconnected before sending the stream header");
+    if (bytes == display_query && display_size) {
+        const auto reply = encode_display_reply(display_size());
+        socket.write_all(reply.data(), reply.size());
+        if (!socket.read_exact(bytes.data(), bytes.size(), poll))
+            throw std::runtime_error("Peer disconnected after requesting the display resolution");
+    }
     const auto size = header_size(bytes.data());
     if (size > legacy_size) {
         bytes.resize(size);
-        if (!socket.read_exact(bytes.data() + legacy_size, size - legacy_size))
+        if (!socket.read_exact(bytes.data() + legacy_size, size - legacy_size, poll))
             throw std::runtime_error("Peer disconnected before completing the stream header");
     }
     return decode_header(bytes);

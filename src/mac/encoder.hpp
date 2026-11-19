@@ -21,12 +21,10 @@ public:
             bool require_hardware = false);
     ~Encoder();
 
-    // Call from the serial capture queue. Output can run on a VideoToolbox thread.
+    // Call from the serial capture queue. Output is delivered before encode() returns.
     void encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe = false);
     void set_bitrate(uint32_t bps);
     bool hardware_accelerated() const;
-    // May be polled from another thread, including while the desktop is idle.
-    void check_error() const;
     // Call after capture has stopped and its queue is drained.
     void finish();
 

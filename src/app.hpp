@@ -10,8 +10,9 @@ constexpr std::uint16_t default_port = 49300;
 struct SenderOptions {
     std::string host;
     std::uint16_t port = default_port;
-    std::uint32_t width = 1920;
-    std::uint32_t height = 1080;
+    // Logical desktop size. A zero pair requests the Windows monitor dimensions.
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
     std::uint32_t fps = 60;
     std::uint32_t bitrate = 12'000'000;
     Codec codec = Codec::h264;
@@ -19,6 +20,7 @@ struct SenderOptions {
     double scale = 1.0;
     std::uint32_t timeout_ms = 200;
     bool adaptive = true;
+    bool adaptive_fps = true;
     bool require_hardware = false;
     bool legacy = false;
 };

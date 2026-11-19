@@ -82,10 +82,22 @@ void recovery_pictures() {
     invalid[3] = 70; // Replace VPS with an access unit delimiter.
     require(!has_recovery_picture(Codec::h265, invalid), "HEVC IRAP without VPS accepted");
 }
+
+void variable_cadence() {
+    FrameRecovery stream(200);
+    stream.inspect(1, 0, true, 0);
+    require(stream.idle_drain_us(60, 200'000) < 34'000, "Strong initial delay for single static frame");
+    stream.inspect(2, 80'000, false, 80'000);
+    require(stream.idle_drain_us(60, 200'000) == 160'000, "Slow stream would flush before the next picture");
+    require(stream.idle_drain_us(60, 10'000) == 5'000, "Idle drain exceeded remaining deadline");
+    stream.inspect(3, 6'000'000, false, 6'000'000);
+    require(stream.idle_drain_us(60, 200'000) < 34'000, "Idle pause permanently enlarged presentation delay");
+}
 }
 
 int main() {
     loss_and_reordering();
     deadlines_and_clocks();
     recovery_pictures();
+    variable_cadence();
 }

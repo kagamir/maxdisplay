@@ -101,7 +101,6 @@ struct Receiver {
         bool used_decoder = false;
         std::deque<Clock::time_point> deadlines;
         Clock::time_point drain_at;
-        const auto idle_interval = std::chrono::microseconds(2'000'000 / header.fps);
         auto acknowledge = [&] {
             feedback(wire::pack_feedback({recovery.sequence(), recovery.waiting_for_keyframe()}));
         };
@@ -177,8 +176,10 @@ struct Receiver {
                     recovery.recover();
                 }
                 if (!deadlines.empty()) {
-                    // Leave time for the hardware readback and color conversion.
-                    drain_at = std::min(now + idle_interval, now + (deadlines.front() - now) / 2);
+                    const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                        deadlines.front() - now).count();
+                    const auto delay = recovery.idle_drain_us(header.fps, std::max<std::int64_t>(0, remaining));
+                    drain_at = now + std::chrono::microseconds(delay);
                 }
             }
             acknowledge();
@@ -208,6 +209,13 @@ struct Receiver {
         if (!stopping) show_status(next_status);
     }
 
+    wire::DisplaySize display_size() const {
+        const SIZE pixels = win_info::monitor_pixels(window);
+        if (pixels.cx <= 0 || pixels.cy <= 0)
+            throw std::runtime_error("Cannot read the resolution of the receiver window's monitor");
+        return {static_cast<std::uint32_t>(pixels.cx), static_cast<std::uint32_t>(pixels.cy)};
+    }
+
     void listen(net::Socket& listener) {
         while (!stopping) {
             if (!net::wait_readable(listener, 150)) continue;
@@ -219,7 +227,7 @@ struct Receiver {
                 if (stopping) break;
                 active = client;
             }
-            receive_stream([&] { return wire::receive_header(*client); },
+            receive_stream([&] { return wire::receive_header(*client, [&] { return display_size(); }); },
                            [&](auto& bytes, const auto& poll) { return wire::receive_frame(*client, bytes, poll); },
                            [&](const auto& ack) { client->write_all(ack.data(), ack.size()); });
             std::lock_guard lock(mutex);
@@ -241,10 +249,7 @@ struct Receiver {
         while (!stopping) {
             if (!listener.accept(100)) continue;
             receive_stream([&] {
-                std::vector<std::uint8_t> bytes;
-                if (!read(bytes, [] { return 100u; }))
-                    throw std::runtime_error("UDP stream ended before its header");
-                return wire::decode_header(bytes);
+                return listener.receive_header([&] { return display_size(); }, [&] { return stopping.load(); });
             }, read, [&](const auto& ack) { listener.send_feedback(ack); });
             listener.disconnect();
         }

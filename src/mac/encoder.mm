@@ -5,7 +5,9 @@
 #import <VideoToolbox/VideoToolbox.h>
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -100,28 +102,42 @@ struct Encoder::Impl {
     VTCompressionSessionRef session = nullptr;
     Output output;
     std::unique_ptr<Av1Encoder> av1;
-    uint32_t width, height;
-    bool hardware = false;
+    uint32_t width, height, fps, bitrate;
+    Codec codec;
+    bool require_hardware;
+    std::atomic<bool> hardware{false};
+    bool need_sync = true;
     int64_t last_av1_pts = -1;
     CMTime last_vt_pts = kCMTimeInvalid;
-    std::mutex error_mutex;
-    std::exception_ptr error;
     CMTime duration;
 
-    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps)
-        : output(std::move(cb)), width(w), height(h), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
+    // Only one sample is submitted at a time. Publish output to the transport
+    // after CompleteFrames succeeds so a failed frame can be retried exactly once.
+    struct Frame {
+        std::vector<uint8_t> bytes;
+        bool keyframe = false;
+    };
+    std::mutex result_mutex;
+    Frame result;
+    std::exception_ptr callback_error;
 
-    OSStatus close() noexcept {
-        if (!session)
-            return noErr;
-        OSStatus status = VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
-        VTCompressionSessionInvalidate(session);
-        CFRelease(session);
-        session = nullptr;
-        return status;
+    Impl(Output cb, uint32_t w, uint32_t h, uint32_t fps, uint32_t bps, Codec codec, bool strict)
+        : output(std::move(cb)), width(w), height(h), fps(fps), bitrate(bps), codec(codec),
+          require_hardware(strict), duration(CMTimeMake(1, static_cast<int32_t>(fps))) {}
+
+    void close() noexcept {
+        if (session) {
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            session = nullptr;
+        }
     }
 
     ~Impl() { close(); }
+
+    void open(bool use_hardware);
+    void fall_back(const std::runtime_error& cause);
+    Frame submit(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe);
 
     static void encoded(void* context, void*, OSStatus status, VTEncodeInfoFlags flags,
                         CMSampleBufferRef sample) noexcept {
@@ -133,31 +149,18 @@ struct Encoder::Impl {
             if (!sample || !CMSampleBufferDataIsReady(sample))
                 throw std::runtime_error("VideoToolbox returned no encoded sample");
             const bool keyframe = is_sync_sample(sample);
-            self.output(annex_b(sample, keyframe), keyframe);
+            auto bytes = annex_b(sample, keyframe);
+            std::lock_guard<std::mutex> lock(self.result_mutex);
+            self.result = {std::move(bytes), keyframe};
         } catch (...) {
-            std::lock_guard<std::mutex> lock(self.error_mutex);
-            if (!self.error)
-                self.error = std::current_exception();
+            std::lock_guard<std::mutex> lock(self.result_mutex);
+            self.callback_error = std::current_exception();
         }
     }
 };
 
-Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate,
-                 std::function<void(std::vector<uint8_t>)> output, Codec codec, bool require_hardware)
-    : Encoder(width, height, fps, bitrate, [cb = std::move(output)](std::vector<uint8_t> data, bool) {
-          cb(std::move(data));
-      }, codec, require_hardware) {}
-
-Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output,
-                 Codec codec, bool require_hardware)
-    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps)) {
-    if (codec == Codec::av1) {
-        if (require_hardware) throw std::invalid_argument("AV1 encoding uses software libaom");
-        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate);
-        return;
-    }
+void Encoder::Impl::open(bool use_hardware) {
     const bool hevc = codec == Codec::h265;
-    if (!hevc && codec != Codec::h264) throw std::invalid_argument("Unsupported video codec");
     const CFStringRef profile = hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_Baseline_AutoLevel;
     NSDictionary* properties = @{
         (__bridge NSString*)kVTCompressionPropertyKey_RealTime: @YES,
@@ -170,47 +173,96 @@ Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate
         (__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate: @(fps),
         (__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval: @(fps * 2)
     };
-    auto open = [&](bool hardware) {
-        NSDictionary* spec = hardware ?
-            @{(__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES} :
-            @{(__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO};
-        check_status(VTCompressionSessionCreate(kCFAllocatorDefault, width, height,
-                                                hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
-                                                (__bridge CFDictionaryRef)spec, nullptr, nullptr,
-                                                &Impl::encoded, impl_.get(), &impl_->session),
-                     hevc ? "Create VideoToolbox HEVC encoder" : "Create VideoToolbox H.264 encoder");
-        check_status(VTSessionSetProperties(impl_->session, (__bridge CFDictionaryRef)properties),
-                     "Configure VideoToolbox encoder");
-        // Older encoders may omit this optional property. Closed GOPs make recovery independent.
-        VTSessionSetProperty(impl_->session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-        check_status(VTCompressionSessionPrepareToEncodeFrames(impl_->session), "Prepare VideoToolbox encoder");
-        CFTypeRef acceleration = nullptr;
-        OSStatus status = VTSessionCopyProperty(impl_->session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-                                                kCFAllocatorDefault, &acceleration);
-        impl_->hardware = status == noErr && acceleration && CFEqual(acceleration, kCFBooleanTrue);
-        if (acceleration) CFRelease(acceleration);
-        if (hardware && !impl_->hardware)
-            throw std::runtime_error("VideoToolbox did not report a hardware encoder for the requested format");
-    };
+    NSDictionary* spec = use_hardware ?
+        @{(__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES} :
+        @{(__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO};
+    check_status(VTCompressionSessionCreate(kCFAllocatorDefault, width, height,
+                                            hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+                                            (__bridge CFDictionaryRef)spec, nullptr, nullptr,
+                                            &Impl::encoded, this, &session),
+                 hevc ? "Create VideoToolbox HEVC encoder" : "Create VideoToolbox H.264 encoder");
+    check_status(VTSessionSetProperties(session, (__bridge CFDictionaryRef)properties),
+                 "Configure VideoToolbox encoder");
+    // Older encoders may omit this optional property. Closed GOPs make recovery independent.
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
+    check_status(VTCompressionSessionPrepareToEncodeFrames(session), "Prepare VideoToolbox encoder");
+    CFTypeRef acceleration = nullptr;
+    OSStatus status = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                                            kCFAllocatorDefault, &acceleration);
+    hardware = status == noErr && acceleration && CFEqual(acceleration, kCFBooleanTrue);
+    if (acceleration) CFRelease(acceleration);
+    if (use_hardware && !hardware)
+        throw std::runtime_error("VideoToolbox did not report a hardware encoder for the requested format");
+    if (!use_hardware && hardware)
+        throw std::runtime_error("VideoToolbox selected a hardware encoder for a software-only session");
+    need_sync = true;
+}
+
+void Encoder::Impl::fall_back(const std::runtime_error& cause) {
+    if (require_hardware)
+        throw std::runtime_error(std::string("Hardware encoding required: ") + cause.what());
+    std::cerr << "Warning: " << codec_name(codec) << " hardware encoding failed (" << cause.what()
+              << "). Switching to software encoding.\n";
+    close();
+    {
+        std::lock_guard<std::mutex> lock(result_mutex);
+        result = {};
+        callback_error = nullptr;
+    }
     try {
-        open(true);
-    } catch (const std::runtime_error& hw_error) {
-        if (require_hardware)
-            throw std::runtime_error(std::string("Hardware encoding required: ") + hw_error.what());
-        impl_->close();
-        try {
-            open(false);
-        } catch (const std::runtime_error& sw_error) {
-            throw std::runtime_error(std::string("Hardware encoding: ") + hw_error.what() +
-                                     ". Software encoding: " + sw_error.what());
-        }
+        open(false);
+    } catch (const std::runtime_error& software_error) {
+        throw std::runtime_error(std::string("Hardware encoding: ") + cause.what() +
+                                 ". Software encoding: " + software_error.what());
+    }
+}
+
+Encoder::Impl::Frame Encoder::Impl::submit(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe) {
+    NSDictionary* properties = (need_sync || force_keyframe) ?
+        @{(__bridge NSString*)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
+    check_status(VTCompressionSessionEncodeFrame(session, pixels, pts, duration,
+                                                 (__bridge CFDictionaryRef)properties, nullptr, nullptr),
+                 "Submit VideoToolbox frame");
+    // A static desktop might never produce another frame to flush this one.
+    check_status(VTCompressionSessionCompleteFrames(session, pts), "Complete VideoToolbox frame");
+    std::lock_guard<std::mutex> lock(result_mutex);
+    if (callback_error) std::rethrow_exception(callback_error);
+    auto frame = std::exchange(result, Frame{});
+    if (!frame.bytes.empty()) {
+        if (need_sync && !frame.keyframe)
+            throw std::runtime_error("New VideoToolbox session did not produce a random access picture");
+        need_sync = false;
+    }
+    return frame;
+}
+
+Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate,
+                 std::function<void(std::vector<uint8_t>)> output, Codec codec, bool require_hardware)
+    : Encoder(width, height, fps, bitrate, [cb = std::move(output)](std::vector<uint8_t> data, bool) {
+          cb(std::move(data));
+      }, codec, require_hardware) {}
+
+Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, Output output,
+                 Codec codec, bool require_hardware)
+    : impl_(std::make_unique<Impl>(std::move(output), width, height, fps, bitrate, codec, require_hardware)) {
+    if (codec == Codec::av1) {
+        if (require_hardware) throw std::invalid_argument("AV1 encoding uses software libaom");
+        std::cerr << "Warning: AV1 hardware encoding is unavailable in this build. Using software libaom.\n";
+        impl_->av1 = std::make_unique<Av1Encoder>(width, height, fps, bitrate);
+        return;
+    }
+    if (codec != Codec::h264 && codec != Codec::h265)
+        throw std::invalid_argument("Unsupported video codec");
+    try {
+        impl_->open(true);
+    } catch (const std::runtime_error& error) {
+        impl_->fall_back(error);
     }
 }
 
 Encoder::~Encoder() = default;
 
 void Encoder::encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe) {
-    check_error();
     if (!pixels || !CMTIME_IS_NUMERIC(pts))
         throw std::runtime_error("Screen capture returned an invalid frame or timestamp");
     if (impl_->av1) {
@@ -236,30 +288,31 @@ void Encoder::encode(CVPixelBufferRef pixels, CMTime pts, bool force_keyframe) {
     if (CMTIME_IS_VALID(impl_->last_vt_pts) && CMTimeCompare(pts, impl_->last_vt_pts) <= 0)
         pts = CMTimeAdd(impl_->last_vt_pts, impl_->duration);
     impl_->last_vt_pts = pts;
-    NSDictionary* properties = force_keyframe ? @{(__bridge NSString*)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES} : nil;
-    check_status(VTCompressionSessionEncodeFrame(impl_->session, pixels, pts, impl_->duration,
-                                                 (__bridge CFDictionaryRef)properties, nullptr, nullptr),
-                 "Submit VideoToolbox frame");
-    // A static desktop might never produce another frame to flush this one.
-    check_status(VTCompressionSessionCompleteFrames(impl_->session, pts), "Complete VideoToolbox frame");
-    check_error();
+    Impl::Frame frame;
+    try {
+        frame = impl_->submit(pixels, pts, force_keyframe);
+    } catch (const std::runtime_error& error) {
+        if (!impl_->hardware) throw;
+        impl_->fall_back(error);
+        frame = impl_->submit(pixels, pts, true);
+    }
+    if (!frame.bytes.empty()) impl_->output(std::move(frame.bytes), frame.keyframe);
 }
 
 bool Encoder::hardware_accelerated() const { return impl_->hardware; }
 
 void Encoder::set_bitrate(uint32_t bps) {
-    check_error();
     if (!bps) throw std::invalid_argument("Encoder bitrate must be positive");
     if (impl_->av1) return impl_->av1->set_bitrate(bps);
     if (!impl_->session) throw std::logic_error("The compression session is closed");
-    check_status(VTSessionSetProperty(impl_->session, kVTCompressionPropertyKey_AverageBitRate,
-                                      (__bridge CFNumberRef)@(bps)), "Update VideoToolbox bitrate");
-}
-
-void Encoder::check_error() const {
-    std::lock_guard<std::mutex> lock(impl_->error_mutex);
-    if (impl_->error)
-        std::rethrow_exception(impl_->error);
+    impl_->bitrate = bps;
+    try {
+        check_status(VTSessionSetProperty(impl_->session, kVTCompressionPropertyKey_AverageBitRate,
+                                          (__bridge CFNumberRef)@(bps)), "Update VideoToolbox bitrate");
+    } catch (const std::runtime_error& error) {
+        if (!impl_->hardware) throw;
+        impl_->fall_back(error);
+    }
 }
 
 void Encoder::finish() {
@@ -268,7 +321,6 @@ void Encoder::finish() {
         impl_->av1.reset();
         return;
     }
-    OSStatus status = impl_->close();
-    check_error();
-    check_status(status, "Finish VideoToolbox encoder");
+    // submit() completed and delivered each input sample before returning.
+    impl_->close();
 }

@@ -111,6 +111,50 @@ void timed_stream(udp::Listener& listener) {
     listener.disconnect();
     sending.get();
 }
+
+void display_negotiation(udp::Listener& listener, bool automatic) {
+    const auto port = listener.local_port();
+    auto receiver = std::async(std::launch::async, [&] {
+        require(listener.accept(6000), "Display negotiation peer did not connect");
+        bool queried = false;
+        const auto header = listener.receive_header([&] {
+            queried = true;
+            return wire::DisplaySize{3840, 2160};
+        });
+        listener.disconnect();
+        require(queried == automatic, "Unexpected UDP display query");
+        require(header.width == 1920 && header.height == 1080 && header.fps == 60,
+                "Lost UDP stream header after display query");
+    });
+    udp::Sender sender("127.0.0.1", port);
+    if (automatic) {
+        const auto size = sender.request_display_size();
+        require(size.width == 3840 && size.height == 2160, "Incorrect UDP monitor size");
+        require(!sender.take_feedback(), "Resolution reply leaked into frame feedback");
+    }
+    sender.send(wire::encode_header({1920, 1080, 60}));
+    receiver.get();
+}
+
+void unavailable_display(udp::Listener& listener) {
+    const auto port = listener.local_port();
+    auto legacy = std::async(std::launch::async, [&] {
+        require(listener.accept(6000), "Legacy UDP peer did not connect");
+        std::vector<std::uint8_t> first;
+        require(listener.receive(first, 5000) == udp::ReadResult::message && first == wire::display_query,
+                "Missing display query on legacy connection");
+        listener.disconnect(); // Old receivers reject the unfamiliar header.
+    });
+    udp::Sender sender("127.0.0.1", port);
+    bool manual_hint = false;
+    try {
+        sender.request_display_size();
+    } catch (const std::runtime_error& e) {
+        manual_hint = std::string(e.what()).find("--size") != std::string::npos;
+    }
+    legacy.get();
+    require(manual_hint, "No manual size hint when a legacy UDP peer rejected the query");
+}
 } // namespace
 
 int main() {
@@ -121,6 +165,9 @@ int main() {
         exercise(listener, false);
         exercise(listener, true); // Same listener, new peer. Drain queued frames on shutdown.
         timed_stream(listener);
+        display_negotiation(listener, true);
+        display_negotiation(listener, false);
+        unavailable_display(listener);
         std::cout << "UDP ordering, fragmentation, disconnect and reconnect passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

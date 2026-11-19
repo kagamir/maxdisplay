@@ -1,9 +1,9 @@
 #include "app.hpp"
 #include "display_scale.hpp"
 #include "third_party_notices.hpp"
-#include "wire.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <locale>
@@ -19,12 +19,13 @@ void print_help() {
                  "macOS:   maxdisplay send WINDOWS_HOST [--port PORT] [--size WIDTHxHEIGHT]\n"
                  "                                      [--scale FACTOR] [--fps FPS] [--bitrate-mbps MBPS]\n"
                  "                                      [--codec h264|h265|av1] [--transport tcp|udp]\n"
-                 "                                      [--frame-timeout-ms MS] [--fixed-bitrate]\n"
+                 "                                      [--frame-timeout-ms MS] [--fixed-bitrate] [--fixed-fps]\n"
                  "                                      [--require-hardware] [--legacy]\n\n"
-                 "Start Windows first. Defaults: H.264 over TCP 49300, 1920x1080, scale 1, 60 fps, 12 Mbps.\n"
-                 "The pixel resolution is --size times --scale. Scale 2 requests macOS HiDPI.\n"
-                 "H.264/H.265 prefer hardware. AV1 uses the bundled software codec.\n"
-                 "Adaptive bitrate uses --bitrate-mbps as its ceiling; --fixed-bitrate disables adaptation.\n"
+                 "Start Windows first. Defaults: H.264 over TCP 49300, scale 1, up to 60 fps and 12 Mbps.\n"
+                 "--size sets the Mac virtual desktop. The stream size is --size times --scale.\n"
+                 "Omit --size to use the Windows monitor's pixel dimensions divided by --scale for the desktop.\n"
+                 "H.264/H.265 prefer hardware and warn on software fallback. --require-hardware disables fallback.\n"
+                 "--fps and --bitrate-mbps are adaptive ceilings. Each can be fixed independently.\n"
                  "The default frame deadline is 200 ms. Use --legacy for older H.264/AV1 receivers.\n"
                  "Windows: F11 toggles full screen, Esc exits. Mac: Ctrl+C stops sharing.\n"
                  "Use --licenses to view bundled third-party notices.\n";
@@ -90,9 +91,6 @@ int run_cli(int argc, char** argv) {
     }
     SenderOptions options;
     options.host = argv[2];
-    auto base_width = options.width;
-    auto base_height = options.height;
-    auto scale = options.scale;
     bool explicit_timeout = false;
     for (int i = 3; i < argc; ++i) {
         const std::string_view key = argv[i];
@@ -100,10 +98,10 @@ int run_cli(int argc, char** argv) {
             const auto value = option_value(i, argc, argv);
             auto separator = value.find('x');
             if (separator == value.npos) throw std::invalid_argument("Use --size WIDTHxHEIGHT");
-            base_width = number(value.substr(0, separator), 1, std::numeric_limits<std::uint32_t>::max(), key);
-            base_height = number(value.substr(separator + 1), 1, std::numeric_limits<std::uint32_t>::max(), key);
+            options.width = number(value.substr(0, separator), 1, std::numeric_limits<std::uint32_t>::max(), key);
+            options.height = number(value.substr(separator + 1), 1, std::numeric_limits<std::uint32_t>::max(), key);
         } else if (key == "--scale") {
-            scale = parse_scale(option_value(i, argc, argv));
+            options.scale = parse_scale(option_value(i, argc, argv));
         } else if (key == "--codec") {
             options.codec = parse_codec(option_value(i, argc, argv));
         } else if (key == "--transport") {
@@ -117,6 +115,8 @@ int run_cli(int argc, char** argv) {
             explicit_timeout = true;
         } else if (key == "--fixed-bitrate") {
             options.adaptive = false;
+        } else if (key == "--fixed-fps") {
+            options.adaptive_fps = false;
         } else if (key == "--require-hardware") {
             options.require_hardware = true;
         } else if (key == "--legacy") {
@@ -133,13 +133,13 @@ int run_cli(int argc, char** argv) {
         if (options.codec == Codec::h265 || explicit_timeout)
             throw std::invalid_argument("--legacy supports H.264 or AV1 and the old protocol has no frame deadline");
         options.adaptive = false;
+        options.adaptive_fps = false;
+        if (!options.width) {
+            options.width = 1920;
+            options.height = 1080;
+        }
     }
-    set_display_size(options, base_width, base_height, scale);
-    if (!wire::valid_mode(options.width, options.height, options.fps, options.codec)) {
-        throw std::invalid_argument("Unsupported " + std::string(codec_name(options.codec)) +
-            " mode after scaling: " + std::to_string(options.width) + "x" + std::to_string(options.height) +
-            " at " + std::to_string(options.fps) + " fps");
-    }
+    if (options.width) resolve_display_geometry(options);
     return run_sender(options);
 #elif defined(_WIN32)
     ReceiverOptions options;

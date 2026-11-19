@@ -71,6 +71,48 @@ void check_layout() {
             bytes == Bytes{0, 0, 0, 4, 0, 0, 1, 0xff}, "Invalid wire frame");
 }
 
+void display_negotiation() {
+    Connection connection;
+    unsigned queries = 0;
+    auto receiver = std::async(std::launch::async, [&] {
+        return wire::receive_header(connection.reader, [&] {
+            ++queries;
+            return wire::DisplaySize{5120, 2880};
+        });
+    });
+    const auto size = wire::request_display_size(connection.writer);
+    wire::send_header(connection.writer, 2560, 1440, 60, Codec::h265, 200);
+    const auto header = receiver.get();
+    require(queries == 1 && size.width == 5120 && size.height == 2880, "TCP returned wrong monitor size");
+    require(header.width == 2560 && header.codec == Codec::h265, "TCP display negotiation lost stream header");
+
+    Connection direct;
+    wire::send_header(direct.writer, 640, 480, 30);
+    const auto legacy = wire::receive_header(direct.reader, [&]() -> wire::DisplaySize {
+        throw std::runtime_error("Unsolicited resolution exchange");
+    });
+    require(legacy.width == 640 && !net::wait_readable(direct.writer, 0),
+            "Unsolicited data sent to legacy TCP sender");
+
+    auto malformed = wire::encode_display_reply({1920, 1080});
+    malformed[7] = 2;
+    expect_failure([&] { wire::decode_display_reply(malformed); }, "Unknown resolution reply version accepted");
+    expect_failure([] { wire::encode_display_reply({0, 1080}); }, "Zero width accepted");
+    expect_failure([] { wire::decode_display_reply({'M','X','D','R'}); }, "Truncated resolution accepted");
+
+    // A silent or stalled legacy peer must not leave the Mac waiting indefinitely.
+    Connection stalled;
+    const auto reply = wire::encode_display_reply({1920, 1080});
+    stalled.reader.write_all(reply.data(), 3);
+    try {
+        wire::request_display_size(stalled.writer, 40);
+    } catch (const std::runtime_error& error) {
+        require(std::string(error.what()).find("--size") != std::string::npos, "No manual size hint");
+        return;
+    }
+    throw std::runtime_error("Partial TCP display reply did not time out");
+}
+
 void codec_headers() {
     require(wire::encode_header({1920, 1080, 60}) == hello, "Legacy H.264 header changed");
     Connection connection;
@@ -234,6 +276,7 @@ int main() {
     try {
         round_trip();
         check_layout();
+        display_negotiation();
         codec_headers();
         timed_frames_and_feedback();
         partial_frame_polling();

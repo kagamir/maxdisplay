@@ -50,12 +50,19 @@ public:
                 // New clock origin. Reference pictures may also have been lost.
                 recover();
                 delay_us_ = 0;
+                cadence_us_ = 0;
                 tracking_late_ = false;
             } else {
                 // Difference of elapsed times removes the arbitrary epochs on
                 // the two hosts. Clamping at zero tracks the best transit seen.
                 const auto received = arrival_us - arrival_us_;
                 const auto sent = timestamp_us - timestamp_us_;
+                if (advance == 1) {
+                    // Follow a lower send rate immediately. A long static pause
+                    // and the next recovery key are not a new stream cadence.
+                    if (sent > 1'000'000) cadence_us_ = 0;
+                    else cadence_us_ = std::max(sent, (3 * cadence_us_ + sent) / 4);
+                }
                 if (received > sent) delay_us_ += received - sent;
                 else delay_us_ -= std::min(delay_us_, sent - received);
             }
@@ -89,10 +96,16 @@ public:
     bool waiting_for_keyframe() const { return waiting_; }
     std::uint32_t sequence() const { return sequence_; }
     std::uint64_t remaining_us() const { return budget_us_ - std::min(budget_us_, delay_us_); }
+    std::uint64_t idle_drain_us(std::uint32_t max_fps, std::uint64_t remaining) const {
+        const auto period = std::max<std::uint64_t>(1'000'000 / max_fps, cadence_us_);
+        const auto readback_margin = std::min<std::uint64_t>(20'000, remaining / 2);
+        return std::min(2 * period, remaining - readback_margin);
+    }
 
 private:
     std::uint64_t budget_us_;
     std::uint64_t arrival_us_ = 0, timestamp_us_ = 0, delay_us_ = 0, late_since_ = 0;
+    std::uint64_t cadence_us_ = 0;
     std::uint32_t sequence_ = 0;
     bool started_ = false, waiting_ = true, tracking_late_ = false;
 };

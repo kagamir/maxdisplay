@@ -123,15 +123,25 @@ bool sees_pattern(HWND window, bool final) {
 
 class TestSender {
 public:
-    TestSender(const ReceiverOptions& options, Codec codec, uint32_t timeout_ms)
+    TestSender(const ReceiverOptions& options, Codec codec, uint32_t timeout_ms, HWND query_window = nullptr)
         : timed_(timeout_ms != 0) {
-        if (options.transport == Transport::udp) {
-            udp_.emplace(options.bind, options.port);
-            udp_->send(wire::encode_header({width, height, fps, codec, timeout_ms}));
-        } else {
-            tcp_ = net::connect_tcp(options.bind, options.port);
-            wire::send_header(tcp_, width, height, fps, codec, timeout_ms);
+        if (options.transport == Transport::udp) udp_.emplace(options.bind, options.port);
+        else tcp_ = net::connect_tcp(options.bind, options.port);
+        if (query_window) {
+            const auto size = udp_ ? udp_->request_display_size() : wire::request_display_size(tcp_);
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            if (!GetMonitorInfoW(MonitorFromWindow(query_window, MONITOR_DEFAULTTONEAREST), &info))
+                throw std::runtime_error("Could not inspect receiver window's monitor");
+            // This test process is per-monitor DPI aware, so monitor coordinates are physical pixels.
+            if (size.width != static_cast<unsigned>(info.rcMonitor.right - info.rcMonitor.left) ||
+                size.height != static_cast<unsigned>(info.rcMonitor.bottom - info.rcMonitor.top))
+                throw std::runtime_error("Receiver reported a display size other than the window's monitor");
         }
+        if (udp_)
+            udp_->send(wire::encode_header({width, height, fps, codec, timeout_ms}));
+        else
+            wire::send_header(tcp_, width, height, fps, codec, timeout_ms);
     }
 
     static uint64_t now_us() {
@@ -206,7 +216,7 @@ void check(const Frames& frames, Codec codec, Transport transport) {
         if (!window) throw std::runtime_error("No receiver window appeared");
         constexpr uint32_t timeout_ms = 1000;
         for (bool late : {false, true}) {
-            client.emplace(options, codec, timeout_ms);
+            client.emplace(options, codec, timeout_ms, late ? nullptr : window);
             if (late) {
                 // A static desktop may produce just one picture. It must paint while the session stays open.
                 client->send(frames, 0, 1);

@@ -11,14 +11,17 @@
 class StreamControl {
 public:
     StreamControl(std::uint32_t ceiling, std::uint32_t fps, std::uint32_t timeout_ms,
-                  bool adaptive, bool feedback)
+                  bool adaptive_bitrate, bool adaptive_fps, bool feedback)
         : ceiling_(ceiling), floor_(std::min(ceiling, std::max(250'000u, ceiling / 8))),
-          bitrate_(ceiling), budget_(std::uint64_t(timeout_ms) * 1000),
+          bitrate_(ceiling), max_fps_(fps), min_fps_(std::min(10u, (fps + 3) / 4)), fps_(fps),
+          budget_(std::uint64_t(timeout_ms) * 1000),
           flight_limit_(std::clamp((std::uint64_t(fps) * timeout_ms + 999) / 1000 + 2,
                                    std::uint64_t(4), std::uint64_t(128))),
-          adaptive_(adaptive && feedback), feedback_(feedback) {}
+          adaptive_bitrate_(adaptive_bitrate && feedback), adaptive_fps_(adaptive_fps && feedback),
+          feedback_(feedback) {}
 
     std::uint32_t bitrate() const { return bitrate_; }
+    std::uint32_t fps() const { return fps_; }
     bool needs_key() const { return needs_key_; }
     std::uint64_t deadline(std::uint64_t capture) const { return capture + budget_; }
     bool expired(std::uint64_t now, std::uint64_t capture) const { return now >= deadline(capture); }
@@ -38,11 +41,44 @@ public:
         needs_key_ = true;
     }
 
-    // Retry actual sync frames at a bounded frequency, independent of capture FPS.
-    bool take_key_request(std::uint64_t now) {
-        if (!needs_key_ || (last_request_ && now - *last_request_ < 100'000)) return false;
-        last_request_ = now;
-        return true;
+    // A later capture replaces an earlier unencoded change. A timer may consume
+    // the final change once its slot opens, even when the desktop stops moving.
+    enum class Capture { skip, encode, force_key };
+    Capture next_capture(std::uint64_t now, bool changed) {
+        pending_change_ |= changed;
+        if (needs_key_) {
+            if (last_request_ && now - *last_request_ < 100'000) return Capture::skip;
+            last_request_ = now;
+            last_slot_ = now;
+            pending_change_ = false;
+            return Capture::force_key;
+        }
+        if (!pending_change_) return Capture::skip;
+        const auto interval = 1'000'000u / fps_;
+        if (fps_ < max_fps_ && last_slot_) {
+            if (now - *last_slot_ < interval) return Capture::skip;
+            // Preserve fractional cadence (e.g. 60 captures into 45 slots)
+            // without issuing a burst to catch up after a pause.
+            *last_slot_ = now - *last_slot_ >= 2 * interval ? now : *last_slot_ + interval;
+        } else {
+            // ScreenCaptureKit already enforces the configured upper limit.
+            last_slot_ = now;
+        }
+        pending_change_ = false;
+        return Capture::encode;
+    }
+
+    // A large independent frame is not representative of sustained encode cost.
+    void observe_encode_time(std::uint64_t us, bool keyframe) {
+        if (!adaptive_fps_ || keyframe) return;
+        encode_us_ = encode_us_ ? (7 * encode_us_ + us) / 8 : us;
+        if (encode_us_ <= 1'000'000u / fps_) {
+            slow_encodes_ = 0;
+        } else if (++slow_encodes_ >= 3) {
+            fps_ = std::min(fps_, encoder_fps_limit());
+            healthy_since_.reset();
+            slow_encodes_ = 0;
+        }
     }
 
     bool accept_encoded(std::uint32_t sequence, bool keyframe) {
@@ -91,9 +127,13 @@ public:
 
 private:
     struct Sample { std::uint32_t sequence; std::uint64_t sent; std::size_t bytes; };
-    std::uint32_t ceiling_, floor_, bitrate_;
+    std::uint32_t ceiling_, floor_, bitrate_, max_fps_, min_fps_, fps_;
     std::uint64_t budget_, flight_limit_;
-    bool adaptive_, feedback_, needs_key_ = true;
+    bool adaptive_bitrate_, adaptive_fps_, feedback_, needs_key_ = true;
+    bool pending_change_ = false;
+    std::optional<std::uint64_t> last_slot_;
+    std::uint64_t encode_us_ = 0;
+    unsigned slow_encodes_ = 0;
     std::deque<Sample> flight_;
     std::optional<std::uint32_t> latest_key_;
     std::optional<std::uint64_t> last_request_, last_cut_, healthy_since_;
@@ -102,6 +142,12 @@ private:
     std::optional<std::uint64_t> delivery_start_;
     std::uint64_t delivered_ = 0;
     std::optional<std::uint32_t> delivery_bps_;
+
+    std::uint32_t encoder_fps_limit() const {
+        if (!encode_us_) return max_fps_;
+        // Leave ten percent of each frame interval for capture and queueing.
+        return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(900'000 / encode_us_, min_fps_, max_fps_));
+    }
 
     // Keep a rolling minimum across two windows so a lasting change of route
     // below the frame budget eventually establishes a new latency baseline.
@@ -140,7 +186,10 @@ private:
 
     void congestion(std::uint64_t now) {
         healthy_since_.reset();
-        if (!adaptive_ || (last_cut_ && now - *last_cut_ < 400'000)) return;
+        if (last_cut_ && now - *last_cut_ < 400'000) return;
+        last_cut_ = now;
+        if (adaptive_fps_) fps_ = std::max(min_fps_, fps_ * 3 / 4);
+        if (!adaptive_bitrate_) return;
         // Only consult delivered throughput during congestion. Quiet desktop
         // imagery can encode far below the configured rate on a healthy link.
         auto target = std::uint64_t(bitrate_) * 3 / 4;
@@ -148,15 +197,18 @@ private:
             target = std::min(target, std::max(std::uint64_t(bitrate_) / 2,
                                                std::uint64_t(*delivery_bps_) * 9 / 10));
         bitrate_ = std::max(floor_, static_cast<std::uint32_t>(target));
-        last_cut_ = now;
     }
 
     void recover_rate(std::uint64_t now) {
-        if (!adaptive_ || bitrate_ == ceiling_) return;
+        if ((!adaptive_bitrate_ || bitrate_ == ceiling_) && (!adaptive_fps_ || fps_ == max_fps_)) return;
         if (!healthy_since_) healthy_since_ = now;
         if (now - *healthy_since_ < 1'500'000) return;
-        const auto increase = std::max(50'000u, bitrate_ / 12);
-        bitrate_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(ceiling_, std::uint64_t(bitrate_) + increase));
+        if (adaptive_bitrate_) {
+            const auto increase = std::max(50'000u, bitrate_ / 12);
+            bitrate_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(ceiling_, std::uint64_t(bitrate_) + increase));
+        }
+        if (adaptive_fps_)
+            fps_ = std::max(fps_, std::min(encoder_fps_limit(), fps_ + std::max(1u, fps_ / 10)));
         healthy_since_ = now;
     }
 };

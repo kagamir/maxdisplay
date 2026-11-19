@@ -3,8 +3,10 @@
 
 #include <enet/enet.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -83,6 +85,9 @@ struct Sender::Impl {
     };
     std::deque<Message> queue;
     std::optional<std::vector<std::uint8_t>> feedback;
+    std::condition_variable display_ready;
+    bool awaiting_display = false;
+    std::optional<wire::DisplaySize> display;
     std::size_t outstanding_bytes = 0;
     std::size_t outstanding_messages = 0;
     bool key_in_flight = false;
@@ -182,12 +187,19 @@ struct Sender::Impl {
                 Packet packet(event.packet, enet_packet_destroy);
                 if (event.type == ENET_EVENT_TYPE_DISCONNECT) break;
                 if (event.type == ENET_EVENT_TYPE_RECEIVE) {
-                    if (!packet || packet->dataLength != wire::feedback_size)
-                        throw std::runtime_error("Invalid UDP feedback length");
+                    if (!packet || (packet->dataLength != wire::feedback_size &&
+                                    packet->dataLength != wire::display_reply_size))
+                        throw std::runtime_error("Invalid UDP receiver reply length");
                     std::vector<std::uint8_t> bytes(packet->data, packet->data + packet->dataLength);
-                    wire::unpack_feedback(bytes);
                     std::lock_guard lock(mutex);
-                    feedback = std::move(bytes);
+                    if (awaiting_display) {
+                        display = wire::decode_display_reply(bytes);
+                        awaiting_display = false;
+                        display_ready.notify_one();
+                    } else {
+                        wire::unpack_feedback(bytes);
+                        feedback = std::move(bytes);
+                    }
                 }
                 if (Clock::now() >= close_deadline) break;
             }
@@ -195,7 +207,11 @@ struct Sender::Impl {
             std::lock_guard lock(mutex);
             error = std::current_exception();
         }
-        closed = true;
+        {
+            std::lock_guard lock(mutex);
+            closed = true;
+        }
+        display_ready.notify_one();
         enet_peer_disconnect_now(peer, 0);
         host.reset(); // release packet callbacks while their counters and mutex exist
     }
@@ -203,6 +219,26 @@ struct Sender::Impl {
 
 Sender::Sender(const std::string& host, std::uint16_t port) : impl_(std::make_unique<Impl>(host, port)) {}
 Sender::~Sender() = default;
+wire::DisplaySize Sender::request_display_size(unsigned timeout_ms) {
+    try {
+        {
+            std::lock_guard lock(impl_->mutex);
+            if (impl_->awaiting_display || impl_->display)
+                throw std::logic_error("Display resolution was already requested");
+            impl_->awaiting_display = true;
+        }
+        send(wire::display_query);
+        std::unique_lock lock(impl_->mutex);
+        if (!impl_->display_ready.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                [&] { return impl_->display || impl_->closed || impl_->stopping; }))
+            throw std::runtime_error("Waiting for UDP reply timed out");
+        if (impl_->error) std::rethrow_exception(impl_->error);
+        if (!impl_->display) throw std::runtime_error("Receiver disconnected");
+        return *impl_->display;
+    } catch (const std::runtime_error& e) {
+        throw std::runtime_error(std::string(wire::display_query_hint) + e.what());
+    }
+}
 void Sender::send(const std::vector<std::uint8_t>& message) {
     impl_->enqueue(message, Delivery::reliable);
 }
@@ -224,6 +260,14 @@ struct Listener::Impl {
         initialize();
         const auto bind = address_for(name, port);
         host = make_host(&bind);
+    }
+    void reply(const std::vector<std::uint8_t>& message, enet_uint32 flags) {
+        if (!peer) throw std::logic_error("No active UDP session");
+        Packet packet(enet_packet_create(message.data(), message.size(), flags), enet_packet_destroy);
+        if (!packet || enet_peer_send(peer, 0, packet.get()) != 0)
+            throw std::runtime_error("Could not send UDP receiver reply");
+        packet.release();
+        enet_host_flush(host.get());
     }
 };
 
@@ -268,6 +312,26 @@ ReadResult Listener::receive(std::vector<std::uint8_t>& message, unsigned timeou
     }
 }
 
+wire::Header Listener::receive_header(const std::function<wire::DisplaySize()>& display_size,
+                                      const std::function<bool()>& stopping) {
+    const auto deadline = Clock::now() + wire::header_timeout;
+    std::vector<std::uint8_t> bytes;
+    bool answered = false;
+    while ((!stopping || !stopping()) && Clock::now() < deadline) {
+        const auto result = receive(bytes, std::min(100u, remaining(deadline)));
+        if (result == ReadResult::timeout) continue;
+        if (result == ReadResult::disconnected)
+            throw std::runtime_error("UDP peer disconnected before sending its stream header");
+        if (!answered && bytes == wire::display_query && display_size) {
+            impl_->reply(wire::encode_display_reply(display_size()), ENET_PACKET_FLAG_RELIABLE);
+            answered = true;
+        } else {
+            return wire::decode_header(bytes);
+        }
+    }
+    throw std::runtime_error("Waiting for UDP stream header timed out or was stopped");
+}
+
 void Listener::disconnect() noexcept {
     if (impl_->peer) {
         enet_peer_disconnect_now(impl_->peer, 0);
@@ -276,13 +340,8 @@ void Listener::disconnect() noexcept {
 }
 
 void Listener::send_feedback(const std::vector<std::uint8_t>& message) {
-    if (!impl_->peer) throw std::logic_error("No active UDP session");
     wire::unpack_feedback(message);
-    Packet packet(enet_packet_create(message.data(), message.size(), 0), enet_packet_destroy);
-    if (!packet || enet_peer_send(impl_->peer, 0, packet.get()) != 0)
-        throw std::runtime_error("Could not send UDP receiver feedback");
-    packet.release();
-    enet_host_flush(impl_->host.get());
+    impl_->reply(message, 0);
 }
 
 } // namespace udp

@@ -28,23 +28,29 @@ bool contains(const std::vector<CGDirectDisplayID>& displays, CGDirectDisplayID 
 
 // Run this query in a fresh process. WindowServer's creator-side mode cache
 // can return a null CGDisplayMode for an otherwise active virtual screen.
-int verify_mode(CGDirectDisplayID id, uint32_t width, uint32_t height) {
+int verify_mode(CGDirectDisplayID id, uint32_t width, uint32_t height, bool hi_dpi) {
     auto mode = CGDisplayCopyDisplayMode(id);
     if (!mode) throw std::runtime_error("Observer could not read the active display mode");
     const auto actual_width = CGDisplayModeGetPixelWidth(mode);
     const auto actual_height = CGDisplayModeGetPixelHeight(mode);
+    const auto logical_width = CGDisplayModeGetWidth(mode);
+    const auto logical_height = CGDisplayModeGetHeight(mode);
     std::cout << "Observed " << actual_width << 'x' << actual_height << " pixels, "
-              << CGDisplayModeGetWidth(mode) << 'x' << CGDisplayModeGetHeight(mode) << " points\n";
+              << logical_width << 'x' << logical_height << " points\n";
     CGDisplayModeRelease(mode);
-    if (actual_width != width || actual_height != height)
-        throw std::runtime_error("WindowServer selected the wrong physical resolution");
+    if (logical_width != width || logical_height != height)
+        throw std::runtime_error("WindowServer changed the requested Mac desktop resolution");
+    const bool standard = actual_width == width && actual_height == height;
+    const bool retina = actual_width == width * 2 && actual_height == height * 2;
+    if (!standard && !(hi_dpi && retina))
+        throw std::runtime_error("WindowServer selected an unexpected backing density");
     return 0;
 }
 
 void check_lifecycle(bool hi_dpi) {
     using namespace std::chrono_literals;
-    const uint32_t width = hi_dpi ? 2560 : 1280;
-    const uint32_t height = hi_dpi ? 1440 : 720;
+    const uint32_t width = 1280;
+    const uint32_t height = 720;
     const auto original = online_displays();
     CGDirectDisplayID id = kCGNullDirectDisplay;
     @autoreleasepool {
@@ -55,7 +61,8 @@ void check_lifecycle(bool hi_dpi) {
             throw std::runtime_error("MaxDisplay is not a newly registered independent display");
         NSTask *observer = [NSTask new];
         observer.executableURL = [NSURL fileURLWithPath:NSProcessInfo.processInfo.arguments.firstObject];
-        observer.arguments = @[@"--verify", @(id).stringValue, @(width).stringValue, @(height).stringValue];
+        observer.arguments = @[@"--verify", @(id).stringValue, @(width).stringValue, @(height).stringValue,
+                               @(hi_dpi ? 1 : 0).stringValue];
         NSError *error = nil;
         if (![observer launchAndReturnError:&error])
             throw std::runtime_error("Could not launch display observer: " + std::string(error.localizedDescription.UTF8String));
@@ -83,10 +90,10 @@ int main(int argc, char** argv) {
         }
         CFRelease(session);
         try {
-            if (argc == 5 && std::string(argv[1]) == "--verify")
+            if (argc == 6 && std::string(argv[1]) == "--verify")
                 return verify_mode(static_cast<CGDirectDisplayID>(std::stoul(argv[2])),
                                    static_cast<uint32_t>(std::stoul(argv[3])),
-                                   static_cast<uint32_t>(std::stoul(argv[4])));
+                                   static_cast<uint32_t>(std::stoul(argv[4])), std::string(argv[5]) == "1");
             check_lifecycle(false);
             check_lifecycle(true);
         }

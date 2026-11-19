@@ -53,7 +53,7 @@ Class private_class(NSString *name, std::initializer_list<SEL> required) {
     return cls;
 }
 
-MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps, bool hi_dpi) {
+MDDisplay *make_display(uint32_t logical_width, uint32_t logical_height, uint32_t fps, bool hi_dpi) {
     Class descriptor_class = private_class(@"CGVirtualDisplayDescriptor",
         {@selector(setQueue:), @selector(setName:), @selector(setMaxPixelsWide:),
          @selector(setMaxPixelsHigh:), @selector(setSizeInMillimeters:), @selector(setVendorID:),
@@ -70,6 +70,8 @@ MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps, bool hi_d
     descriptor.vendorID = 0xF0F0;
     // WindowServer restores a saved display mode by EDID identity. Keep the
     // identity stable for reconnects at the same geometry and density.
+    const auto width = logical_width * (hi_dpi ? 2u : 1u);
+    const auto height = logical_height * (hi_dpi ? 2u : 1u);
     descriptor.productID = hi_dpi ? 2 : 1;
     const auto serial = (width << 16) | height;
     descriptor.serialNum = serial;
@@ -85,10 +87,8 @@ MDDisplay *make_display(uint32_t width, uint32_t height, uint32_t fps, bool hi_d
 
     // For HiDPI the descriptor advertises the backing pixels, while the mode
     // advertises points. CoreGraphics renders each point at 2× on both axes.
-    const auto mode_width = hi_dpi ? width / 2 : width;
-    const auto mode_height = hi_dpi ? height / 2 : height;
-    MDDisplayMode *mode = [(MDDisplayMode *)[mode_class alloc] initWithWidth:mode_width
-                                                                      height:mode_height
+    MDDisplayMode *mode = [(MDDisplayMode *)[mode_class alloc] initWithWidth:logical_width
+                                                                      height:logical_height
                                                                  refreshRate:fps];
     if (!mode) return nil;
     MDDisplaySettings *settings = [settings_class new];
@@ -119,18 +119,24 @@ void pump_display_events() {
         std::this_thread::sleep_for(25ms);
 }
 
-bool matches_pixel_size(CGDirectDisplayID id, uint32_t width, uint32_t height) {
+bool matches_desktop(CGDirectDisplayID id, uint32_t width, uint32_t height, bool hi_dpi) {
     if (auto mode = CGDisplayCopyDisplayMode(id)) {
-        const bool matches = CGDisplayModeGetPixelWidth(mode) == width && CGDisplayModeGetPixelHeight(mode) == height;
+        const auto density = hi_dpi ? 2u : 1u;
+        const bool matches = CGDisplayModeGetWidth(mode) == width && CGDisplayModeGetHeight(mode) == height &&
+                             CGDisplayModeGetPixelWidth(mode) == width * density &&
+                             CGDisplayModeGetPixelHeight(mode) == height * density;
         CGDisplayModeRelease(mode);
         return matches;
     }
     // Some macOS versions do not expose the mode object to the process
-    // that created the display. Quartz still reports its drawable size.
-    return CGDisplayPixelsWide(id) == width && CGDisplayPixelsHigh(id) == height;
+    // that created the display. The bounds in global desktop coordinates
+    // still let us verify the logical resolution used by applications.
+    const CGSize logical = CGDisplayBounds(id).size;
+    return logical.width == width && logical.height == height;
 }
 
-bool wait_until_ready(CGDirectDisplayID id, uint32_t width, uint32_t height, std::chrono::seconds timeout) {
+bool wait_until_ready(CGDirectDisplayID id, uint32_t width, uint32_t height, bool hi_dpi,
+                      std::chrono::seconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     bool requested_extension = false;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -140,7 +146,7 @@ bool wait_until_ready(CGDirectDisplayID id, uint32_t width, uint32_t height, std
                     extend_display(id);
                     requested_extension = true;
                 }
-            } else if (CGDisplayIsActive(id) && matches_pixel_size(id, width, height)) {
+            } else if (CGDisplayIsActive(id) && matches_desktop(id, width, height, hi_dpi)) {
                 return true;
             }
         }
@@ -154,13 +160,13 @@ VirtualDisplay::VirtualDisplay(uint32_t width, uint32_t height, uint32_t fps, bo
     using namespace std::chrono_literals;
     if (hi_dpi) {
         @autoreleasepool { display_ = make_display(width, height, fps, true); }
-        if (display_ && wait_until_ready(id(), width, height, 3s)) return;
+        if (display_ && wait_until_ready(id(), width, height, true, 3s)) return;
         display_ = nil;
         std::cerr << "MaxDisplay: macOS did not activate the requested HiDPI mode. "
                   << "Using a " << width << 'x' << height << " standard-density display.\n";
     }
     @autoreleasepool { display_ = make_display(width, height, fps, false); }
-    if (!display_ || !wait_until_ready(id(), width, height, 8s))
+    if (!display_ || !wait_until_ready(id(), width, height, false, 8s))
         throw std::runtime_error("MaxDisplay did not become an independent " + std::to_string(width) +
                                  "x" + std::to_string(height) + " display. Check System Settings > Displays.");
 }
