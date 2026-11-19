@@ -143,6 +143,9 @@ Encoder::Encoder(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate
         (__bridge NSString*)kVTCompressionPropertyKey_RealTime: @YES,
         (__bridge NSString*)kVTCompressionPropertyKey_AllowFrameReordering: @NO,
         (__bridge NSString*)kVTCompressionPropertyKey_ProfileLevel: (__bridge NSString*)kVTProfileLevel_H264_Baseline_AutoLevel,
+        (__bridge NSString*)kVTCompressionPropertyKey_ColorPrimaries: (__bridge NSString*)kCVImageBufferColorPrimaries_ITU_R_709_2,
+        (__bridge NSString*)kVTCompressionPropertyKey_TransferFunction: (__bridge NSString*)kCVImageBufferTransferFunction_ITU_R_709_2,
+        (__bridge NSString*)kVTCompressionPropertyKey_YCbCrMatrix: (__bridge NSString*)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
         (__bridge NSString*)kVTCompressionPropertyKey_AverageBitRate: @(bitrate),
         (__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate: @(fps),
         (__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval: @(fps * 2)

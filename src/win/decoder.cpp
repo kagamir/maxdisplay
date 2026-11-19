@@ -69,10 +69,8 @@ struct YuvMatrix {
     int y_offset, y_scale, r_v, g_u, g_v, b_u;
 };
 
-YuvMatrix color_matrix(IMFMediaType* type, UINT32 height) {
-    const auto matrix = MFGetAttributeUINT32(type, MF_MT_YUV_MATRIX,
-                                             height >= 720 ? MFVideoTransferMatrix_BT709
-                                                           : MFVideoTransferMatrix_BT601);
+YuvMatrix color_matrix(IMFMediaType* type) {
+    const auto matrix = MFGetAttributeUINT32(type, MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
     const bool full = MFGetAttributeUINT32(type, MF_MT_VIDEO_NOMINAL_RANGE,
                                            MFNominalRange_16_235) == MFNominalRange_0_255;
     if (matrix == MFVideoTransferMatrix_BT601) {
@@ -116,6 +114,10 @@ struct Decoder::Impl {
         check(MFCreateMediaType(&input), "MFCreateMediaType");
         check(input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Set video type");
         check(input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264), "Set H.264 subtype");
+        // The sender uses video-range BT.709 even at SD resolutions. Supply the
+        // same metadata here for the initial negotiation before the first SPS.
+        check(input->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709), "Set input color matrix");
+        check(input->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235), "Set input color range");
         check(MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, width, height), "Set frame size");
         check(MFSetAttributeRatio(input.Get(), MF_MT_FRAME_RATE, fps, 1), "Set frame rate");
         check(MFSetAttributeRatio(input.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1), "Set pixel aspect");
@@ -187,7 +189,7 @@ struct Decoder::Impl {
             throw std::runtime_error("Short NV12 output buffer or invalid stride");
         }
 
-        const auto matrix = color_matrix(nv12.Get(), height);
+        const auto matrix = color_matrix(nv12.Get());
         VideoFrame frame{width, height, std::vector<uint8_t>(static_cast<size_t>(width) * height * 4)};
         const BYTE* uv_plane = lock.bytes + static_cast<size_t>(stride) * coded_height;
         for (UINT32 y = 0; y < height; ++y) {

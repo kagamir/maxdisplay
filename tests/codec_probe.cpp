@@ -7,7 +7,6 @@
 #include "win/decoder.hpp"
 #endif
 
-#include <algorithm>
 #include <type_traits>
 #include <memory>
 #include <string>
@@ -46,17 +45,28 @@ void probe(const char* path) {
     });
     for (unsigned i = 0; i < frame_count; ++i) {
         CVPixelBufferRef pixel = nullptr;
-        if (CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_32BGRA, nullptr, &pixel) != kCVReturnSuccess)
+        if (CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nullptr, &pixel) != kCVReturnSuccess)
             throw std::runtime_error("Could not allocate test pixels");
         std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)> guard(pixel, &CVPixelBufferRelease);
         if (CVPixelBufferLockBaseAddress(pixel, 0) != kCVReturnSuccess)
             throw std::runtime_error("Could not lock test pixels");
-        auto* base = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pixel));
+        // Generate video-range BT.709 NV12, matching the ScreenCaptureKit source.
+        CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                              kCVAttachmentMode_ShouldPropagate);
+        auto* luma = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 0));
+        auto* chroma = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(pixel, 1));
+        const auto luma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
+        const auto chroma_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
         for (unsigned y = 0; y < height; ++y) {
-            auto* row = base + y * CVPixelBufferGetBytesPerRow(pixel);
             for (unsigned x = 0; x < width; ++x) {
-                auto color = color_at(x, y, i);
-                std::copy(color.begin(), color.end(), row + 4 * x);
+                const auto color = color_at(x, y, i);
+                const double luminance = 0.2126 * color[2] + 0.7152 * color[1] + 0.0722 * color[0];
+                luma[y * luma_stride + x] = static_cast<uint8_t>(std::lround(16 + 219 * luminance / 255));
+                if (y % 2 == 0 && x % 2 == 0) {
+                    auto* uv = chroma + y / 2 * chroma_stride + x;
+                    uv[0] = static_cast<uint8_t>(std::lround(128 + (112.0 / 255) * (color[0] - luminance) / (1 - 0.0722)));
+                    uv[1] = static_cast<uint8_t>(std::lround(128 + (112.0 / 255) * (color[2] - luminance) / (1 - 0.2126)));
+                }
             }
         }
         CVPixelBufferUnlockBaseAddress(pixel, 0);
@@ -75,13 +85,16 @@ void probe(const char* path) {
     auto check = [&](VideoFrame&& frame) {
         if (frame.width != width || frame.height != height || frame.bgra.size() != width * height * 4)
             throw std::runtime_error("Unexpected decoded geometry");
-        for (unsigned y : {height / 4, height * 3 / 4}) {
-            for (unsigned x : {width / 4, width * 3 / 4}) {
+        for (unsigned y : {height / 4, height / 2 - 8, height / 2 + 8, height * 3 / 4}) {
+            for (unsigned x : {width / 4, width / 2 - 8, width / 2 + 8, width * 3 / 4}) {
                 const auto expected = color_at(x, y, decoded);
                 for (unsigned c = 0; c < 3; ++c) {
                     const auto actual = frame.bgra[(y * width + x) * 4 + c];
-                    if (std::abs(static_cast<int>(actual) - expected[c]) > 28)
-                        throw std::runtime_error("Wrong pixel color or frame order at frame " + std::to_string(decoded));
+                    if (std::abs(static_cast<int>(actual) - expected[c]) > 12)
+                        throw std::runtime_error("Wrong pixel at frame " + std::to_string(decoded) +
+                            " x=" + std::to_string(x) + " y=" + std::to_string(y) + " channel=" +
+                            std::to_string(c) + ", expected " + std::to_string(expected[c]) +
+                            ", got " + std::to_string(actual));
                 }
             }
         }
@@ -94,6 +107,8 @@ void probe(const char* path) {
         std::vector<uint8_t> access_unit(n);
         stream.read(reinterpret_cast<char*>(access_unit.data()), n);
         decoder.decode(access_unit, check);
+        std::cout << "After access unit " << i + 1 << ", displayed " << decoded << " frame(s)\n";
+        if (i == 2 && !decoded) throw std::runtime_error("Decoder did not present a live startup frame");
     }
     decoder.finish(check);
     if (decoded != frame_count) throw std::runtime_error("Did not decode all pattern frames");

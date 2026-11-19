@@ -61,5 +61,5 @@ cmake --build build --config Release --parallel
 - macOS 通过 CoreGraphics 的私有 `CGVirtualDisplay` 系列接口建立虚拟屏。这些接口可能随系统更新改变，程序会在启动时检查所需接口。ScreenCaptureKit 按新建显示器的 ID 捕获画面和指针，VideoToolbox 编码 H.264，关键帧携带 SPS/PPS。
 - 一条 TCP 连接传输一场会话。20 字节握手包含 `MXDS`、版本、宽、高和帧率，后四项各为大端 uint32。每个视频访问单元以大端 uint32 长度开头，随后为 Annex B 数据。接收端检查版本、尺寸、帧率和单帧长度。
 - Windows 使用 Media Foundation 的 H.264 解码器，将 NV12 转换为 BGRA 并按宽高比绘制。图像大小与接收屏不匹配时会留黑边。
-- 构建后执行 `ctest --test-dir build -C Release --output-on-failure` 可运行协议和命令行测试。Linux 可构建并验证公共传输层。要单独验证编解码互通，可在 Mac 的构建目录运行 `./codec_probe test-pattern.frames`，把生成的文件复制到 Windows，再运行 `.\codec_probe.exe test-pattern.frames`。测试会检查解码后的颜色、方向、尺寸和帧顺序。
+- 构建后执行 `ctest --test-dir build -C Release --output-on-failure` 可运行协议和命令行测试。macOS 上还会检查虚拟屏的注册、尺寸和释放，当前进程已获得屏幕录制权限时会实际采集并通过 TCP 读取一帧 H.264。Linux 可构建并验证公共传输层。要单独验证编解码互通，可在 Mac 的构建目录运行 `./codec_probe test-pattern.frames`，把生成的文件复制到 Windows，再运行 `.\codec_probe.exe test-pattern.frames`。测试会检查解码后的颜色、方向、尺寸和帧顺序。
 - 双机验收可将窗口拖到虚拟屏，移动指针，观察 Windows 桌面是否只显示扩展区域。停止发送后检查 Mac 的显示器列表，再发起一次连接确认可以重新使用。
