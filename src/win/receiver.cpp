@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "build_version.hpp"
 #include "decoder.hpp"
 #include "display_info.hpp"
 #include "cursor_overlay.hpp"
@@ -562,6 +563,10 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         SetTextColor(dc, RGB(224, 224, 224));
         const SIZE pixels = win_info::monitor_pixels(receiver.window);
         std::wstring details = status;
+        if (build_version::release_tag_wide[0]) {
+            details += L"\nMaxDisplay ";
+            details += build_version::release_tag_wide;
+        }
         if (pixels.cx > 0 && pixels.cy > 0)
             details += L"\nDisplay: " + std::to_wstring(pixels.cx) + L" × " + std::to_wstring(pixels.cy) + L" px";
         details += L"\n\nLocal IP addresses (";

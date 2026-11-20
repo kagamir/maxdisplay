@@ -35,30 +35,30 @@ Use the same MaxDisplay version on both computers. The Mac must be able to reach
 
 ### 1. Download
 
-Get both files from the [latest release](https://github.com/kagamir/maxdisplay/releases/latest), under **Assets**.
+Get both files from the same [GitHub release](https://github.com/kagamir/maxdisplay/releases/latest), under **Assets**. In the filenames below, `<tag>` is the release tag.
 
 | Platform | File |
 | --- | --- |
-| Windows x64 | `maxdisplay-windows-x64.exe` |
-| Mac with Apple Silicon | `maxdisplay-macos-arm64.tar.gz` |
+| Windows x64 | `maxdisplay-<tag>-windows-x64.exe` |
+| Mac with Apple Silicon | `maxdisplay-<tag>-macos-arm64.tar.gz` |
 
-On the Mac, unpack the archive to get the `maxdisplay` executable:
+On the Mac, double-click the archive to extract `maxdisplay-<tag>`. Rename the extracted file to `maxdisplay` for the Terminal commands below. You can check its tag after renaming it.
 
 ```bash
-tar -xzf maxdisplay-macos-arm64.tar.gz
+./maxdisplay --version
 ```
 
 ### 2. Start the receiver on Windows
 
-Double-click `maxdisplay-windows-x64.exe`, or run it from PowerShell:
+Double-click the downloaded `.exe` to start the receiver. To use the PowerShell commands in this guide, rename the file to `maxdisplay.exe` and run it from its folder.
 
 ```powershell
-.\maxdisplay-windows-x64.exe receive
+.\maxdisplay.exe receive
 ```
 
 If Windows Firewall asks about network access, allow inbound TCP and UDP on the receiver port on private networks.
 
-The waiting screen lists the addresses the receiver is listening on and the pixel resolution of the monitor it is on. Addresses on the adapter with the default route come first. The examples below use `192.168.1.50`.
+The waiting screen shows the release tag, the addresses the receiver is listening on and the pixel resolution of its monitor. Compare the tag with the Mac's `--version` output. Addresses on the adapter with the default route come first. The examples below use `192.168.1.50`.
 
 ### 3. Start the sender on the Mac
 
@@ -105,7 +105,7 @@ The receiver listens on all IPv4 interfaces and accepts one Mac at a time. While
 Both executables print their options with `--help`. This example moves the receiver to a specific address and port in a window, and sends a 2560×1440 desktop at up to 24 Mbps:
 
 ```powershell
-.\maxdisplay-windows-x64.exe receive --bind 192.168.1.50 --port 49301 --windowed
+.\maxdisplay.exe receive --bind 192.168.1.50 --port 49301 --windowed
 ```
 
 ```bash
@@ -162,7 +162,7 @@ UDP splits each picture into fragments. Missing keyframe fragments are retransmi
 Select `--transport udp` on the Mac. The same Windows receiver accepts TCP or UDP video on its configured port, one stream at a time. For example, this sends a 2560×1440 H.265 stream at up to 60 fps over Wi-Fi:
 
 ```powershell
-.\maxdisplay-windows-x64.exe receive
+.\maxdisplay.exe receive
 ```
 
 ```bash
@@ -188,7 +188,7 @@ Pointer shapes are rasterized at the stream scale, up to 256×256 pixels. When m
 Start the Windows receiver and the Mac sender with the same nonempty password. Replace the example value with a long, randomly generated password. These commands use TCP. Add `--transport udp` on the Mac for UDP video.
 
 ```powershell
-.\maxdisplay-windows-x64.exe receive --password 'your-shared-password'
+.\maxdisplay.exe receive --password 'your-shared-password'
 ```
 
 ```bash
@@ -272,6 +272,7 @@ Add `--stats` on either side to print per-second statistics on that device. Use 
 | --- | --- |
 | `--password VALUE` | Enable AES-128-GCM with a shared password. Omit on both peers for plaintext |
 | `--help`, `-h` | Show usage |
+| `--version` | Print `MaxDisplay <tag>` for a tagged build or `MaxDisplay dev` for an untagged build, then exit |
 | `--licenses` | Print the notices for bundled third-party software |
 
 ## Troubleshooting
@@ -334,6 +335,10 @@ To check a real pair of machines by hand:
 
 Pushing a Git tag makes CI build both platforms, run the cross-platform interoperability tests and, once they pass, publish the binaries to the GitHub Release of the same name.
 
+Filenames preserve letters A–Z and a–z, digits, periods, underscores and hyphens. Each other UTF-8 byte is written as an underscore and two hex digits. For example, the tag `release/v1.2.3` appears as `release_2Fv1.2.3` in filenames and as `release/v1.2.3` in `--version` and on the Windows waiting screen.
+
+To embed a tag in a local build, pass `-DMAXDISPLAY_RELEASE_TAG=<tag>` when configuring CMake. For example, `-DMAXDISPLAY_RELEASE_TAG=v1.2.3-rc.1` makes `--version` print `MaxDisplay v1.2.3-rc.1`.
+
 ## How it works
 
 ```mermaid
@@ -375,4 +380,4 @@ MaxDisplay links these libraries statically. Run `maxdisplay --licenses` for the
 | [libaom](https://aomedia.googlesource.com/aom/) | AV1 encoding and decoding | BSD 2-Clause, with the AOM Patent License 1.0 |
 | [libde265](https://github.com/strukturag/libde265) | HEVC software decoding on Windows | LGPL-3.0-or-later |
 
-To replace the bundled HEVC decoder library and relink the Windows program, download `maxdisplay-windows-relink.zip` from the same release.
+To replace the bundled HEVC decoder library and relink the Windows program, download `maxdisplay-<tag>-windows-relink.zip` from the same release.

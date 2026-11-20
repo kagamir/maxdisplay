@@ -1,4 +1,5 @@
 #include "app.hpp"
+#include "build_version.hpp"
 #include "display_scale.hpp"
 #include "third_party_notices.hpp"
 
@@ -32,6 +33,7 @@ void print_help() {
                  "The Mac sends its pointer over UDP to the same receiver port. Use --video-cursor to capture it in video.\n"
                  "The default frame deadline is 200 ms.\n"
                  "Windows: F11 toggles full screen, Esc exits. Mac: Ctrl+C stops sharing.\n"
+                 "Use --version to print the build version.\n"
                  "Use --licenses to view bundled third-party notices.\n";
 }
 
@@ -95,6 +97,10 @@ int run_cli(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--licenses") {
             for (const auto& notice : third_party_notices) std::cout << notice;
             std::cout << '\n';
+            return 0;
+        }
+        if (std::string_view(argv[i]) == "--version") {
+            std::cout << "MaxDisplay " << (build_version::release_tag[0] ? build_version::release_tag : "dev") << '\n';
             return 0;
         }
         if (std::string_view(argv[i]) == "--help" || std::string_view(argv[i]) == "-h") {

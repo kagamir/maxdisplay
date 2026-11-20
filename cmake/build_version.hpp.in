@@ -1,0 +1,6 @@
+#pragma once
+
+namespace build_version {
+inline constexpr char release_tag[] = "@MAXDISPLAY_RELEASE_TAG@";
+inline constexpr wchar_t release_tag_wide[] = L"@MAXDISPLAY_RELEASE_TAG@";
+} // namespace build_version

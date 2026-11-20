@@ -16,6 +16,8 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
+    env:
+      MAXDISPLAY_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,11 +25,9 @@ jobs:
           - name: macOS arm64
             runner: macos-15
             artifact: maxdisplay-macos-arm64
-            path: maxdisplay-macos-arm64.tar.gz
           - name: Windows x64
             runner: windows-2022
             artifact: maxdisplay-windows-x64
-            path: build/Release/maxdisplay.exe
 
     steps:
       - uses: actions/checkout@v7
@@ -36,7 +36,7 @@ jobs:
 
       - name: Configure macOS
         if: runner.os == 'macOS'
-        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DBUILD_TESTING=ON
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DBUILD_TESTING=ON "-DMAXDISPLAY_RELEASE_TAG:STRING=$MAXDISPLAY_RELEASE_TAG"
 
       - name: Locate or install NASM for the x64 AV1 codec
         if: runner.os == 'Windows'
@@ -52,7 +52,7 @@ jobs:
 
       - name: Configure Windows
         if: runner.os == 'Windows'
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON "-DMAXDISPLAY_RELEASE_TAG:STRING=$env:MAXDISPLAY_RELEASE_TAG"
 
       - &media-foundation
         name: Enable Media Foundation on Windows Server
@@ -100,22 +100,36 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
 
-      - name: Check macOS executable and preserve its file mode
-        if: runner.os == 'macOS'
+      - name: Check the executable and its version
+        shell: bash
         run: |
           ./build/Release/maxdisplay --help
-          tar -C build/Release -czf maxdisplay-macos-arm64.tar.gz maxdisplay
+          version=$(./build/Release/maxdisplay --version)
+          [[ "${version%$'\r'}" == "MaxDisplay ${MAXDISPLAY_RELEASE_TAG:-dev}" ]]
 
-      - name: Check Windows executable
-        if: runner.os == 'Windows'
-        run: .\build\Release\maxdisplay.exe --help
+      - name: Package tagged downloads
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          # Git refs can contain slashes and other characters unsuitable for download names.
+          file_tag=$(python3 -c 'import os, urllib.parse; print(urllib.parse.quote(os.environ["MAXDISPLAY_RELEASE_TAG"], safe="").replace("%", "_"), end="")')
+          name="maxdisplay-$file_tag"
+          mkdir -p dist
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            mkdir -p package
+            cp -p build/Release/maxdisplay "package/$name"
+            tar -czf "dist/$name-macos-arm64.tar.gz" -C package "$name"
+          else
+            cp build/Release/maxdisplay.exe "dist/$name-windows-x64.exe"
+            cp build/maxdisplay-windows-relink.zip "dist/$name-windows-relink.zip"
+          fi
 
-      - name: Stage binary for the tagged release
-        if: github.event_name == 'push' && github.ref_type == 'tag'
+      - name: Stage tagged downloads
+        if: github.ref_type == 'tag'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.path }}
+          path: dist/
           retention-days: 1
           if-no-files-found: error
 
@@ -127,15 +141,6 @@ jobs:
           path: |
             build/Release/codec_probe.exe
             build/Release/windows_present_tests.exe
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: Stage corresponding source and relink files for the tagged release
-        if: runner.os == 'Windows' && github.event_name == 'push' && github.ref_type == 'tag'
-        uses: actions/upload-artifact@v7
-        with:
-          name: maxdisplay-windows-relink
-          path: build/maxdisplay-windows-relink.zip
           retention-days: 1
           if-no-files-found: error
 
@@ -213,10 +218,6 @@ jobs:
         with:
           name: maxdisplay-windows-x64
           path: dist
-      - uses: actions/download-artifact@v8
-        with:
-          name: maxdisplay-windows-relink
-          path: dist
       - name: Publish assets for the pushed tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -224,8 +225,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
-          mv dist/maxdisplay.exe dist/maxdisplay-windows-x64.exe
-          assets=(dist/maxdisplay-macos-arm64.tar.gz dist/maxdisplay-windows-x64.exe dist/maxdisplay-windows-relink.zip)
+          assets=(dist/maxdisplay-*-macos-arm64.tar.gz dist/maxdisplay-*-windows-x64.exe dist/maxdisplay-*-windows-relink.zip)
           for file in "${assets[@]}"; do test -s "$file"; done
 
           if release=$(gh release view --json isDraft,assets -- "$TAG"); then
