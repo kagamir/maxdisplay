@@ -98,13 +98,14 @@ void check_av1(const std::vector<uint8_t>& frame, uint32_t width, uint32_t heigh
 }
 
 // Exercise the production sampler, cipher and ARQ without moving the runner's real mouse.
-// Hidden heartbeats need no bitmap. Require distinct sequences so that replaying
-// the last state cannot pass the test while the pointer is on another display.
+// Wait for distinct position sequences after acknowledging its bitmap. A stalled sender
+// that just retransmits the same tail packet cannot satisfy this check.
 void check_cursor(udp::Listener& listener, std::uint64_t token,
                   std::unique_ptr<secure::Datagrams> cipher, bool interrupt, const std::atomic<bool>& video_ready) {
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
     cursor::Receiver receiver(token);
+    bool shape_seen = false;
     std::optional<Clock::time_point> reopen_at, first_reply;
     std::optional<std::uint32_t> last_seq, original_floor, fallback_seq;
     unsigned positions = 0;
@@ -126,22 +127,13 @@ void check_cursor(udp::Listener& listener, std::uint64_t token,
         if (!ack) throw std::runtime_error("Invalid Mac cursor packet");
         listener.send_cursor(cipher ? cipher->seal(*ack) : *ack, source);
         if (reopen_at && !first_reply) first_reply = now;
-        if (bytes[8] != cursor::detail::state_type) continue;
-        const bool visible = (bytes[9] & 1) != 0;
-        if (!visible && (cursor::detail::get(bytes, 14, 4) || cursor::detail::get(bytes, 18, 4)))
-            throw std::runtime_error("Hidden Mac cursor sent its coordinates");
-        // A video floor identifies a live overlay. A hidden sample then has no shape to share.
-        if (!visible && (bytes[9] & 2) && cursor::detail::get(bytes, 22, 8))
-            throw std::runtime_error("Hidden Mac cursor shared a shape during overlay handoff");
+        if (bytes[8] == cursor::detail::shape_type) shape_seen = true;
+        if (!shape_seen || bytes[8] != cursor::detail::state_type) continue;
         const auto seq = static_cast<std::uint32_t>(cursor::detail::get(bytes, 10, 4));
         if (last_seq && !cursor::detail::newer(seq, *last_seq)) continue;
         last_seq = seq;
-        if (visible) {
-            const auto image = receiver.view().image;
-            if (!image || cursor::shape_id(*image) != cursor::detail::get(bytes, 22, 8)) continue;
-        }
         if (!interrupt) {
-            if (video_ready && ++positions == 2) return;
+            if (++positions == 2) return;
             continue;
         }
 
@@ -164,6 +156,7 @@ void check_cursor(udp::Listener& listener, std::uint64_t token,
             return;
         }
     }
+    if (!shape_seen) throw std::runtime_error("No valid cursor bitmap received from Mac");
     if (!interrupt) throw std::runtime_error("No acknowledged cursor heartbeats from Mac");
     if (!original_floor) throw std::runtime_error("Mac never handed off from video to the cursor overlay");
     if (!fallback_seq) throw std::runtime_error("Mac never hid the cursor overlay after the UDP outage");

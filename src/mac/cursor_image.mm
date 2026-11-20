@@ -114,37 +114,23 @@ cursor::Image mac_cursor::rasterize(NSCursor* source, double scale) {
     return draw(cg_image, points, size, source.hotSpot);
 }
 
-cursor::State mac_cursor::position(CGPoint location, CGRect display, unsigned width, unsigned height, bool visible) {
-    if (!visible || !width || !height || CGRectIsEmpty(display) ||
-        !(location.x >= CGRectGetMinX(display) && location.x < CGRectGetMaxX(display) &&
-          location.y >= CGRectGetMinY(display) && location.y < CGRectGetMaxY(display))) return {};
-    auto eighths = [](double offset, double extent, unsigned pixels) {
-        return static_cast<int32_t>(std::min(std::round(offset / extent * pixels * 8), pixels * 8.0 - 1));
-    };
-    return {true, eighths(location.x - display.origin.x, display.size.width, width),
-                  eighths(location.y - display.origin.y, display.size.height, height)};
+cursor::State mac_cursor::position(CGPoint location, CGRect display, unsigned width, unsigned height,
+                                   const cursor::Bitmap& bitmap, bool visible) {
+    if (!visible || CGRectIsEmpty(display)) return {};
+    const double x = (location.x - display.origin.x) * width / display.size.width;
+    const double y = (location.y - display.origin.y) * height / display.size.height;
+    const double left = x - bitmap.hot_x, top = y - bitmap.hot_y;
+    if (!(left < width && left + bitmap.width > 0 && top < height && top + bitmap.height > 0)) return {};
+    return {true, static_cast<int32_t>(std::round(x * 8)), static_cast<int32_t>(std::round(y * 8))};
 }
 
 CursorImageSource::CursorImageSource(CGDirectDisplayID display, unsigned stream_width, unsigned stream_height)
     : display_(display), width_(stream_width), height_(stream_height) {}
 
-cursor::View CursorImageSource::sample(uint64_t now_ms) {
+cursor::State CursorImageSource::sample(uint64_t now_ms) {
     available_ = false;
     const CGRect bounds = CGDisplayBounds(display_);
-    if (CGRectIsEmpty(bounds) || CGDisplayIsInMirrorSet(display_)) return {};
-    CGEventRef event = CGEventCreate(nullptr);
-    if (!event) return {};
-    const CGPoint location = CGEventGetLocation(event);
-    CFRelease(event);
-    if (!std::isfinite(location.x) || !std::isfinite(location.y)) return {};
-    available_ = true;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    const bool visible = CGCursorIsVisible();
-#pragma clang diagnostic pop
-    const auto state = mac_cursor::position(location, bounds, width_, height_, visible);
-    if (!state.visible) return {};
-
+    if (CGRectIsEmpty(bounds)) return {};
     const double scale = width_ / bounds.size.width;
     const auto seed = cursor_seed();
     if (!image_ || scale != sampled_scale_ || seed != last_seed_ || (!seed && now_ms - sampled_at_ >= 50)) {
@@ -155,7 +141,6 @@ cursor::View CursorImageSource::sample(uint64_t now_ms) {
         if (!next) next = mac_cursor::rasterize(NSCursor.arrowCursor, scale);
         if (!next) {
             image_.reset();
-            available_ = false;
             return {};
         }
         const auto id = cursor::shape_id(*next);
@@ -167,5 +152,14 @@ cursor::View CursorImageSource::sample(uint64_t now_ms) {
         sampled_at_ = now_ms;
         sampled_scale_ = scale;
     }
-    return {state, image_};
+    CGEventRef event = CGEventCreate(nullptr);
+    if (!event) return {};
+    const CGPoint location = CGEventGetLocation(event);
+    CFRelease(event);
+    available_ = std::isfinite(location.x) && std::isfinite(location.y);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    const bool visible = CGCursorIsVisible();
+#pragma clang diagnostic pop
+    return mac_cursor::position(location, bounds, width_, height_, *image_, available_ && visible);
 }

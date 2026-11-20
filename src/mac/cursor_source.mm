@@ -78,8 +78,7 @@ struct CursorSource::Impl {
                         sender.acknowledge(now, packet);
                     }
                 }
-                const auto sample = source ? source->sample(now) : cursor::View{};
-                const auto& state = sample.state;
+                auto state = source ? source->sample(now) : cursor::State{};
                 cursor::State outgoing{};
                 {
                     std::lock_guard lock(mutex);
@@ -88,13 +87,14 @@ struct CursorSource::Impl {
                         outgoing.video_floor = video_floor;
                     }
                 }
-                sender.update(now, outgoing, sample.image, [&](const cursor::Bytes& bytes) {
+                sender.update(now, outgoing, source ? source->image() : cursor::Image{}, [&](const cursor::Bytes& bytes) {
                     socket.send_to(peer, cursor::packet::wrap(cipher ? cipher->seal(bytes) : bytes));
                 });
                 std::lock_guard lock(mutex);
                 if (sender.last_ack() != previous_ack) route.ack(now);
                 available = source && source->available();
-                // A hidden cursor needs no bitmap for the overlay handoff.
+                // When outside the virtual display there is no visible image
+                // to wait for, although its fragments are already in flight.
                 image_ready = !state.visible || sender.shape_ready();
                 if (state.visible != previous.visible || state.x != previous.x || state.y != previous.y)
                     ++movement;
