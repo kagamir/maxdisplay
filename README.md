@@ -173,6 +173,8 @@ Select `--transport udp` on the Mac. The same Windows receiver accepts TCP or UD
 
 From startup, Windows hides its own pointer over the viewer's display area, including the waiting screen. In windowed mode, the title bar and resize borders keep their normal Windows cursors.
 
+The Mac shares pointer coordinates and shapes only while the hotspot is on the MaxDisplay virtual screen. Crossing onto the built-in screen or another display hides the pointer on Windows. While the hotspot stays outside, heartbeats and retries carry zero coordinates and no shape.
+
 The Mac samples its pointer every 4 ms. With either video transport, the Mac sends pointer positions and shapes directly to the video receiver’s UDP port. Windows handles those packets independently of video decoding. Windows draws the pointer over the video without moving the local Windows mouse. On a still desktop, moving the Mac pointer alone lets the video encoder stay idle after static refinement finishes.
 
 Windows replies from the listening port when it receives a valid cursor packet from the Mac. The Mac keeps the pointer in video if it receives no cursor acknowledgement within one second of startup. During streaming it returns to video after two seconds without an acknowledgement. After acknowledgements resume for one second, Windows waits for a cursor-free video frame before showing the overlay again. To keep the pointer in the video throughout a session, add `--video-cursor` to the Mac command. This also skips the cursor handshake.

@@ -14,16 +14,14 @@ cursor::Image rasterize(NSCursor* source, double scale);
 #endif
 
 namespace mac_cursor {
-cursor::State position(CGPoint location, CGRect display, unsigned width, unsigned height,
-                       const cursor::Bitmap& bitmap, bool visible);
+cursor::State position(CGPoint location, CGRect display, unsigned width, unsigned height, bool visible);
 }
 
 // Used exclusively by the pointer sampling thread.
 class CursorImageSource {
 public:
     CursorImageSource(CGDirectDisplayID display, unsigned stream_width, unsigned stream_height);
-    cursor::State sample(std::uint64_t now_ms);
-    const cursor::Image& image() const { return image_; }
+    cursor::View sample(std::uint64_t now_ms);
     bool available() const { return available_; }
 
 private:
