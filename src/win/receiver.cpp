@@ -2,7 +2,6 @@
 #include "decoder.hpp"
 #include "display_info.hpp"
 #include "cursor_overlay.hpp"
-#include "waiting_screen.hpp"
 #include "cursor_packet.hpp"
 #include "frame_recovery.hpp"
 #include "net.hpp"
@@ -42,7 +41,6 @@ constexpr wchar_t window_class[] = L"MaxDisplayReceiver";
 constexpr UINT listener_failed = WM_APP + 1;
 constexpr UINT cursor_changed = WM_APP + 2;
 constexpr UINT_PTR address_timer = 1;
-constexpr UINT_PTR motion_timer = 2;
 
 using Clock = std::chrono::steady_clock;
 using Reason = FrameRecovery::Reason;
@@ -82,9 +80,6 @@ struct Receiver {
     win_info::Binding binding{};
     std::uint16_t port = 0;
     std::wstring address_text;
-    SIZE monitor_size{};
-    const Clock::time_point opened = Clock::now();
-    bool motion_timer_running = false; // UI thread only.
     bool require_hardware = false;
     bool stats_enabled = false;
     bool fullscreen = false;
@@ -247,16 +242,6 @@ struct Receiver {
         if (text != address_text) {
             address_text = std::move(text);
             if (window) InvalidateRect(window, nullptr, FALSE);
-        }
-    }
-
-    void animate_waiting_screen(bool animate) {
-        if (animate == motion_timer_running) return;
-        if (animate) {
-            motion_timer_running = SetTimer(window, motion_timer, 250, nullptr) != 0;
-        } else {
-            KillTimer(window, motion_timer);
-            motion_timer_running = false;
         }
     }
 
@@ -433,7 +418,6 @@ struct Receiver {
         try {
             const auto header = read_header();
             Decoder decoder(header.width, header.height, header.fps, header.codec, require_hardware);
-            win_info::KeepAwake keep_awake;
             StreamStats stats;
             if (stats_enabled) stats.last_report = Clock::now();
             receive_live(header, decoder, stats, read_frame, feedback);
@@ -572,17 +556,31 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         sequence = receiver.frame_sequence;
         status = receiver.status;
     }
-    receiver.animate_waiting_screen(!frame && !IsIconic(receiver.window));
     if (!frame) {
-        const SIZE pixels = receiver.monitor_size;
+        FillRect(dc, &area, black);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(224, 224, 224));
+        const SIZE pixels = win_info::monitor_pixels(receiver.window);
         std::wstring details = status;
         if (pixels.cx > 0 && pixels.cy > 0)
             details += L"\nDisplay: " + std::to_wstring(pixels.cx) + L" × " + std::to_wstring(pixels.cy) + L" px";
         details += L"\n\nLocal IP addresses (";
         details += receiver.udp_listener ? L"TCP and UDP " : L"TCP video and UDP cursor ";
         details += std::to_wstring(receiver.port) + L")\n" + receiver.address_text;
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - receiver.opened);
-        win_waiting::paint(dc, area, details, GetDpiForWindow(receiver.window), elapsed.count());
+        const auto dpi = GetDpiForWindow(receiver.window);
+        HFONT font = CreateFontW(-MulDiv(13, dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                                 DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ previous = SelectObject(dc, font ? static_cast<HGDIOBJ>(font) : GetStockObject(DEFAULT_GUI_FONT));
+        const int inset = (std::min)(MulDiv(16, dpi, 96), width / 4);
+        RECT bounds{inset, 0, width - inset, height};
+        RECT measured = bounds;
+        constexpr UINT flags = DT_CENTER | DT_WORDBREAK | DT_NOPREFIX;
+        DrawTextW(dc, details.c_str(), -1, &measured, flags | DT_CALCRECT);
+        bounds.top = (std::max)(0L, (height - measured.bottom) / 2);
+        DrawTextW(dc, details.c_str(), -1, &bounds, flags);
+        SelectObject(dc, previous);
+        if (font) DeleteObject(font);
     } else if (width > 0 && height > 0) {
         const auto start = track_paint ? Clock::now() : Clock::time_point{};
         const auto video = win_cursor::fit_video(area, *frame);
@@ -656,16 +654,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_SIZE:
     case WM_MOVE:
-        receiver->monitor_size = win_info::monitor_pixels(window);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
     case WM_TIMER:
-        if (wp == motion_timer) {
-            std::lock_guard lock(receiver->mutex);
-            if (receiver->frame || IsIconic(window)) receiver->animate_waiting_screen(false);
-            else InvalidateRect(window, nullptr, FALSE);
-            return 0;
-        }
         if (wp == address_timer) {
             {
                 std::lock_guard lock(receiver->mutex);
@@ -686,7 +677,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DISPLAYCHANGE:
         if (receiver->fullscreen) fit_monitor(window);
-        receiver->monitor_size = win_info::monitor_pixels(window);
         InvalidateRect(window, nullptr, FALSE);
         return 0;
     case WM_KEYDOWN:
@@ -708,6 +698,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int run_receiver(const ReceiverOptions& options) {
+    win_info::KeepAwake keep_awake;
     auto tcp = net::listen_tcp(options.bind, options.port);
     Receiver receiver(options.password);
     receiver.port = tcp.local_port();

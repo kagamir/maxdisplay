@@ -33,8 +33,6 @@ using namespace std::chrono_literals;
 using Frames = std::array<std::vector<std::uint8_t>, 8>;
 constexpr unsigned width = 320, height = 180, fps = 30;
 constexpr auto frame_timeout = 1000ms;
-constexpr UINT idle_power_probe = WM_APP + 1;
-constexpr UINT idle_animation_probe = WM_APP + 2;
 
 Frames read_frames(const char* path) {
     Frames frames;
@@ -74,24 +72,6 @@ BOOL CALLBACK find_receiver(HWND candidate, LPARAM context) {
 // Inspect the receiver's input queue on its own UI thread. The CI desktop's
 // real pointer may be over another window; drive hit tests without moving it.
 LRESULT CALLBACK cursor_probe_proc(HWND probe, UINT message, WPARAM wp, LPARAM lp) {
-    if (message == idle_animation_probe) {
-        const auto viewer = reinterpret_cast<HWND>(wp);
-        UpdateWindow(viewer);
-        // Run the viewer's real timer on this UI thread without consuming paints.
-        // Check that the timer itself dirties the window when there is no input.
-        return wait_until([&] {
-            MSG timer{};
-            if (!PeekMessageW(&timer, viewer, WM_TIMER, WM_TIMER, PM_REMOVE)) return false;
-            ValidateRect(viewer, nullptr);
-            DispatchMessageW(&timer);
-            return GetUpdateRect(viewer, nullptr, FALSE) != FALSE;
-        }, 2s);
-    }
-    if (message == idle_power_probe) {
-        const auto flags = SetThreadExecutionState(ES_CONTINUOUS);
-        if (!flags || !SetThreadExecutionState(flags | ES_CONTINUOUS)) return FALSE;
-        return !(flags & (ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED));
-    }
     if (message != WM_APP) return DefWindowProcW(probe, message, wp, lp);
     const auto viewer = reinterpret_cast<HWND>(wp);
     const auto previous = GetCursor();
@@ -106,11 +86,6 @@ LRESULT CALLBACK cursor_probe_proc(HWND probe, UINT message, WPARAM wp, LPARAM l
     const bool client_hidden = GetCursor() == nullptr;
     SetCursor(previous);
     return title_bar_visible && handled && client_hidden;
-}
-
-void check_idle_power(HWND probe) {
-    if (!SendMessageW(probe, idle_power_probe, 0, 0))
-        throw std::runtime_error("The waiting receiver kept the Windows display or system awake");
 }
 
 struct Surface {
@@ -364,13 +339,6 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             return window || ui.wait_for(0s) == std::future_status::ready;
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
-        auto check_idle_animation = [&] {
-            if (codec == Codec::h264 && transport == Transport::tcp && !encrypted &&
-                !SendMessageW(probe, idle_animation_probe, reinterpret_cast<WPARAM>(window), 0))
-                throw std::runtime_error("The idle receiver timer did not schedule a repaint");
-        };
-        check_idle_animation();
-        check_idle_power(probe);
         auto check_system_cursor = [&] {
             if (!SendMessageW(probe, WM_APP, reinterpret_cast<WPARAM>(window), 0))
                 throw std::runtime_error("Unexpected Windows cursor over the receiver client or title bar");
@@ -407,8 +375,6 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             client.reset();
             if (!wait_until([&] { return edge() == RGB(0, 0, 0); }, 4s))
                 throw std::runtime_error("Disconnected window did not clear its last frame");
-            if (!late) check_idle_animation();
-            check_idle_power(probe);
         }
         client.emplace(options, transport, codec);
         send_initial_frames(*client, frames, window);
