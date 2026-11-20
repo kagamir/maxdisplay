@@ -116,9 +116,7 @@ jobs:
           name="maxdisplay-$file_tag"
           mkdir -p dist
           if [[ "$RUNNER_OS" == macOS ]]; then
-            mkdir -p package
-            cp -p build/Release/maxdisplay "package/$name"
-            tar -czf "dist/$name-macos-arm64.tar.gz" -C package "$name"
+            tar -czf "dist/$name-macos-arm64.tar.gz" -C build/Release maxdisplay
           else
             cp build/Release/maxdisplay.exe "dist/$name-windows-x64.exe"
             cp build/maxdisplay-windows-relink.zip "dist/$name-windows-relink.zip"

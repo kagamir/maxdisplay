@@ -42,7 +42,7 @@ Get both files from the same [GitHub release](https://github.com/kagamir/maxdisp
 | Windows x64 | `maxdisplay-<tag>-windows-x64.exe` |
 | Mac with Apple Silicon | `maxdisplay-<tag>-macos-arm64.tar.gz` |
 
-On the Mac, double-click the archive to extract `maxdisplay-<tag>`. Rename the extracted file to `maxdisplay` for the Terminal commands below. You can check its tag after renaming it.
+On the Mac, double-click the archive to extract `maxdisplay`. Run this command from the folder where you extracted it to check the release tag.
 
 ```bash
 ./maxdisplay --version
