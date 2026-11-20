@@ -58,7 +58,7 @@ Double-click `maxdisplay-windows-x64.exe`, or run it from PowerShell:
 
 If Windows Firewall asks about network access, allow inbound TCP and UDP on the receiver port on private networks.
 
-The waiting screen lists the addresses the receiver is listening on and the pixel resolution of the monitor it is on. Addresses on the adapter with the default route come first. The whole text block moves slowly up and down within the window so all lines stay visible. The examples below use `192.168.1.50`.
+The waiting screen lists the addresses the receiver is listening on and the pixel resolution of the monitor it is on. Addresses on the adapter with the default route come first. The examples below use `192.168.1.50`.
 
 ### 3. Start the sender on the Mac
 
@@ -98,7 +98,7 @@ On the Mac, open **System Settings → Displays → Arrange** and drag **MaxDisp
 | Bitrate | Up to 12 Mbps |
 | Frame timeout | 200 ms |
 
-The receiver listens on all IPv4 interfaces and accepts one Mac at a time. While waiting for a connection, it follows the Windows display-off and sleep settings. It keeps the display and system awake during a video session, including when the Mac's desktop is still, and releases the request when the session ends.
+The receiver listens on all IPv4 interfaces and accepts one Mac at a time. While it is waiting or playing, it stops Windows from turning off the display or going to sleep when idle, and it releases that request on exit. When the Mac's screen is still, the last frame stays on screen.
 
 ## Configuration
 
