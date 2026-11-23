@@ -41,6 +41,7 @@ namespace {
 constexpr wchar_t window_class[] = L"MaxDisplayReceiver";
 constexpr UINT listener_failed = WM_APP + 1;
 constexpr UINT cursor_changed = WM_APP + 2;
+constexpr UINT status_changed = WM_APP + 3;
 constexpr UINT_PTR address_timer = 1;
 
 using Clock = std::chrono::steady_clock;
@@ -94,6 +95,7 @@ struct Receiver {
     std::uint64_t session_id = 0;
     PaintStats paint_stats; // Updated by WM_PAINT and exchanged by the worker under mutex.
     std::weak_ptr<const VideoFrame> last_painted; // UI thread only.
+    std::optional<win_info::KeepAwake> keep_awake; // Acquired and released on the UI thread.
     const wchar_t* status = L"Waiting for the Mac to connect";
     std::optional<udp::Listener> udp_listener;
     net::Socket ipv6_cursor; // ENet uses IPv4. IPv6 TCP video still supports a same-port UDP cursor.
@@ -259,6 +261,7 @@ struct Receiver {
             frame.reset();
             status = message;
         }
+        PostMessageW(window, status_changed, 0, 0);
         InvalidateRect(window, nullptr, FALSE);
     }
 
@@ -539,7 +542,7 @@ void toggle_fullscreen(Receiver& receiver) {
     }
 }
 
-void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
+void paint_client(Receiver& receiver, HDC dc, bool on_screen) {
     RECT area{};
     GetClientRect(receiver.window, &area);
     const int width = area.right;
@@ -558,6 +561,7 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         status = receiver.status;
     }
     if (!frame) {
+        if (on_screen) receiver.keep_awake.reset();
         FillRect(dc, &area, black);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(224, 224, 224));
@@ -587,6 +591,7 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         SelectObject(dc, previous);
         if (font) DeleteObject(font);
     } else if (width > 0 && height > 0) {
+        const bool track_paint = on_screen && receiver.stats_enabled;
         const auto start = track_paint ? Clock::now() : Clock::time_point{};
         const auto video = win_cursor::fit_video(area, *frame);
         const RECT bars[] = {{0, 0, width, video.top}, {0, video.bottom, width, height},
@@ -597,6 +602,9 @@ void paint_client(Receiver& receiver, HDC dc, bool track_paint) {
         const auto& shown = receiver.visible_cursor;
         const bool drew = receiver.overlay.paint(dc, video, *frame,
             shown.session == session_id ? shown.view : cursor::View{}, sequence, session_id);
+        if (on_screen && drew && !receiver.keep_awake &&
+            IsWindowVisible(receiver.window) && !IsIconic(receiver.window))
+            receiver.keep_awake.emplace();
         if (track_paint && drew) {
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
             std::lock_guard lock(receiver.mutex);
@@ -628,6 +636,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         break;
     case WM_WINDOWPOSCHANGED: {
         const auto result = DefWindowProcW(window, message, wp, lp);
+        const auto flags = reinterpret_cast<const WINDOWPOS*>(lp)->flags;
+        if (flags & SWP_HIDEWINDOW)
+            receiver->keep_awake.reset();
+        else if (flags & SWP_SHOWWINDOW)
+            InvalidateRect(window, nullptr, FALSE);
         // Showing or resizing the viewer can put it under a stationary pointer.
         POINT point{};
         if (IsWindowVisible(window) && !IsIconic(window) && !GetCapture() &&
@@ -640,12 +653,18 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case cursor_changed:
         receiver->apply_cursor();
         return 0;
+    case status_changed: {
+        // A disconnect can arrive while painting is suspended, or just before a new stream.
+        std::lock_guard lock(receiver->mutex);
+        if (!receiver->frame) receiver->keep_awake.reset();
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT state{};
         HDC dc = BeginPaint(window, &state);
-        paint_client(*receiver, dc, receiver->stats_enabled);
+        paint_client(*receiver, dc, true);
         EndPaint(window, &state);
         return 0;
     }
@@ -658,6 +677,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED || !LOWORD(lp) || !HIWORD(lp))
+            receiver->keep_awake.reset();
+        [[fallthrough]];
     case WM_MOVE:
         InvalidateRect(window, nullptr, FALSE);
         return 0;
@@ -703,7 +725,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 } // namespace
 
 int run_receiver(const ReceiverOptions& options) {
-    win_info::KeepAwake keep_awake;
     auto tcp = net::listen_tcp(options.bind, options.port);
     Receiver receiver(options.password);
     receiver.port = tcp.local_port();
@@ -748,6 +769,7 @@ int run_receiver(const ReceiverOptions& options) {
             DispatchMessageW(&message);
         }
         DWORD error = result == -1 ? GetLastError() : ERROR_SUCCESS;
+        receiver.keep_awake.reset();
         receiver.stop();
         worker.join();
         if (error) throw std::system_error(error, std::system_category(), "GetMessageW");

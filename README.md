@@ -98,7 +98,7 @@ On the Mac, open **System Settings → Displays → Arrange** and drag **MaxDisp
 | Bitrate | Up to 12 Mbps |
 | Frame timeout | 200 ms |
 
-The receiver listens on all IPv4 interfaces and accepts one Mac at a time. While it is waiting or playing, it stops Windows from turning off the display or going to sleep when idle, and it releases that request on exit. When the Mac's screen is still, the last frame stays on screen.
+The receiver listens on all IPv4 interfaces and accepts one Mac at a time. Windows follows its normal display and sleep timers while the receiver waits for a connection or the first video frame, after a disconnect, and while the receiver window is minimized or hidden. Once the window displays the Mac desktop, it keeps the display and system awake, including when the picture is still.
 
 ## Configuration
 

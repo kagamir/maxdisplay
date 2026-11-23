@@ -33,6 +33,8 @@ using namespace std::chrono_literals;
 using Frames = std::array<std::vector<std::uint8_t>, 8>;
 constexpr unsigned width = 320, height = 180, fps = 30;
 constexpr auto frame_timeout = 1000ms;
+constexpr UINT power_probe = WM_APP + 1;
+constexpr UINT show_probe = WM_APP + 2;
 
 Frames read_frames(const char* path) {
     Frames frames;
@@ -72,6 +74,15 @@ BOOL CALLBACK find_receiver(HWND candidate, LPARAM context) {
 // Inspect the receiver's input queue on its own UI thread. The CI desktop's
 // real pointer may be over another window; drive hit tests without moving it.
 LRESULT CALLBACK cursor_probe_proc(HWND probe, UINT message, WPARAM wp, LPARAM lp) {
+    if (message == show_probe)
+        return ShowWindow(reinterpret_cast<HWND>(wp), static_cast<int>(lp));
+    if (message == power_probe) {
+        // Flush a pending real paint before sampling the receiver's thread-local request.
+        UpdateWindow(reinterpret_cast<HWND>(wp));
+        const auto flags = SetThreadExecutionState(ES_CONTINUOUS);
+        if (!flags || !SetThreadExecutionState(flags | ES_CONTINUOUS)) return 0;
+        return flags;
+    }
     if (message != WM_APP) return DefWindowProcW(probe, message, wp, lp);
     const auto viewer = reinterpret_cast<HWND>(wp);
     const auto previous = GetCursor();
@@ -310,7 +321,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
     const auto other = transport == Transport::udp ? Transport::tcp : Transport::udp;
     if (encrypted) options.password = "MaxDisplay test passphrase";
     options.windowed = transport == Transport::tcp; // Exercise both windowed and full-screen startup.
-    options.stats = true;
+    options.stats = codec != Codec::h264 || encrypted;
     std::promise<HWND> started;
     auto probe_ready = started.get_future();
     auto ui = std::async(std::launch::async, [&] {
@@ -339,6 +350,13 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             return window || ui.wait_for(0s) == std::future_status::ready;
         }, 8s);
         if (!window) throw std::runtime_error("No receiver window appeared");
+        auto check_power = [&](bool awake, const char* phase) {
+            constexpr EXECUTION_STATE required = ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED;
+            const auto flags = SendMessageW(probe, power_probe, reinterpret_cast<WPARAM>(window), 0);
+            if (!flags || (flags & required) != (awake ? required : 0))
+                throw std::runtime_error(std::string("Unexpected receiver power request ") + phase);
+        };
+        check_power(false, "while waiting for a connection");
         auto check_system_cursor = [&] {
             if (!SendMessageW(probe, WM_APP, reinterpret_cast<WPARAM>(window), 0))
                 throw std::runtime_error("Unexpected Windows cursor over the receiver client or title bar");
@@ -346,6 +364,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
         check_system_cursor();
         for (bool late : {false, true}) {
             client.emplace(options, late ? other : transport, codec, late ? nullptr : window);
+            check_power(false, "before the first frame");
             if (late) {
                 // A static desktop may produce just one picture. It must paint while the session stays open.
                 client->send(frames, 0, 1);
@@ -354,9 +373,25 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
                 // Sequence 2 arrives in order, but its timestamp is older than the deadline.
                 const auto stamp = TestSender::now_us();
                 std::this_thread::sleep_for(frame_timeout + 150ms);
+                check_power(true, "while displaying a static frame");
+                if (options.windowed && codec == Codec::h264 && !encrypted) {
+                    auto show = [&](int command) {
+                        SendMessageW(probe, show_probe, reinterpret_cast<WPARAM>(window), command);
+                    };
+                    show(SW_MINIMIZE);
+                    check_power(false, "while minimized");
+                    show(SW_RESTORE);
+                    check_power(true, "after restoring a static frame");
+                    show(SW_HIDE);
+                    read_colors(window); // Offscreen WM_PRINTCLIENT must not acquire a power request.
+                    check_power(false, "after drawing a hidden window offscreen");
+                    show(SW_SHOWNORMAL);
+                    check_power(true, "after showing a static frame");
+                }
                 client->send(frames, 1, 2, true, stamp);
             } else {
                 send_initial_frames(*client, frames, window);
+                check_power(true, "while displaying video");
                 check_system_cursor();
                 if (codec == Codec::h264) check_busy_receiver(options, other);
                 // Sequence 4 (a reference picture) was lost. Deliver the following delta.
@@ -375,6 +410,7 @@ void check(const Frames& frames, Codec codec, Transport transport, bool encrypte
             client.reset();
             if (!wait_until([&] { return edge() == RGB(0, 0, 0); }, 4s))
                 throw std::runtime_error("Disconnected window did not clear its last frame");
+            check_power(false, "after disconnect");
         }
         client.emplace(options, transport, codec);
         send_initial_frames(*client, frames, window);
